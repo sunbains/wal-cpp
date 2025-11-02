@@ -1,0 +1,5 @@
+@PACKAGE_INIT@
+
+# Provide imported targets for consumers
+include("${CMAKE_CURRENT_LIST_DIR}/walTargets.cmake")
+
