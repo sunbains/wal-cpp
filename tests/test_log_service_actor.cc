@@ -1,0 +1,1059 @@
+#include <cassert>
+#include <cstdio>
+#include <cstring>
+#include <vector>
+#include <thread>
+#include <atomic>
+#include <chrono>
+#include <getopt.h>
+#include <sched.h>
+#include <unistd.h>
+#include <sys/uio.h>
+#include <fcntl.h>
+#include <span>
+#include <print>
+#include <memory>
+#include <bit>
+#include <algorithm>
+#include <future>
+#include <variant>
+#include <array>
+#include <limits>
+#include <random>
+#include <cmath>
+
+#include "coro/task.h"
+#include "util/bounded_channel.h"
+#include "util/logger.h"
+#include "util/spsc.h"
+#include "util/util.h"
+#include "util/thread_pool.h"
+#include "util/metrics.h"
+#include "wal/wal.h"
+
+#include "log_io.h"
+#include "actor_model.h"
+#include "wal/buffer_pool.h"
+
+util::Logger<util::MT_logger_writer> g_logger(util::MT_logger_writer{std::cerr}, util::Log_level::Trace);
+
+static constexpr util::ChecksumAlgorithm kChecksumAlgorithm = util::ChecksumAlgorithm::CRC32C;
+
+using Log_writer = wal::Log_writer;
+using Clock = std::chrono::steady_clock;
+
+struct Metrics_config {
+  bool m_enable_producer_latency{true};  /* Most expensive - track per-message latency */
+  
+  /* Returns true if any metrics are enabled */
+  [[nodiscard]] bool any_enabled() const noexcept {
+    return m_enable_producer_latency;
+  }
+};
+
+enum class Sync_message_type { Fdatasync, Fsync };
+
+struct Test_config {
+  std::size_t m_mailbox_size{256};
+  std::size_t m_num_producers{1};
+  std::size_t m_num_consumers{1};
+  std::size_t m_num_messages{10000000};
+  /** Number of runs to average for stability */
+  std::size_t m_num_iterations{1};
+  bool m_disable_writes{false};
+  bool m_disable_log_writes{false};
+  bool m_skip_memcpy{false};
+  std::size_t m_log_block_size{4096};
+  std::size_t m_log_buffer_size_blocks{16384};
+  std::size_t m_timeout_ms{5000};
+
+  /** Send fdatasync/fsync with probability 1/N (0 = disabled, calculated from probability) */
+  std::size_t m_fdatasync_interval{0};
+
+  /** Type of sync message to send (default: Fdatasync) */
+  Sync_message_type m_sync_type{Sync_message_type::Fdatasync};
+
+  /** Disable metrics collection entirely (overrides Metrics_config) */
+  bool m_disable_metrics{false};
+
+  /** Fine-grained control over which metrics to collect */
+  Metrics_config m_metrics_config{};
+};
+
+/**
+ * Erlang-style Actor Model for Log Service
+ * - Each producer/consumer has its own SPSC mailbox
+ * - Processes self-schedule into thread mailboxes when they have messages
+ * - Consumer is a regular thread (not coroutine) that writes to WAL (like test_log_io_simple producer)
+ * - Consumer drains from thread mailboxes and writes to log
+ */
+
+/* Specialize Message_envelope to use Poison_pill, Fdatasync, and Fsync instead of monostate */
+template<>
+struct Message_envelope<Test_message> {
+  Pid m_sender;
+  std::variant<Test_message, Poison_pill, Fdatasync, Fsync> m_payload;
+  Clock::time_point m_send_time{};  /* Timestamp when message was sent (for latency tracking) */
+};
+
+using Payload_type = Test_message;
+using Message_envelope_type = Message_envelope<Payload_type>;
+using Process_type = Process<Payload_type>;
+using Thread_mailbox_type = Thread_mailbox<Payload_type>;
+using Thread_mailboxes_type = Thread_mailboxes<Payload_type>;
+using Scheduler_type = Scheduler_base<Payload_type>;
+
+struct Producer_context : public Producer_context_base<Payload_type, Scheduler_type> {
+  Sync_message_type m_sync_type{Sync_message_type::Fdatasync};
+  bool m_track_latency{false};
+};
+
+/* Forward declaration */
+struct Log_message_processor;
+
+struct Consumer_context {
+  std::shared_ptr<wal::Log> m_log;
+  Log_writer m_log_writer;
+  std::atomic<bool>* m_consumer_done;
+  bool m_disable_log_writes;
+  util::Thread_pool* m_consumer_pool;
+  util::Thread_pool* m_io_pool;
+  Process_type* m_consumer_process;  /* Consumer's mailbox for poison pills */
+  Scheduler_type* m_sched;
+  Log_message_processor* m_processor;  /* Pass by pointer so we can call flush_batch */
+  std::size_t m_num_producers;
+  std::chrono::milliseconds m_batch_timeout{std::chrono::milliseconds(10)};
+};
+
+/* Function object wrapper that stores values as members and calls static function */
+struct Log_message_processor {
+  Log_message_processor() = default;
+
+  Log_message_processor(
+    std::shared_ptr<wal::Log> log,
+    util::Thread_pool* io_pool,
+    bool disable_log_writes,
+    util::Metrics* metrics = nullptr,
+    const Metrics_config* metrics_config = nullptr
+  ) : m_log(std::move(log)),
+      m_io_pool(io_pool),
+      m_disable_log_writes(disable_log_writes),
+      m_metrics(metrics),
+      m_metrics_config(metrics_config) {
+
+    m_batch.reserve(1024);
+
+    if (m_metrics != nullptr && m_metrics_config != nullptr && m_metrics_config->m_enable_producer_latency) {
+      m_batch_send_times.reserve(1024);
+    }
+  }
+
+  void operator()(const Payload_type& payload, Clock::time_point send_time = Clock::time_point{}) noexcept{
+    if (m_disable_log_writes) {
+      return;
+    }
+    /* Add to batch - caller will flush based on timer or batch size */
+    m_batch.push_back(payload);
+
+    /* Only track send times if metrics are enabled, producer latency is enabled, and send_time is valid */
+    if (m_metrics != nullptr && m_metrics_config != nullptr && 
+        m_metrics_config->m_enable_producer_latency && 
+        send_time != Clock::time_point{}) [[unlikely]] {
+      m_batch_send_times.push_back(send_time);
+    }
+    m_batch_size_bytes += payload.get_span().size();
+    
+    /* Flush if we've accumulated 4090 bytes or a multiple (block size - header - CRC32).
+     * 4096 - 12 (Block_header::Data) - 4 (CRC32) = 4080, using 4090 as specified */
+    constexpr std::size_t batch_unit_size = 4090;
+
+    if (m_batch_size_bytes >= batch_unit_size) {
+      flush_batch();
+    }
+  }
+
+  void flush_batch() noexcept {
+    flush_batch_impl(false, false);
+  }
+
+  void flush_batch_and_fdatasync() {
+    flush_batch_impl(true, false);
+  }
+
+  void flush_batch_and_fsync() {
+    flush_batch_impl(false, true);
+  }
+
+private:
+  void flush_batch_impl([[maybe_unused]] bool do_fdatasync, [[maybe_unused]] bool do_fsync) {
+    if (m_batch.empty() || m_disable_log_writes) {
+      return;
+    }
+
+    /* Combine all batched messages into a single write */
+    std::size_t total_size = 0;
+
+    for (const auto& msg : m_batch) {
+      total_size += msg.get_span().size();
+    }
+
+    /* Allocate buffer for batched data */
+    std::vector<std::byte> batched_data;
+
+    batched_data.reserve(total_size);
+
+    for (const auto& msg : m_batch) {
+      auto span = msg.get_span();
+      batched_data.insert(batched_data.end(), span.begin(), span.end());
+    }
+
+    /* Write batched data to log */
+    auto write_result = m_log->write(std::span<const std::byte>(batched_data), m_io_pool);
+
+    /* If write fails, retry with back-pressure (like test_log_io_simple.cc) */
+    if (!write_result.has_value()) [[unlikely]] {
+      int retries = 0;
+      constexpr int max_retries = 10000;
+
+      while (retries < max_retries && !write_result.has_value()) {
+        util::cpu_pause_n(10);  /* Back off to let I/O catch up */
+        write_result = m_log->write(std::span<const std::byte>(batched_data), m_io_pool);
+        ++retries;
+      }
+
+      /* Still failed after retries - this is a real problem */
+      if (!write_result.has_value()) {
+        log_fatal("Failed to write to log after {} retries", max_retries);
+      }
+    }
+    
+    /* Track producer latency AFTER successful write to measure true end-to-end latency */
+    if (m_metrics != nullptr && m_metrics_config != nullptr && 
+        m_metrics_config->m_enable_producer_latency && 
+        !m_batch_send_times.empty() && write_result.has_value()) [[unlikely]] {
+      const auto flush_time = Clock::now();
+      /* Batch latency calculations - optimized: pre-size vector to avoid push_back overhead */
+      constexpr auto latency_type = util::MetricType::ProducerLatency;
+      const std::size_t num_timings = m_batch_send_times.size();
+      /* Count valid send times first to size vector exactly */
+      std::size_t valid_count = 0;
+      for (std::size_t i = 0; i < num_timings; ++i) {
+        if (m_batch_send_times[i] != Clock::time_point{}) {
+          ++valid_count;
+        }
+      }
+      if (valid_count > 0) {
+        /* Pre-size vector to exact size to avoid reallocations */
+        std::vector<std::chrono::nanoseconds> latencies;
+        latencies.reserve(valid_count);
+        /* Single pass: calculate latencies for valid send times */
+        for (std::size_t i = 0; i < num_timings; ++i) {
+          const auto& send_time = m_batch_send_times[i];
+          if (send_time != Clock::time_point{}) {
+            latencies.push_back(std::chrono::duration_cast<std::chrono::nanoseconds>(flush_time - send_time));
+          }
+        }
+        /* Batch add all latencies at once - use move to avoid copying */
+        m_metrics->add_timings_batch_move(latency_type, std::move(latencies));
+      }
+    }
+
+    /* Clear batch - only clear send times if we were tracking them */
+    m_batch.clear();
+    if (!m_batch_send_times.empty()) {
+      m_batch_send_times.clear();
+    }
+    m_batch_size_bytes = 0;
+  }
+
+public:
+  std::shared_ptr<wal::Log> m_log;
+  util::Thread_pool* m_io_pool;
+  bool m_disable_log_writes;
+  std::vector<Payload_type> m_batch;
+
+  /** Send times for latency tracking (only populated if m_metrics != nullptr) */
+  std::vector<Clock::time_point> m_batch_send_times;
+
+  /** Track accumulated batch size in bytes */
+  std::size_t m_batch_size_bytes{0};
+
+  /** Metrics collector for latency tracking */
+  util::Metrics* m_metrics{nullptr};
+
+  /** Metrics configuration - which metrics to collect */
+  const Metrics_config* m_metrics_config{nullptr};
+};
+
+/** Producer actor - sends log messages to consumer
+ * @param[in] ctx The producer context (contains fdatasync_interval, sync_type, and track_latency)
+ * @param[in] num_items The number of items to send
+ * @param[in] start_flag The start flag
+ */
+Task<void> producer_actor(Producer_context ctx, std::size_t num_items, std::atomic<bool>& start_flag) {
+  co_await ctx.m_sched->m_producer_pool->schedule();
+
+  while (!start_flag.load(std::memory_order_acquire)) {
+    util::cpu_pause();
+  }
+
+  ctx.m_proc->schedule_self(ctx.m_sched->m_mailboxes, ctx.m_sched->m_mailboxes->size());
+
+  /* Random number generator for fdatasync */
+  std::mt19937 rng(std::random_device{}());
+  std::uniform_int_distribution<std::size_t> dist(1, ctx.m_fdatasync_interval > 0 ? ctx.m_fdatasync_interval : 1);
+
+  /* Send messages, randomly sending sync messages if interval is set */
+  for (std::size_t i = 0; i < num_items; ++i) {
+    Message_envelope<Payload_type> env;
+    env.m_sender = ctx.m_self;
+    /* Only record send time if latency tracking is enabled - avoids expensive clock call */
+    if (ctx.m_track_latency) [[unlikely]] {
+      env.m_send_time = Clock::now();
+    }
+    
+    /* Send sync message randomly with 1/fdatasync_interval probability if interval is set */
+    if (ctx.m_fdatasync_interval > 0 && dist(rng) == 1) {
+      if (ctx.m_sync_type == Sync_message_type::Fdatasync) {
+        env.m_payload = Fdatasync{};
+      } else {
+        env.m_payload = Fsync{};
+      }
+    } else {
+      Test_message msg{};
+      env.m_payload = msg;
+    }
+
+    if (ctx.m_proc->m_mailbox.enqueue(std::move(env))) [[likely]] {
+      continue;
+    }
+
+    /* Slow path: queue full */
+    while (!ctx.m_proc->m_mailbox.enqueue(std::move(env))) {
+      ctx.m_proc->schedule_self(ctx.m_sched->m_mailboxes, ctx.m_sched->m_mailboxes->size());
+      util::cpu_pause();
+    }
+  }
+
+  Message_envelope<Payload_type> term_env{.m_sender = ctx.m_self, .m_payload = Poison_pill{}};
+
+  if (!ctx.m_proc->m_mailbox.enqueue(std::move(term_env))) {
+    while (!ctx.m_proc->m_mailbox.enqueue(std::move(term_env))) {
+      ctx.m_proc->schedule_self(ctx.m_sched->m_mailboxes, ctx.m_sched->m_mailboxes->size());
+      util::cpu_pause();
+    }
+  }
+  
+  /* Schedule self after enqueueing poison pill so consumer can detect it */
+  ctx.m_proc->schedule_self(ctx.m_sched->m_mailboxes, ctx.m_sched->m_mailboxes->size());
+
+  co_return;
+}
+
+/* Consumer coroutine - runs on thread pool and writes to log */
+Task<void> consumer_actor(
+  Consumer_context ctx,
+  std::atomic<bool>& start_flag
+) noexcept {
+  co_await ctx.m_sched->m_consumer_pool->schedule();
+ 
+  while (!start_flag.load(std::memory_order_acquire)) {
+    util::cpu_pause();
+  }
+ 
+  std::size_t local_consumed = 0;
+  std::size_t completed_producers = 0;
+  Message_envelope<Payload_type> msg;
+  std::size_t no_work_iterations = 0;
+ 
+  constexpr std::size_t bulk_read_size = 64;
+  std::array<std::size_t, bulk_read_size> notification_buffer;
+ 
+  /* Timer for batch flushing */
+  auto last_flush_time = std::chrono::steady_clock::now();
+ 
+  while (completed_producers < ctx.m_num_producers) {
+    /* Check timer and flush batch if expired */
+    auto now = std::chrono::steady_clock::now();
+    auto time_since_flush = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_flush_time);
+    if (time_since_flush >= ctx.m_batch_timeout) {
+      /* Check if processor has flush_batch method using SFINAE */
+      if constexpr (requires { ctx.m_processor->flush_batch(); }) {
+        ctx.m_processor->flush_batch();
+        last_flush_time = now;
+      }
+    }
+ 
+    /* Check for poison pills in consumer mailbox (if provided) */
+    if (ctx.m_consumer_process != nullptr) {
+      while (ctx.m_consumer_process->m_mailbox.dequeue(msg)) {
+        if (std::holds_alternative<Poison_pill>(msg.m_payload)) {
+          ++completed_producers;
+          if (completed_producers >= ctx.m_num_producers) {
+            break;
+          }
+        }
+      }
+    }
+ 
+    if (completed_producers >= ctx.m_num_producers) {
+      break;
+    }
+ 
+    Process<Payload_type>* proc = nullptr;
+    bool found_work = false;
+ 
+    std::size_t num_notifications = 0;
+    std::size_t notified_mailbox_idx = 0;
+    
+    while (num_notifications < bulk_read_size && ctx.m_sched->m_mailboxes->m_notify_queue->dequeue(notified_mailbox_idx)) {
+      notification_buffer[num_notifications++] = notified_mailbox_idx;
+    }
+ 
+    for (std::size_t i = 0; i < num_notifications; ++i) {
+      std::size_t mailbox_idx = notification_buffer[i];
+ 
+      auto thread_mbox = ctx.m_sched->m_mailboxes->get_for_thread(mailbox_idx);
+ 
+      if (thread_mbox == nullptr) {
+        continue;
+      }
+ 
+      if (!thread_mbox->m_has_messages.load(std::memory_order_acquire)) {
+        continue;
+      }
+ 
+      bool loop_exited_normally = true;
+ 
+      while (thread_mbox->m_queue.dequeue(proc)) {
+        found_work = true;
+ 
+        util::prefetch_for_read<3>(proc);
+ 
+        proc->m_in_thread_mailbox.store(false, std::memory_order_release);
+ 
+        while (proc->m_mailbox.dequeue(msg)) {
+          if (std::holds_alternative<Poison_pill>(msg.m_payload)) [[unlikely]] {
+            ++completed_producers;
+ 
+            if (completed_producers >= ctx.m_num_producers) {
+              loop_exited_normally = false;
+              break;
+            }
+          } else if constexpr (requires { ctx.m_processor->flush_batch(); }) {
+            /* Check for Fdatasync */
+            if (std::holds_alternative<Fdatasync>(msg.m_payload)) {
+              /* Flush batch and call fdatasync */
+              if constexpr (requires { ctx.m_processor->flush_batch_and_fdatasync(); }) {
+                ctx.m_processor->flush_batch_and_fdatasync();
+              } else {
+                ctx.m_processor->flush_batch();
+              }
+              continue;
+            }
+            /* Check for Fsync */
+            if (std::holds_alternative<Fsync>(msg.m_payload)) {
+              /* Flush batch and call fsync */
+              if constexpr (requires { ctx.m_processor->flush_batch_and_fsync(); }) {
+                ctx.m_processor->flush_batch_and_fsync();
+              } else {
+                ctx.m_processor->flush_batch();
+              }
+              continue;
+            }
+            /* Regular payload message */
+            if (std::holds_alternative<Payload_type>(msg.m_payload)) {
+              process_payload_message(*ctx.m_processor, std::get<Payload_type>(msg.m_payload), msg);
+              ++local_consumed;
+            }
+          } else {
+            /* Only process if it's actually a payload message */
+            if (std::holds_alternative<Payload_type>(msg.m_payload)) {
+              process_payload_message(*ctx.m_processor, std::get<Payload_type>(msg.m_payload), msg);
+              ++local_consumed;
+            }
+          }
+        }
+        
+        if (completed_producers >= ctx.m_num_producers) {
+          loop_exited_normally = false;
+          break;
+        }
+      }
+ 
+      if (loop_exited_normally) {
+        thread_mbox->m_has_messages.store(false, std::memory_order_release);
+      }
+      
+      if (completed_producers >= ctx.m_num_producers) {
+        break;
+      }
+    }
+ 
+    const std::size_t scan_interval = (ctx.m_num_producers == 1) ? 1000 : 20;
+ 
+    if (!found_work) {
+      ++no_work_iterations;
+    } else {
+      no_work_iterations = 0;
+    }
+ 
+    if (no_work_iterations % scan_interval == 0) {
+      /* Scan all processes to find poison pills in producer mailboxes.
+       * Producers send poison pills to their own mailboxes, so we need to scan all processes.
+       * Skip the consumer process (if provided) since producers don't send poison pills there.
+       */
+      for (std::size_t pid = 0; pid < ctx.m_sched->m_processes.size() && completed_producers < ctx.m_num_producers; ++pid) {
+        auto* p = ctx.m_sched->get_process(pid);
+        if (p == nullptr) {
+          continue;
+        }
+        
+        /* Skip consumer process mailbox - producers don't send poison pills there */
+        if (ctx.m_consumer_process && p == ctx.m_consumer_process) {
+          continue;
+        }
+ 
+        while (p->m_mailbox.dequeue(msg)) {
+          if (std::holds_alternative<Poison_pill>(msg.m_payload)) [[unlikely]] {
+            ++completed_producers;
+            if (completed_producers >= ctx.m_num_producers) {
+              break;
+            }
+          } else if constexpr (requires { ctx.m_processor->flush_batch(); }) {
+            /* Check for Fdatasync */
+            if (std::holds_alternative<Fdatasync>(msg.m_payload)) {
+              if constexpr (requires { ctx.m_processor->flush_batch_and_fdatasync(); }) {
+                ctx.m_processor->flush_batch_and_fdatasync();
+              } else {
+                ctx.m_processor->flush_batch();
+              }
+              continue;
+            }
+            /* Regular payload message */
+            if (std::holds_alternative<Payload_type>(msg.m_payload)) {
+              process_payload_message(*ctx.m_processor, std::get<Payload_type>(msg.m_payload), msg);
+            }
+          } else {
+            /* Only process if it's actually a payload message */
+            if (std::holds_alternative<Payload_type>(msg.m_payload)) {
+              process_payload_message(*ctx.m_processor, std::get<Payload_type>(msg.m_payload), msg);
+            }
+          }
+        }
+        
+        if (completed_producers >= ctx.m_num_producers) {
+          break;
+        }
+      }
+    }
+ 
+    if (!found_work) [[unlikely]] {
+      util::cpu_pause();
+    }
+  }
+ 
+  /* Flush any remaining batched messages before completing */
+  if constexpr (requires { ctx.m_processor->flush_batch(); }) {
+    ctx.m_processor->flush_batch();
+  }
+ 
+  if (ctx.m_consumer_done) {
+    ctx.m_consumer_done->store(true, std::memory_order_release);
+  }
+  co_return;
+}
+
+static double test_throughput_actor_model_single_run(const Test_config& config) {
+  const std::size_t total_messages = config.m_num_messages;
+  const std::size_t producers = config.m_num_producers;
+  const std::size_t base_per_producer = producers == 0 ? 0 : total_messages / producers;
+  const std::size_t producer_remainder = producers == 0 ? 0 : total_messages % producers;
+
+  std::string path = config.m_disable_writes ? "/dev/null" : ("/local/tmp/test_actor.log");
+  auto log_file = std::make_shared<Log_file>(path, 512 * 1024 * 1024, config.m_log_block_size, config.m_disable_writes);
+
+  WAL_ASSERT(log_file->m_fd != -1);
+
+  if (!config.m_disable_writes) {
+    auto ret = ::posix_fallocate(log_file->m_fd, 0, log_file->m_max_file_size);
+    if (ret != 0) {
+      log_fatal("Failed to preallocate log file: {}", std::strerror(errno));
+    }
+  }
+
+  /* Use smaller buffers but more of them for better parallelism, when we have small writes and frequent syncs.
+   * If buffer size is large (e.g., 16384 blocks), use more smaller buffers.
+   * Aim for ~4-8MB per buffer instead of 64MB */
+  const std::size_t target_buffer_size_blocks = std::min(config.m_log_buffer_size_blocks, std::size_t(2048));
+  const std::size_t buffer_pool_size = std::max(std::size_t(8), (config.m_log_buffer_size_blocks + target_buffer_size_blocks - 1) / target_buffer_size_blocks);
+  /* Ensure pool size is a power of 2 */
+  const std::size_t log2_pool_size = static_cast<std::size_t>(std::ceil(std::log2(static_cast<double>(buffer_pool_size))));
+  const std::size_t buffer_pool_size_pow2 = std::size_t(1) << log2_pool_size;
+  auto wal_config = wal::Config(target_buffer_size_blocks, config.m_log_block_size, kChecksumAlgorithm);
+  auto log = std::make_shared<wal::Log>(0, buffer_pool_size_pow2, wal_config);
+
+  /* Create metrics collector for write_to_store operations - always enabled unless explicitly disabled.
+   * Write-to-store metrics are always collected; producer latency is controlled by Metrics_config */
+  util::Metrics metrics;
+  const Metrics_config* metrics_config_ptr = nullptr;
+
+  if (!config.m_disable_metrics) {
+    log->set_metrics(&metrics);
+    metrics_config_ptr = &config.m_metrics_config;
+  }
+
+  /* Capture metrics pointer directly to avoid circular reference with log shared_ptr.
+   * Use raw pointer since metrics lifetime is managed by this function scope */
+  util::Metrics* metrics_ptr = (!config.m_disable_metrics) ? &metrics : nullptr;
+
+  Log_writer log_writer = [log_file, metrics_ptr, disable_writes = config.m_disable_writes]
+    (std::span<struct iovec> span, wal::Log::Sync_type sync_type) -> wal::Result<std::size_t> {
+    auto result = log_file->write(span);
+    
+    if (result.has_value() && !disable_writes) {
+      bool sync_succeeded = false;
+      
+      if (sync_type == wal::Log::Sync_type::Fdatasync) [[likely]] {
+        auto sync_start = Clock::now();
+        if (::fdatasync(log_file->m_fd) == 0) {
+          sync_succeeded = true;
+        } else {
+          log_err("fdatasync failed: {}", std::strerror(errno));
+          return std::unexpected(wal::Status::IO_error);
+        }
+        auto sync_end = Clock::now();
+        auto sync_duration = std::chrono::duration_cast<std::chrono::nanoseconds>(sync_end - sync_start);
+        
+        if (metrics_ptr != nullptr) {
+          metrics_ptr->inc(util::MetricType::FdatasyncCount);
+          metrics_ptr->add_timing(util::MetricType::FdatasyncTiming, sync_duration);
+        }
+      } else if (sync_type == wal::Log::Sync_type::Fsync) {
+        auto sync_start = Clock::now();
+        if (::fsync(log_file->m_fd) == 0) {
+          sync_succeeded = true;
+        } else {
+          log_err("fsync failed: {}", std::strerror(errno));
+          return std::unexpected(wal::Status::IO_error);
+        }
+        auto sync_end = Clock::now();
+        auto sync_duration = std::chrono::duration_cast<std::chrono::nanoseconds>(sync_end - sync_start);
+        
+        if (metrics_ptr != nullptr) {
+          metrics_ptr->inc(util::MetricType::FsyncCount);
+          metrics_ptr->add_timing(util::MetricType::FsyncTiming, sync_duration);
+        }
+      }
+      
+      if (sync_succeeded && !span.empty()) {
+        const auto n_blocks = span.size() / 3;
+        if (n_blocks > 0) {
+          const auto block_header = reinterpret_cast<const wal::Block_header*>(span[0].iov_base);
+          const auto block_no = block_header->get_block_no();
+          const off_t length = static_cast<off_t>(n_blocks * log_file->m_block_size);
+          const off_t phy_off = static_cast<off_t>(block_no * log_file->m_block_size % static_cast<std::size_t>(log_file->m_max_file_size));
+          
+          if (::posix_fadvise(log_file->m_fd, phy_off, length, POSIX_FADV_DONTNEED) != 0) {
+            log_warn("posix_fadvise(DONTNEED) failed: {}", std::strerror(errno));
+          }
+        }
+      }
+    }
+    
+    return result;
+  };
+
+  Actor_test_setup<Payload_type, Scheduler_type> setup(producers);
+
+  std::vector<Pid> producer_pids;
+  for (std::size_t i = 0; i < producers; ++i) {
+    producer_pids.push_back(setup.m_sched.spawn(config.m_mailbox_size));
+  }
+
+  /* Create consumer process for poison pills */
+  Pid consumer_pid = setup.m_sched.spawn(config.m_mailbox_size);
+  auto consumer_process = setup.m_sched.get_process(consumer_pid);
+
+  std::atomic<bool> start_flag{false};
+  std::atomic<bool> consumer_done{false};
+
+  Consumer_context consumer_ctx{
+    .m_log = log,
+    .m_log_writer = log_writer,
+    .m_consumer_done = &consumer_done,
+    .m_disable_log_writes = config.m_disable_log_writes,
+    .m_consumer_pool = &setup.m_consumer_pool,
+    .m_io_pool = &setup.m_io_pool,
+    .m_consumer_process = consumer_process,
+    .m_sched = nullptr,  /* Will be set after processor is created */
+    .m_processor = nullptr,  /* Will be set after processor is created */
+    .m_num_producers = 0,  /* Will be set after processor is created */
+    .m_batch_timeout = std::chrono::milliseconds(10)
+  };
+
+  /* Start the background I/O coroutine to process buffers on dedicated I/O pool */
+  if (!config.m_disable_log_writes) {
+    log->start_io(log_writer, &setup.m_io_pool);
+    /* Brief pause to ensure I/O coroutine is scheduled and ready */
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+
+  Log_message_processor processor(
+    consumer_ctx.m_log,
+    consumer_ctx.m_io_pool,
+    consumer_ctx.m_disable_log_writes,
+    config.m_disable_metrics ? nullptr : &metrics,  /* Pass metrics only if not disabled */
+    metrics_config_ptr  /* Pass metrics config for fine-grained control */
+  );
+
+  assert(config.m_num_consumers == 1);
+
+  Log_message_processor msg_processor(
+    consumer_ctx.m_log,
+    consumer_ctx.m_io_pool,
+    consumer_ctx.m_disable_log_writes,
+    config.m_disable_metrics ? nullptr : &metrics,  /* Pass metrics only if not disabled */
+    metrics_config_ptr  /* Pass metrics config for fine-grained control */
+  );
+
+  /* Set additional fields in consumer context */
+  consumer_ctx.m_sched = &setup.m_sched;
+  consumer_ctx.m_processor = &msg_processor;
+  consumer_ctx.m_num_producers = producers;
+  consumer_ctx.m_batch_timeout = std::chrono::milliseconds(10);  /* Flush batch every 10ms */
+
+  /* Use simple lambda when writes are disabled, matching test_actor_model exactly */
+  /* Pass processor by reference so timer can call flush_batch */
+  detach(consumer_actor(consumer_ctx, std::ref(start_flag)));
+
+  /* Launch producer actors (coroutines) */
+  for (std::size_t p = 0; p < producers; ++p) {
+    const std::size_t messages_for_this_producer = base_per_producer + (p < producer_remainder ? 1 : 0);
+
+    Producer_context producer_ctx;
+    producer_ctx.m_self = producer_pids[p];
+    producer_ctx.m_proc = setup.m_sched.get_process(producer_pids[p]);
+    producer_ctx.m_sched = &setup.m_sched;
+    producer_ctx.m_fdatasync_interval = config.m_fdatasync_interval;
+    producer_ctx.m_sync_type = config.m_sync_type;
+    /* Enable latency tracking if metrics are enabled, producer latency is enabled, and log writes are not disabled */
+    producer_ctx.m_track_latency = (!config.m_disable_metrics && 
+                                    config.m_metrics_config.m_enable_producer_latency &&
+                                    log->get_metrics() != nullptr && 
+                                    !config.m_disable_log_writes);
+    auto producer_task = producer_actor(producer_ctx, messages_for_this_producer, start_flag); 
+    producer_task.start_on_pool(setup.m_producer_pool);
+  }
+
+  /* Brief warmup to ensure all coroutines are scheduled and ready */
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  
+  /* Start timing immediately before releasing start flag */
+  auto start = Clock::now();
+  start_flag.store(true, std::memory_order_release);
+
+  /* Wait for consumer to complete (event-based) */
+  constexpr auto max_wait_time = std::chrono::seconds(600);
+  auto wait_start = Clock::now();
+
+  while (!consumer_done.load(std::memory_order_acquire)) {
+    auto elapsed = Clock::now() - wait_start;
+    if (elapsed > max_wait_time) {
+      std::println(stderr, "ERROR: Timeout waiting for consumer to complete");
+      break;
+    }
+    for (int j = 0; j < 10; ++j) {
+      util::cpu_pause();
+    }
+  }
+
+  /* Consumer coroutines will complete and signal via consumer_done flag */
+
+  auto end = Clock::now();
+
+  /* Brief delay to ensure all I/O is complete before shutdown */
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  if (!config.m_disable_log_writes) {
+    auto shutdown_result = log->shutdown(log_writer);
+    WAL_ASSERT(shutdown_result.has_value());
+    
+    /* Clear the I/O callback to break circular reference before log goes out of scope */
+    /* The callback lambda captures metrics_ptr, but Log also stores it, creating a cycle */
+    /* Wait a bit more to ensure all I/O coroutines have finished */
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  
+  /* Explicitly clear the log_writer lambda to break any remaining references */
+  /* This ensures the lambda (which may capture log_file and metrics_ptr) is destroyed */
+  log_writer = {};
+
+  const auto elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
+  double elapsed_s = static_cast<double>(elapsed_ns.count()) / 1'000'000'000.0;
+
+  /* All messages were processed when consumer_done is true */
+  const auto processed = total_messages;
+  const auto ops_per_sec = elapsed_s == 0.0 ? 0.0 : static_cast<double>(processed) / elapsed_s;
+
+  /* Print all metrics if enabled */
+  if (!config.m_disable_metrics && log->get_metrics() != nullptr) {
+    /* Print write-to-store metrics */
+    log->get_metrics()->print("Write-to-Store Metrics:");
+    
+    /* Explicitly print sync metrics even if count is 0 for visibility */
+    auto fdatasync_count = log->get_metrics()->get_counter(util::MetricType::FdatasyncCount);
+    auto fsync_count = log->get_metrics()->get_counter(util::MetricType::FsyncCount);
+    auto consumer_sync_count = log->get_metrics()->get_counter(util::MetricType::ConsumerSyncCount);
+    std::println("\nSync Operations:");
+    std::println("  fdatasync.count: {}", fdatasync_count);
+    std::println("  fsync.count: {}", fsync_count);
+    std::println("  consumer_sync.count: {}", consumer_sync_count);
+    
+    if (fdatasync_count > 0) {
+      auto fdatasync_stats = log->get_metrics()->get_timing_stats(util::MetricType::FdatasyncTiming);
+      if (fdatasync_stats.m_count > 0) {
+        std::println("  fdatasync.timing: count: {} min: {}ns max: {}ns avg: {:.2f}ns total: {}ns",
+                     fdatasync_stats.m_count, fdatasync_stats.m_min_ns, fdatasync_stats.m_max_ns,
+                     static_cast<double>(fdatasync_stats.m_avg_ns), fdatasync_stats.m_sum_ns);
+        const auto& timings = log->get_metrics()->get_timings(util::MetricType::FdatasyncTiming);
+        if (!timings.empty()) {
+          auto histogram = util::Metrics::generate_timing_histogram(timings, 20);
+          std::println("    histogram:");
+          for (const auto& [range, count] : histogram) {
+            double percentage = (100.0 * static_cast<double>(count) / static_cast<double>(fdatasync_stats.m_count));
+            std::println("      {}: {} ({:.2f}%)", range, count, percentage);
+          }
+        }
+      } else {
+        std::println("  fdatasync.timing: no timing data collected");
+      }
+    }
+    
+    if (fsync_count > 0) {
+      auto fsync_stats = log->get_metrics()->get_timing_stats(util::MetricType::FsyncTiming);
+      if (fsync_stats.m_count > 0) {
+        std::println("  fsync.timing: count: {} min: {}ns max: {}ns avg: {:.2f}ns total: {}ns",
+                     fsync_stats.m_count, fsync_stats.m_min_ns, fsync_stats.m_max_ns,
+                     static_cast<double>(fsync_stats.m_avg_ns), fsync_stats.m_sum_ns);
+        const auto& timings = log->get_metrics()->get_timings(util::MetricType::FsyncTiming);
+        if (!timings.empty()) {
+          auto histogram = util::Metrics::generate_timing_histogram(timings, 20);
+          std::println("    histogram:");
+          for (const auto& [range, count] : histogram) {
+            double percentage = (100.0 * static_cast<double>(count) / static_cast<double>(fsync_stats.m_count));
+            std::println("      {}: {} ({:.2f}%)", range, count, percentage);
+          }
+        }
+      } else {
+        std::println("  fsync.timing: no timing data collected");
+      }
+    }
+    
+    /* Print producer latency histogram */
+    auto latency_stats = log->get_metrics()->get_timing_stats(util::MetricType::ProducerLatency);
+    if (latency_stats.m_count > 0) {
+      std::println("\nProducer Latency Statistics:");
+      std::println("  Total requests: {}", latency_stats.m_count);
+      std::println("  Min latency: {} ns ({:.3f} us)", latency_stats.m_min_ns, static_cast<double>(latency_stats.m_min_ns) / 1000.0);
+      std::println("  Max latency: {} ns ({:.3f} us)", latency_stats.m_max_ns, static_cast<double>(latency_stats.m_max_ns) / 1000.0);
+      std::println("  Avg latency: {:.2f} ns ({:.3f} us)", static_cast<double>(latency_stats.m_avg_ns), static_cast<double>(latency_stats.m_avg_ns) / 1000.0);
+      
+      /* Print latency histogram */
+      const auto& timings = log->get_metrics()->get_timings(util::MetricType::ProducerLatency);
+      if (!timings.empty()) {
+        auto histogram = util::Metrics::generate_timing_histogram(timings, 20);
+        std::println("\n  Producer Latency Histogram:");
+        for (const auto& [range, count] : histogram) {
+          double percentage = (100.0 * static_cast<double>(count) / static_cast<double>(latency_stats.m_count));
+          std::println("    {}: {} ({:.2f}%)", range, count, percentage);
+        }
+      }
+    }
+  }
+
+  return ops_per_sec;
+}
+
+static void test_throughput_actor_model(const Test_config& config) {
+  std::println("[test_throughput_actor_model] producers={}, consumers={}, messages={}, iterations={}",
+               config.m_num_producers, config.m_num_consumers, config.m_num_messages, config.m_num_iterations);
+
+  double total_ops_per_sec = 0.0;
+  double min_ops_per_sec = std::numeric_limits<double>::max();
+  double max_ops_per_sec = 0.0;
+
+  for (std::size_t run = 0; run < config.m_num_iterations; ++run) {
+    double ops_per_sec = test_throughput_actor_model_single_run(config);
+    total_ops_per_sec += ops_per_sec;
+    min_ops_per_sec = std::min(min_ops_per_sec, ops_per_sec);
+    max_ops_per_sec = std::max(max_ops_per_sec, ops_per_sec);
+  }
+
+  const double avg_ops_per_sec = total_ops_per_sec / static_cast<double>(config.m_num_iterations);
+  const std::size_t total_messages = config.m_num_messages;
+  const double avg_elapsed_s = static_cast<double>(total_messages) / avg_ops_per_sec;
+  const double throughput_bytes_s = avg_ops_per_sec * Test_message::SIZE;
+
+  /* Format throughput with appropriate units (KiB/s, MiB/s, GiB/s) */
+  const char* throughput_unit = "B/s";
+  double throughput_value = throughput_bytes_s;
+  if (throughput_bytes_s >= 1024.0 * 1024.0 * 1024.0) {
+    throughput_value = throughput_bytes_s / (1024.0 * 1024.0 * 1024.0);
+    throughput_unit = "GiB/s";
+  } else if (throughput_bytes_s >= 1024.0 * 1024.0) {
+    throughput_value = throughput_bytes_s / (1024.0 * 1024.0);
+    throughput_unit = "MiB/s";
+  } else if (throughput_bytes_s >= 1024.0) {
+    throughput_value = throughput_bytes_s / 1024.0;
+    throughput_unit = "KiB/s";
+  }
+
+  /* Format ops with appropriate units (K/s, M/s, G/s) */
+  const char* ops_unit = "ops/s";
+  double ops_value = avg_ops_per_sec;
+  if (avg_ops_per_sec >= 1'000'000'000.0) {
+    ops_value = avg_ops_per_sec / 1'000'000'000.0;
+    ops_unit = "G ops/s";
+  } else if (avg_ops_per_sec >= 1'000'000.0) {
+    ops_value = avg_ops_per_sec / 1'000'000.0;
+    ops_unit = "M ops/s";
+  } else if (avg_ops_per_sec >= 1'000.0) {
+    ops_value = avg_ops_per_sec / 1'000.0;
+    ops_unit = "K ops/s";
+  }
+
+  std::println("[test_throughput_actor_model] total_messages={}, iterations={}, elapsed={:.3f}s, throughput={:.2f} {}, ops={:.2f} {} (min={:.2f}, max={:.2f})",
+               total_messages, config.m_num_iterations, avg_elapsed_s, throughput_value, throughput_unit,
+               ops_value, ops_unit, min_ops_per_sec / 1'000'000.0, max_ops_per_sec / 1'000'000.0);
+}
+
+static void print_usage(const char* program_name) noexcept {
+  std::fprintf(stderr,
+               "Usage: %s [OPTIONS]\n"
+               "\n"
+               "Options:\n"
+               "  -M, --mailbox-size NUM   Mailbox size (default: 256)\n"
+               "  -m, --messages NUM       Number of messages per iteration (default: 1000000)\n"
+               "  -i, --iterations NUM     Number of iterations to average (default: 1)\n"
+               "  -p, --producers NUM      Number of producer actors (default: 1)\n"
+               "  -c, --consumers NUM       Number of consumer actors (default: 1)\n"
+               "  -d, --disable-writes     Disable actual disk writes (default: off)\n"
+               "  -w, --disable-log-writes Disable log->write() calls entirely (default: off)\n"
+               "  -S, --skip-memcpy        Skip memcpy in write operation (default: off)\n"
+               "  -X, --disable-metrics    Disable metrics collection entirely (default: off)\n"
+               "      --no-producer-latency Disable producer latency tracking (most expensive metric)\n"
+               "      --log-block-size NUM Size of each log block in bytes (default: 4096)\n"
+               "      --log-buffer-blocks NUM Number of blocks in log buffer (default: 16384)\n"
+               "      --timeout-ms NUM     Timeout in milliseconds (0 disables, default: 3000)\n"
+               "  -f, --fdatasync-interval NUM Send sync messages with probability NUM (0.0-1.0, e.g., 0.3 = 30%%, default: 0)\n"
+               "      --use-fsync          Use fsync messages instead of fdatasync (default: fdatasync)\n"
+               "  -h, --help                Show this help message\n",
+               program_name);
+}
+
+int main(int argc, char** argv) {
+  Test_config config;
+  bool show_help = false;
+
+  static const struct option long_options[] = {
+    {"mailbox-size", required_argument, nullptr, 'M'},
+    {"messages", required_argument, nullptr, 'm'},
+    {"iterations", required_argument, nullptr, 'i'},
+    {"producers", required_argument, nullptr, 'p'},
+    {"consumers", required_argument, nullptr, 'c'},
+    {"disable-writes", no_argument, nullptr, 'd'},
+    {"disable-log-writes", no_argument, nullptr, 'w'},
+    {"skip-memcpy", no_argument, nullptr, 'S'},
+    {"disable-metrics", no_argument, nullptr, 'X'},
+    {"no-producer-latency", no_argument, nullptr, 1000},
+    {"log-block-size", required_argument, nullptr, 'L'},
+    {"log-buffer-blocks", required_argument, nullptr, 'R'},
+    {"timeout-ms", required_argument, nullptr, 'T'},
+    {"fdatasync-interval", required_argument, nullptr, 'f'},
+    {"use-fsync", no_argument, nullptr, 1005},
+    {"help", no_argument, nullptr, 'h'},
+    {nullptr, 0, nullptr, 0}
+  };
+
+  int opt;
+  int option_index = 0;
+  while ((opt = getopt_long(argc, argv, "M:m:i:p:c:hwdSXL:R:T:f:", long_options, &option_index)) != -1) {
+    switch (opt) {
+      case 'M':
+        config.m_mailbox_size = std::stoull(optarg);
+        break;
+      case 'm':
+        config.m_num_messages = std::stoull(optarg);
+        break;
+      case 'i':
+        config.m_num_iterations = std::stoull(optarg);
+        break;
+      case 'p':
+        config.m_num_producers = std::stoull(optarg);
+        break;
+      case 'c':
+        config.m_num_consumers = std::stoull(optarg);
+        break;
+      case 'd':
+        config.m_disable_writes = true;
+        break;
+      case 'w':
+        config.m_disable_log_writes = true;
+        break;
+      case 'S':
+        config.m_skip_memcpy = true;
+        break;
+      case 'X':
+        config.m_disable_metrics = true;
+        break;
+      case 1000:
+        config.m_metrics_config.m_enable_producer_latency = false;
+        break;
+      case 'L':
+        config.m_log_block_size = std::stoull(optarg);
+        break;
+      case 'R':
+        config.m_log_buffer_size_blocks = std::stoull(optarg);
+        break;
+      case 'T':
+        config.m_timeout_ms = std::stoull(optarg);
+        break;
+      case 'f': {
+        /* Parse as double to support fractional values like 0.3 (30% probability) */
+        double prob = std::stod(optarg);
+        if (prob < 0.0 || prob > 1.0) {
+          std::println(stderr, "Error: fdatasync-interval must be between 0 and 1 (got {})", prob);
+          return EXIT_FAILURE;
+        }
+        if (prob <= 0.0) {
+          /* 0 or negative means disabled */
+          config.m_fdatasync_interval = 0;
+        } else {
+          /* Convert probability to interval: if prob = 0.3, we want 1/interval = 0.3, so interval = 1/0.3 ≈ 3.33 */
+          /* Use ceiling to ensure we get at least the desired probability */
+          config.m_fdatasync_interval = static_cast<std::size_t>(std::ceil(1.0 / prob));
+        }
+        break;
+      }
+      case 1005:
+        config.m_sync_type = Sync_message_type::Fsync;
+        break;
+      case 'h':
+        show_help = true;
+        break;
+      default:
+        print_usage(argv[0]);
+        return EXIT_FAILURE;
+    }
+  }
+
+  if (show_help) {
+    print_usage(argv[0]);
+    return EXIT_SUCCESS;
+  }
+
+  test_throughput_actor_model(config);
+  return EXIT_SUCCESS;
+}
+
