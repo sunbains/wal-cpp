@@ -28,7 +28,18 @@ if(MSVC)
   set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT ProgramDatabase)
 endif()
 
-# Non-MSVC: we’ll add debug info + linker tweaks at the target level.
+# Non-MSVC: we'll add debug info + linker tweaks at the target level.
+
+# ----------------------------- Linker configuration --------------------------
+# Try mold if available (for both library and tests).
+if(NOT MSVC)
+  find_program(MOLD_LD mold PATHS /usr/bin /usr/local/bin)
+  if(MOLD_LD)
+    message(STATUS "Using mold linker: ${MOLD_LD}")
+  else()
+    message(STATUS "mold linker not found, using default linker")
+  endif()
+endif()
 
 # ----------------------------- wal library -----------------------------------
 if(WAL_BUILD_LIB OR WAL_BUILD_TESTS)
@@ -71,13 +82,8 @@ if(WAL_BUILD_LIB OR WAL_BUILD_TESTS)
 
   # Linker options (non-MSVC): build-id and mold if present.
   if(NOT MSVC)
-    # Try mold if available.
-    find_program(MOLD_LD mold PATHS /usr/bin /usr/local/bin)
     if(MOLD_LD)
-      message(STATUS "Using mold linker: ${MOLD_LD}")
       target_link_options(wal PRIVATE -fuse-ld=mold)
-    else()
-      message(STATUS "mold linker not found, using default linker")
     endif()
     target_link_options(wal PRIVATE -Wl,--build-id)
   endif()

@@ -70,19 +70,19 @@ struct alignas(kCLS) Block_header {
     #pragma pack(push, 1)
 
     /** Block number, the left most bit is the flush bit. */
-    block_no_t m_block_no{0};
+    block_no_t m_block_no;
 
     /** Checkpoint number */
-    checkpoint_no_t m_checkpoint_no{0};
+    checkpoint_no_t m_checkpoint_no;
 
     /** Offset of the first mtr log record group in m_data[]. */
-    std::uint16_t m_first_rec_group{0};
+    std::uint16_t m_first_rec_group;
 
     /** Valid data length inside the block. Use atomics to read and write this variable.
      * This struct and variable should be aligned correctly for this to work. Unlike
      * the other fields this field is always in host byte order and only converted
     * to network byte order before writing. */
-    std::uint16_t m_len{0};
+    std::uint16_t m_len;
 
     #pragma pack(pop)
   };
@@ -94,47 +94,56 @@ struct alignas(kCLS) Block_header {
    * @param block_no The log block number: must be > 0 and < LOG_BLOCK_FLUSH_BIT_MASK.
    */
   void set_block_no(block_no_t block_no) noexcept {
-    m_data.m_block_no = util::hton(block_no);
+    m_data.m_block_no = block_no;
   }
 
   void prepare_to_write() noexcept {
+    m_data.m_block_no = util::hton(m_data.m_block_no);
+    m_data.m_checkpoint_no = util::hton(m_data.m_checkpoint_no);
     m_data.m_len = util::hton(m_data.m_len);
+    m_data.m_first_rec_group = util::hton(m_data.m_first_rec_group);
   }
 
   void prepare_to_read() noexcept {
+    m_data.m_block_no = util::ntoh(m_data.m_block_no);
+    m_data.m_checkpoint_no = util::ntoh(m_data.m_checkpoint_no);
+    m_data.m_first_rec_group = util::ntoh(m_data.m_first_rec_group);
     m_data.m_len = util::ntoh(m_data.m_len);
   }
 
   void set_first_rec_group(uint16_t first_rec_group) noexcept {
-    m_data.m_first_rec_group = util::hton(first_rec_group);
+    m_data.m_first_rec_group = first_rec_group;
   }
 
   void set_checkpoint_no(checkpoint_no_t checkpoint_no) noexcept {
-    m_data.m_checkpoint_no = util::hton(checkpoint_no);
+    m_data.m_checkpoint_no = checkpoint_no;
   }
 
   [[nodiscard]] block_no_t get_block_no() const noexcept {
-     return ~FLUSH_BIT_MASK & util::ntoh(m_data.m_block_no);
+     return ~FLUSH_BIT_MASK & m_data.m_block_no;
   }
 
-  /** We handle data len as an exception to the other fields.
-   * It increases incrementally when writing data to the block.
-   * We convert it to network byte order when writing to disk
-   * and back to host byte order when reading from disk. */
+  void initialize(block_no_t block_no) noexcept {
+    m_data.m_block_no = block_no;
+    m_data.m_checkpoint_no = 0;
+    m_data.m_first_rec_group = 0;
+    m_data.m_len = 0;
+  }
+
   [[nodiscard]] uint16_t get_data_len() const noexcept {
-    return util::ntoh(m_data.m_len);
+    return m_data.m_len;
   }
 
   [[nodiscard]] uint16_t get_first_rec_group() const noexcept {
-    return util::ntoh(m_data.m_first_rec_group);
+    return m_data.m_first_rec_group;
   }
 
   [[nodiscard]] checkpoint_no_t get_checkpoint_no() const noexcept {
-    return util::ntoh(m_data.m_checkpoint_no);
+    return m_data.m_checkpoint_no;
   }
 
   [[nodiscard]] bool get_flush_bit() const noexcept {
-    return (util::ntoh(m_data.m_block_no) & FLUSH_BIT_MASK) != 0;
+    return (m_data.m_block_no & FLUSH_BIT_MASK) != 0;
   }
 
   /**
@@ -144,9 +153,9 @@ struct alignas(kCLS) Block_header {
    */
   void set_flush_bit(bool val) noexcept {
     if (val) {
-      set_block_no(util::ntoh(m_data.m_block_no) | FLUSH_BIT_MASK);
+      m_data.m_block_no |= FLUSH_BIT_MASK;
     } else {
-      set_block_no(util::ntoh(m_data.m_block_no) & ~FLUSH_BIT_MASK);
+      m_data.m_block_no &= ~FLUSH_BIT_MASK;
     }
   }
 
@@ -166,16 +175,37 @@ struct alignas(kCLS) Block_header {
     );
   }
 
-  Data m_data{};
+  Data m_data;
 };
 
 static_assert(sizeof(Block_header::Data) == 12, "Block_header::Data size must be equal to 12 ie. packed size");
 static_assert(std::is_standard_layout_v<Block_header>, "Block_header must be standard layout");
+static_assert(std::is_trivial_v<Block_header>, "Block_header::Data must be trivial");
 static_assert(std::is_trivially_copyable_v<Block_header>, "Block_header must be trivially copyable");
 static_assert(alignof(Block_header) == kCLS, "Block_header must be cache-line aligned");
 
 struct [[nodiscard]] Circular_buffer {
   using IO_vecs = std::vector<struct iovec>;
+
+  struct [[nodiscard]] Config {
+    /** Constructor
+     * 
+     * @param[in] n_blocks The number of blocks in the circular buffer.
+     * @param[in] block_size The size of the block in the circular buffer.
+     */
+    explicit Config(size_t n_blocks, size_t block_size) noexcept
+      : m_n_blocks(n_blocks),
+        m_block_size(block_size) {}
+
+    ~Config() = default;
+
+    const size_t m_n_blocks;
+    const size_t m_block_size;
+
+    std::size_t get_data_size_in_block() const noexcept {
+      return m_block_size - sizeof(Block_header::Data) - sizeof(crc32_t);
+    }
+  };
 
   /**
    * Callback function to read the buffer from disk.
@@ -204,32 +234,31 @@ struct [[nodiscard]] Circular_buffer {
     std::uint16_t m_committed{false};
   };
 
-  using Block = std::tuple<const Block_header*, std::span<const std::byte>, crc32_t*>;
+  using Block = std::tuple<Block_header*, std::span<const std::byte>, crc32_t*>;
 
-  explicit Circular_buffer(lsn_t hwm, size_t n_blocks, size_t block_size) noexcept;
+  explicit Circular_buffer(lsn_t hwm, Config config) noexcept;
 
   ~Circular_buffer() noexcept;
 
   [[nodiscard]] Block_header &get_block_header(std::size_t block_index) noexcept {
-    assert(block_index < m_n_blocks);
+    assert(block_index < m_config.m_n_blocks);
 
-    const auto bhs{reinterpret_cast<Block_header*>(m_buffer.data())};
-    return bhs[block_index];
+    return m_block_header_array[block_index];
   }
 
   [[nodiscard]] const Block_header &get_block_header(std::size_t block_index) const noexcept {
-    assert(block_index < m_n_blocks);
+    assert(block_index < m_config.m_n_blocks);
     return m_block_header_array[block_index];
   }
 
   [[nodiscard]] const std::span<const std::byte> get_data(std::size_t block_index) const noexcept {
-    assert(block_index < m_n_blocks);
-    return std::span<std::byte>(&m_data_array[(get_data_size_in_block() * block_index)], get_data_size_in_block());
+    assert(block_index < m_config.m_n_blocks);
+    return std::span<std::byte>(&m_data_array[(m_config.get_data_size_in_block() * block_index)], m_config.get_data_size_in_block());
   }
 
   /** Get the size of the data in the block. */
   [[nodiscard]] std::size_t get_data_size_in_block() const noexcept {
-    return m_data_size_in_block;
+    return m_config.get_data_size_in_block();
   }
 
   [[nodiscard]] std::size_t get_total_data_size() const noexcept {
@@ -237,11 +266,11 @@ struct [[nodiscard]] Circular_buffer {
   }
 
   [[nodiscard]] std::size_t get_total_block_header_size() const noexcept {
-    return sizeof(Block_header) * m_n_blocks;
+    return sizeof(Block_header) * m_config.m_n_blocks;
   }
 
   [[nodiscard]] const crc32_t &get_crc32(std::size_t block_index) const noexcept {
-    assert(block_index < m_n_blocks);
+    assert(block_index < m_config.m_n_blocks);
     return m_crc32_array[block_index];
   }
 
@@ -250,7 +279,7 @@ struct [[nodiscard]] Circular_buffer {
   }
 
   [[nodiscard]] Block get_block(std::size_t block_index) noexcept {
-    assert(block_index < m_n_blocks);
+    assert(block_index < m_config.m_n_blocks);
     return std::make_tuple(&get_block_header(block_index), get_data(block_index), &get_crc32(block_index));
   }
 
@@ -269,12 +298,33 @@ struct [[nodiscard]] Circular_buffer {
     }; 
   }
 
-  [[nodiscard]] const Block_header &get_first_block_header() const noexcept {
-    return get_block_header(0);
+  [[nodiscard]] std::span<std::byte> data() const noexcept {
+    return std::span<std::byte>(m_data_array, m_total_data_size);
   }
 
-  [[nodiscard]] const Block_header &get_last_block_header() const noexcept {
-    return get_block_header(m_n_blocks - 1);
+  [[nodiscard]] std::span<Block_header> headers() const noexcept {
+    return std::span<Block_header>(m_block_header_array, m_config.m_n_blocks);
+  }
+
+  [[nodiscard]] std::span<crc32_t> crc32s() const noexcept {
+    return std::span<crc32_t>(m_crc32_array, m_config.m_n_blocks);
+  }
+
+  [[nodiscard]] std::size_t get_first_block_index() const noexcept {
+    return (m_lwm / m_config.get_data_size_in_block()) % m_config.m_n_blocks;
+  }
+
+  [[nodiscard]] std::size_t get_last_block_index() const noexcept {
+    assert(m_committed_lsn >= m_lwm);
+    return ((m_committed_lsn - m_lwm) / (m_config.get_data_size_in_block() - 1)) % m_config.m_n_blocks;
+  }
+
+  [[nodiscard]] const Block_header &front() const noexcept {
+    return get_block_header(get_first_block_index());
+  }
+
+  [[nodiscard]] const Block_header &back() const noexcept {
+    return get_block_header(get_last_block_index());
   }
 
   /** 
@@ -291,78 +341,110 @@ struct [[nodiscard]] Circular_buffer {
    * @return The number of bytes written.
    */
   [[nodiscard]] Result<std::size_t> write(const Slot &slot, std::span<const std::byte> span) noexcept {
-    assert(slot.m_len > 0);
+    assert(span.size() > 0);
     assert(slot.m_len == span.size());
 
-    const auto block_no{slot.m_lsn / m_data_size_in_block};
-    const auto fitrst_block_no = get_first_block_header().get_block_no();
+    using len_t = decltype(Block_header::Data::m_len);
 
-    assert(block_no >= fitrst_block_no);
+    assert(m_lwm <= slot.m_lsn);
 
-    if (block_no > get_last_block_header().get_block_no()) {
-      /* Buffer is full because the LSN is outside the buffer bounds
-       * we need to flush the buffer to disk first and move the flush LSN
-       * forward. */
+    if (m_total_data_size < slot.m_lsn - m_lwm) {
       return std::unexpected(Status::Not_enough_space);
     }
 
-    /* Convert to relative offset within the data array. This is the offset
-    from we start writing data to the data array. */
-    auto relative_offset{slot.m_lsn % get_total_data_size()};
-    
-    /* Ensure we don't read beyond span or write beyond buffer */
-    auto copy_len = std::min({static_cast<std::size_t>(slot.m_len), get_total_data_size() - relative_offset});
+    std::size_t rel_off = static_cast<std::size_t>(slot.m_lsn % m_total_data_size);
+    const std::size_t len = std::min(size_t(slot.m_len), m_total_data_size - rel_off);
 
-    assert(copy_len > 0);
+    log_inf("writing {} bytes at LSN {} (rel_off: {}, len: {})", slot.m_len, slot.m_lsn, rel_off, len);
 
-    /* Calculate offset within the first block */
-    auto offset_in_block{relative_offset % get_data_size_in_block()};
-    auto block_index = static_cast<std::size_t>(block_no - fitrst_block_no);
-    
-    auto ptr{m_data_array + relative_offset};
+    assert(len > 0);
 
-    std::memcpy(ptr, span.data(), copy_len);
+    auto block_no = slot.m_lsn / m_config.get_data_size_in_block();
 
-    auto remaining_bytes{copy_len};
+    const auto off_in_blk = static_cast<std::size_t>(slot.m_lsn % m_config.get_data_size_in_block());
 
-    /* Update the block headers data length field. */
-    while (remaining_bytes > 0 && block_index < m_n_blocks) {
-      /* Calculate how many bytes we can write in the current block */
-      const auto space_in_block = get_data_size_in_block() - offset_in_block;
-      const auto n_written = std::min(space_in_block, remaining_bytes);
-      
-      /* Update the block header's data length */
-      auto block_header = &m_block_header_array[block_index];
-      std::atomic_ref<decltype(Block_header::Data::m_len)> data_len(block_header->m_data.m_len);
-      data_len.fetch_add(static_cast<decltype(Block_header::Data::m_len)>(n_written));
+    assert(block_no < std::numeric_limits<block_no_t>::max());
 
-      remaining_bytes -= n_written;
-      
-      /* Move to next block (no wraparound - caller handles buffer full) */
-      if (remaining_bytes > 0) [[unlikely]] {
-        ++block_index;
-        /* Start at beginning of next block */
-        offset_in_block = 0; 
-      }
+    std::size_t block_index = static_cast<std::size_t>(block_no - front().get_block_no()) % m_config.m_n_blocks;
+    assert(block_index < m_config.m_n_blocks);
+
+    std::size_t copied = 0;
+    std::byte* ptr = m_data_array + rel_off;
+
+    /* Process current block, then subsequent blocks as needed. */
+    std::size_t offset_in_block = off_in_blk;
+
+    while (copied < len) {
+
+      auto &hdr = get_block_header(block_index);
+
+      hdr.set_block_no(static_cast<block_no_t>(block_no));
+
+      /* Copy bounded by remaining bytes and remaining space in this block. */
+      const std::size_t avail_in_block = m_config.get_data_size_in_block() - offset_in_block;
+      const std::size_t to_copy = std::min(len - copied, avail_in_block);
+
+      log_inf("writing {} bytes to block {} (block_no: {}, block_index: {})", to_copy, block_no, block_no, block_index);
+
+      assert(to_copy > 0);
+
+      std::memcpy(ptr, span.data() + copied, to_copy);
+
+      std::atomic_ref<len_t>(hdr.m_data.m_len).fetch_add(static_cast<len_t>(to_copy));
+
+      /* Advance pointers/counters. */
+      copied += to_copy;
+      rel_off = (rel_off + to_copy) % m_total_data_size;
+      ptr = m_data_array + rel_off;
+
+      /* Next block starts at 0 */
+      offset_in_block = 0;
+
+      ++block_no;
+      block_index = (block_index + 1) % m_config.m_n_blocks;
+
+      assert(std::atomic_ref<len_t>(hdr.m_data.m_len).load() <= m_config.get_data_size_in_block());
     }
 
-    /* Return number of bytes actually written, caller should check and handle overflow. */
-    return Result<std::size_t>(copy_len - remaining_bytes);
+    assert(copied > 0 && copied <= len);
+
+    m_committed_lsn.fetch_add(copied, std::memory_order_release);
+
+    log_inf("wrote {} bytes to slot {} (len: {}), m_committed_lsn: {}", copied, slot.m_lsn, len, m_committed_lsn.load());
+
+    /* Caller can detect partial write via return value. */
+    return Result<std::size_t>(copied);
   }
 
   [[nodiscard]] bool is_full() const noexcept {
-    return m_hwm - m_lwm >= get_total_data_size();
+    assert(m_committed_lsn >= m_lwm);
+    assert(m_committed_lsn <= m_hwm);
+    assert(m_committed_lsn - m_lwm <= get_total_data_size());
+    return m_committed_lsn - m_lwm == get_total_data_size();
   }
 
   [[nodiscard]] bool is_empty() const noexcept {
-    return m_hwm - m_lwm == 0;
+    assert(m_committed_lsn >= m_lwm);
+    assert(m_committed_lsn <= m_hwm);
+    return m_committed_lsn == m_lwm;
   }
 
-  /** Check how much space is left in the buffer.
+  /**
+   * Check if there are any pending writes.
+   * This is to check if slots have been reserved but not yet written.
+   * @return True if there are pending writes, false otherwise.
+   */
+  [[nodiscard]] bool pending_writes() const noexcept {
+    return m_committed_lsn < m_hwm;
+  }
+
+  /**
+   * Check how much space is left in the buffer.
    * @return The number of bytes left in the buffer.
    */
   [[nodiscard]] std::size_t check_margin() const noexcept {
-    return get_total_data_size() - (m_hwm - m_lwm);
+    assert(m_committed_lsn >= m_lwm);
+    return m_total_data_size - (m_committed_lsn - m_lwm);
   }
 
   /**
@@ -382,22 +464,60 @@ struct [[nodiscard]] Circular_buffer {
    */
   [[nodiscard]] Result<lsn_t> write_to_store(Write_callback callback) noexcept;
 
+  /**
+   * Clear the headers for the given range of LSNs.
+   * @note: We need clear the header so that we can atomically update the data length.
+   * 
+   * @param[in] start_lsn The start LSN to clear.
+   * @param[in] end_lsn The end LSN to clear.
+  */
+  void clear(lsn_t start_lsn, lsn_t end_lsn) noexcept {
+    assert(start_lsn <= end_lsn);
+    assert(start_lsn >= m_lwm);
+    assert(end_lsn <= m_committed_lsn);
+
+    auto n_blocks_to_clear = ((end_lsn - start_lsn) / m_config.get_data_size_in_block());
+    auto n_bytes_to_clear = n_blocks_to_clear * sizeof(Block_header);
+
+    assert(n_bytes_to_clear <= sizeof(Block_header) * m_config.m_n_blocks);
+
+    const auto start_block_index = (start_lsn / m_config.get_data_size_in_block()) % m_config.m_n_blocks;
+
+    auto ptr = m_block_header_array + start_block_index;
+    const auto end_ptr = m_block_header_array + m_config.m_n_blocks;
+
+    {
+      using uptrdiff_t = std::make_unsigned_t<std::ptrdiff_t>;
+
+      assert(sizeof(Block_header) * n_blocks_to_clear >= n_bytes_to_clear);
+      const auto len = std::min(n_bytes_to_clear, uptrdiff_t(end_ptr - ptr) * sizeof(Block_header));
+      std::memset(ptr, 0, len);
+      n_bytes_to_clear -= len;
+    }
+
+    /* Check for wrap around. */
+    if (n_bytes_to_clear > 0) {
+      std::memset(m_block_header_array, 0, n_bytes_to_clear);
+      n_bytes_to_clear = 0;
+    }
+
+    assert(n_bytes_to_clear == 0);
+  }
+
   [[nodiscard]] std::string to_string() const noexcept;
 
   /** Low water mark, the circular buffer starts at this LSN. */
-  std::atomic<lsn_t> m_lwm{};
+  alignas(kCLS) std::atomic<lsn_t> m_lwm{};
 
-  /** High water mark. We have written this many bytes to the buffer. */
-  std::atomic<lsn_t> m_hwm{};
+  /** High water mark. We have reserved this many bytes to the buffer.
+   * The writes may not have completed yet.
+  */
+  alignas(kCLS) std::atomic<lsn_t> m_hwm{};
 
-  /** Number of blocks in the buffer. */
-  const std::size_t m_n_blocks{};
+  /** LSN of the last write. This is the LSN of the last write that has been committed. */
+  alignas(kCLS) std::atomic<lsn_t> m_committed_lsn{};
 
-  /** Size of the physical block. */
-  const size_t m_block_size{};
-
-  /** Size of the data in each block. */
-  const size_t m_data_size_in_block{};
+  Config m_config;
 
   /** Total size of the data in the buffer. */
   const size_t m_total_data_size{};
@@ -423,15 +543,17 @@ struct [[nodiscard]] Log {
   /**
    * Constructor.
    *
-   * @param lsn The LSN to start the log from.
-   * @param n_blocks The number of blocks in the log.
-   * @param block_size The size of the block in the log.
+   * @param[in]  lsn The LSN to start the log from.
+   * @param[in]  config The configuration for the circular buffer.
    */
-  Log(lsn_t lsn, std::size_t n_blocks, std::size_t block_size) noexcept;
+  Log(lsn_t lsn, const Circular_buffer::Config &config) noexcept;
 
   ~Log() noexcept;
 
   [[nodiscard]] Result<std::size_t> write(Slot &slot, std::span<const std::byte> span) noexcept {
+    assert(span.size() > 0);
+    assert(slot.m_len == span.size());
+
     auto result = m_buffer.write(slot, span);
     if (!result.has_value()) {
       return std::unexpected(result.error());

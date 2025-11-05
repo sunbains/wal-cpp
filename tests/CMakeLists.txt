@@ -40,3 +40,16 @@ find_package(Threads REQUIRED)
 target_link_libraries(wal_tests_bounded_channel PRIVATE Threads::Threads)
 target_link_libraries(wal_tests_logger PRIVATE Threads::Threads)
 target_link_libraries(wal_tests PRIVATE Threads::Threads wal::wal)
+
+# Linker options (non-MSVC): build-id and mold if present.
+# Uses MOLD_LD variable from parent CMakeLists.txt
+if(NOT MSVC)
+  if(MOLD_LD)
+    target_link_options(wal_tests_bounded_channel PRIVATE -fuse-ld=mold)
+    target_link_options(wal_tests_logger PRIVATE -fuse-ld=mold)
+    target_link_options(wal_tests PRIVATE -fuse-ld=mold)
+  endif()
+  target_link_options(wal_tests_bounded_channel PRIVATE -Wl,--build-id)
+  target_link_options(wal_tests_logger PRIVATE -Wl,--build-id)
+  target_link_options(wal_tests PRIVATE -Wl,--build-id)
+endif()

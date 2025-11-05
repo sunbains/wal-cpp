@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <concepts>
+#include <filesystem>
 #include <format>
 #include <functional>
 #include <iostream>
@@ -32,6 +33,32 @@ enum class Log_level : std::uint8_t {
     case Log_level::Err: return "ERRR";
     case Log_level::Fatal: return "FATAL";
     default: return "UNKNOWN";
+  }
+}
+
+/* Extract filename and parent directory from full path */
+[[nodiscard]] inline std::string get_short_filename(std::string_view path) noexcept {
+  if (path.empty()) {
+    return std::string{path};
+  }
+  
+  try {
+    std::filesystem::path p{path};
+    const auto parent = p.parent_path();
+    const auto filename = p.filename();
+    
+    /* If there's a parent directory, return "parent/filename", otherwise just filename */
+    if (!parent.empty()) {
+      const auto parent_name = parent.filename();
+      if (!parent_name.empty()) {
+        return (parent_name / filename).string();
+      }
+    }
+    
+    return filename.string();
+  } catch (...) {
+    /* Fallback to original path if filesystem operations fail */
+    return std::string{path};
   }
 }
 
@@ -102,17 +129,17 @@ struct Logger {
 
     try {
       const auto user_msg = std::vformat(fmt, std::make_format_args(args...));
-      msg = std::format("[{:%Y-%m-%d %H:%M:%S}.{:03d}] [{}] [{}:{}:{}] {}\n",
+      msg = std::format("[{:%Y-%m-%d %H:%M:%S}.{:03d}] [{}] [{}:{}] {}\n",
                         std::chrono::system_clock::time_point{sec},
                         ms.count(),
                         to_string(level),
-                        loc.file_name(),
+                        get_short_filename(loc.file_name()),
                         loc.line(),
-                        loc.function_name(),
+                        // loc.function_name(),
                         user_msg);
     } catch (...) {
       /* Fallback if formatting fails */
-      msg = std::format("[{}] [{}] Formatting error\n", to_string(level), loc.file_name());
+      msg = std::format("[{}] [{}] Formatting error\n", to_string(level), get_short_filename(loc.file_name()));
     }
 
     /* Write to sink (writer should be thread-safe if needed) */

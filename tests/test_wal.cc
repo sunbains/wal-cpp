@@ -9,19 +9,19 @@
 
 #include "wal/wal.h"
 
-using wal::Log;
-using wal::Circular_buffer;
-using wal::Status;
 using wal::lsn_t;
+using wal::Log;
+using wal::Status;
+using wal::Circular_buffer;
+
 
 static void test_circular_buffer_basic() {
   std::fprintf(stderr, "[test_circular_buffer_basic] start\n");
   
   constexpr lsn_t initial_lsn = 100;
-  constexpr size_t n_blocks = 4;
-  constexpr size_t block_size = 512;
+  Circular_buffer::Config config(4, 512);
   
-  Circular_buffer buffer(initial_lsn, n_blocks, block_size);
+  Circular_buffer buffer(initial_lsn, config);
   
   /* Verify initial state */
   assert(buffer.is_empty());
@@ -35,9 +35,9 @@ static void test_circular_buffer_basic() {
   assert(!slot1.m_committed);
   
   /* After reserve, HWM should be incremented but still empty until write */
-  assert(buffer.check_margin() < buffer.get_total_data_size());
   assert(buffer.m_lwm == initial_lsn);
   assert(buffer.m_hwm == initial_lsn + 100);
+  assert(buffer.m_committed_lsn == initial_lsn);
   
   std::fprintf(stderr, "[test_circular_buffer_basic] done\n");
 }
@@ -46,10 +46,9 @@ static void test_circular_buffer_reserve_and_write() {
   std::fprintf(stderr, "[test_circular_buffer_reserve_and_write] start\n");
   
   constexpr lsn_t initial_lsn = 0;
-  constexpr size_t n_blocks = 4;
-  constexpr size_t block_size = 512;
+  Circular_buffer::Config config(4, 512);
   
-  Circular_buffer buffer(initial_lsn, n_blocks, block_size);
+  Circular_buffer buffer(initial_lsn, config);
   
   /* Reserve and write a small message */
   auto slot = buffer.reserve(50);
@@ -72,33 +71,37 @@ static void test_circular_buffer_multiple_writes() {
   std::fprintf(stderr, "[test_circular_buffer_multiple_writes] start\n");
   
   constexpr lsn_t initial_lsn = 0;
-  constexpr size_t n_blocks = 2;
-  constexpr size_t block_size = 512;
   constexpr size_t record_size = 64;  
-  constexpr size_t n_records = (block_size/record_size) * n_blocks;
+  Circular_buffer::Config config(2, 512);
   
-  Circular_buffer buffer(initial_lsn, n_blocks, block_size);
   using Record = std::vector<std::byte>;
+  Circular_buffer buffer(initial_lsn, config);
+
+  const size_t n_records = (buffer.get_total_data_size() / record_size) + 1;
   
   /* Write multiple slots */
   for (size_t i = 0; i < n_records; ++i) {
     auto slot = buffer.reserve(record_size);
-    Record data(record_size, std::byte{static_cast<unsigned char>('0' + i)});
+    Record record(record_size, std::byte{static_cast<unsigned char>('0' + i)});
     
-    auto result = buffer.write(slot, data);
+    auto result = buffer.write(slot, record);
     assert(result.has_value());
-    assert(result.value() == record_size);
+    assert(result.value() == record_size || result.value() == record_size / 2);
   }
+
+  auto span = buffer.data();
+  auto ptr = span.data();
 
   // Verify the data written matches the contents of the data array
-  for (size_t i = 0; i < n_records; ++i) {
-    auto span = buffer.get_data(i);
-    assert(span.size() == record_size);
+  for (size_t i = 0; i < n_records - 1; ++i, ptr += record_size) {
+    Record record(record_size, std::byte{static_cast<unsigned char>('0' + i)});
 
-    Record data(record_size, std::byte{static_cast<unsigned char>('0' + i)});
-
-    assert(::memcmp(span.data(), data.data(), 64) == 0);
+    assert(::memcmp(ptr, record.data(), record_size) == 0);
   }
+
+  // The last record wrote only half of the record size
+  Record record(record_size / 2, std::byte{static_cast<unsigned char>('0' + n_records - 1)});
+  assert(::memcmp(ptr, record.data(), record.size()) == 0);
 
   assert(buffer.m_lwm == initial_lsn);
   assert(buffer.m_hwm == initial_lsn + n_records * record_size);
@@ -114,12 +117,11 @@ static void test_circular_buffer_block_boundary() {
   std::fprintf(stderr, "[test_circular_buffer_block_boundary] start\n");
   
   constexpr lsn_t initial_lsn = 0;
-  constexpr size_t n_blocks = 2;
-  constexpr size_t block_size = 512;
+  Circular_buffer::Config config(2, 512);
 
   using Record = std::vector<std::byte>;
   
-  Circular_buffer buffer(initial_lsn, n_blocks, block_size);
+  Circular_buffer buffer(initial_lsn, config);
   const auto data_size_per_block = static_cast<std::uint16_t>(buffer.get_data_size_in_block());
   
   Record data(data_size_per_block, std::byte{'X'});
@@ -159,11 +161,10 @@ static void test_circular_buffer_full() {
   std::fprintf(stderr, "[test_circular_buffer_full] start\n");
   
   constexpr lsn_t initial_lsn = 0;
-  constexpr size_t n_blocks = 2;
-  constexpr size_t block_size = 512;
+  Circular_buffer::Config config(2, 512);
   
   using Record = std::vector<std::byte>;
-  Circular_buffer buffer(initial_lsn, n_blocks, block_size);
+  Circular_buffer buffer(initial_lsn, config);
   const auto total_size = buffer.get_total_data_size();
   
   /* Fill the buffer */
@@ -205,11 +206,10 @@ static void test_circular_buffer_write_to_store() {
   std::fprintf(stderr, "[test_circular_buffer_write_to_store] start\n");
   
   constexpr lsn_t initial_lsn = 0;
-  constexpr size_t n_blocks = 2;
-  constexpr size_t block_size = 512;
+  Circular_buffer::Config config(2, 512);
   
   using Record = std::vector<std::byte>;
-  Circular_buffer buffer(initial_lsn, n_blocks, block_size);
+  Circular_buffer buffer(initial_lsn, config);
 
   auto null_writer = [](lsn_t lsn, const wal::Log::IO_vecs &iovecs) -> wal::Result<lsn_t> { 
     std::size_t bytes_written{};
@@ -221,27 +221,75 @@ static void test_circular_buffer_write_to_store() {
     return wal::Result<lsn_t>(lsn + bytes_written);
   };
 
-  for (size_t i = 0; i < n_blocks; ++i) {
-    auto slot = buffer.reserve(block_size);
-    Record data(block_size, std::byte{'F'});
+  std::pair<wal::Circular_buffer::Slot, size_t> pending{};
+
+  Record record(config.m_block_size, std::byte{'F'});
+  std::span<const std::byte> span(record);
+
+  for (size_t i = 0; i < config.m_n_blocks; ++i) {
+    auto slot = buffer.reserve(config.m_block_size);
     
-    auto result = buffer.write(slot, data);
+    auto result = buffer.write(slot, span);
     assert(result.has_value());
-    assert(result.value() == block_size);
+
+    assert(result.value() == config.m_block_size ||
+          result.value() == config.m_block_size - (config.m_block_size - buffer.get_data_size_in_block()) * config.m_n_blocks);
+
+    slot.m_lsn += result.value();
+    slot.m_len -= result.value();
+    pending = {slot, result.value()};
   }
 
   assert(buffer.is_full());
   assert(buffer.check_margin() == 0);
   assert(buffer.m_lwm == initial_lsn);
-  assert(buffer.m_hwm == initial_lsn + n_blocks * block_size);
+  assert(buffer.m_hwm == initial_lsn + config.m_n_blocks * config.m_block_size);
 
   auto result = buffer.write_to_store(null_writer);
-  assert(result.has_value());
-  assert(result.value() == initial_lsn + n_blocks * block_size);
-  assert(buffer.is_empty());
 
-  assert(buffer.m_lwm == result.value());
+  assert(result.has_value());
+  assert(result.value() == initial_lsn + config.m_n_blocks * buffer.get_data_size_in_block());
+  assert(buffer.check_margin() == buffer.get_total_data_size());
+
+  assert(buffer.pending_writes());
+
+  auto result2 = buffer.write(pending.first, span.subspan(pending.second, pending.first.m_len));
+
+  assert(result2.has_value());
+  assert(result2.value() == pending.first.m_len);
+  assert(!buffer.pending_writes());
+  assert(buffer.check_margin() == buffer.get_total_data_size() - pending.first.m_len);
+
+  assert(buffer.m_lwm == buffer.m_hwm - pending.first.m_len);
+  assert(buffer.m_hwm == buffer.m_committed_lsn);
+
+  auto result3 = buffer.write_to_store(null_writer);
+  assert(result3.has_value());
+
+  /* Round up to block boundary and calculate number of blocks written */
+  const auto total_bytes = config.m_n_blocks * buffer.get_data_size_in_block() + pending.first.m_len;
+  const auto n_blocks_written = (total_bytes + buffer.get_data_size_in_block() - 1) / buffer.get_data_size_in_block();
+  const auto expected_lsn = initial_lsn + n_blocks_written * buffer.get_data_size_in_block();
+
+  assert(result3.value() == expected_lsn);
+
+  /* Since we only partially filled the block (pending.first.m_len bytes),
+  the LWM should not advance past that. */
+  const auto expected_lwm = initial_lsn + config.m_n_blocks * buffer.get_data_size_in_block() + pending.first.m_len;
+
+  assert(buffer.m_lwm == expected_lwm);
   assert(buffer.m_lwm == buffer.m_hwm);
+  assert(buffer.m_lwm == buffer.m_committed_lsn);
+
+  /* The block header for the last block should not be cleared. */
+  const auto block_no = expected_lwm / buffer.get_data_size_in_block();
+  const auto block_index = block_no % buffer.m_config.m_n_blocks;
+  const auto block_header = buffer.get_block_header(block_index);
+  assert(block_header.get_block_no() == block_no);
+  assert(block_header.get_flush_bit());
+  assert(block_header.get_data_len() == pending.first.m_len);
+
+  // FIXME: First rec group checks.
 
   std::fprintf(stderr, "[test_circular_buffer_write_to_store] done\n");
 }
@@ -252,10 +300,9 @@ static void test_log_basic() {
   std::fprintf(stderr, "[test_log_basic] start\n");
   
   constexpr lsn_t initial_lsn = 0;
-  constexpr size_t n_blocks = 4;
-  constexpr size_t block_size = 512;
-  
-  Log log(initial_lsn, n_blocks, block_size);
+  Circular_buffer::Config config(4, 512);
+
+  Log log(initial_lsn, config);
   
   /* Verify initial state */
   assert(log.is_empty());
@@ -269,10 +316,9 @@ static void test_log_reserve_and_write() {
   std::fprintf(stderr, "[test_log_reserve_and_write] start\n");
   
   constexpr lsn_t initial_lsn = 0;
-  constexpr size_t n_blocks = 4;
-  constexpr size_t block_size = 512;
+  Circular_buffer::Config config(4, 512);
   
-  Log log(initial_lsn, n_blocks, block_size);
+  Log log(initial_lsn, config);
   
   /* Reserve and write */
   auto slot = log.reserve(100);
@@ -292,24 +338,15 @@ static void test_log_write_data_verification() {
   std::fprintf(stderr, "[test_log_write_data_verification] start\n");
   
   constexpr lsn_t initial_lsn = 0;
-  constexpr size_t n_blocks = 4;
-  constexpr size_t block_size = 512;
-  
-  using Record = std::vector<std::byte>;
-  Log log(initial_lsn, n_blocks, block_size);
+  Circular_buffer::Config config(4, 512);
+
+  Log log(initial_lsn, config);
   
   /* Write specific data and verify it can be read back */
   std::string test_data = "Hello, WAL!";
   auto slot = log.reserve(static_cast<std::uint16_t>(test_data.size()));
   
-  Record data_bytes;
-
-  {
-    auto bytes = std::as_bytes(std::span{test_data});
-    data_bytes.assign(bytes.begin(), bytes.end());
-  }
-
-  auto result = log.write(slot, data_bytes);
+  auto result = log.write(slot, std::as_bytes(std::span{test_data}));
   assert(result.has_value());
   assert(result.value() == test_data.size());
   
@@ -317,7 +354,6 @@ static void test_log_write_data_verification() {
   const auto block_index = slot.m_lsn / log.m_buffer.get_data_size_in_block();
   const auto data_span = log.m_buffer.get_data(static_cast<std::size_t>(block_index));
   
-  assert(data_span.size() == test_data.size());
   assert(::memcmp(data_span.data(), test_data.data(), test_data.size()) == 0);
 
   std::fprintf(stderr, "[test_log_write_data_verification] done\n");
@@ -327,19 +363,18 @@ static void test_log_multiple_writes() {
   std::fprintf(stderr, "[test_log_multiple_writes] start\n");
   
   constexpr lsn_t initial_lsn = 0;
-  constexpr size_t n_blocks = 4;
-  constexpr size_t block_size = 512;
-  constexpr size_t record_size = 32;
+  constexpr size_t record_size = 26;
+  Circular_buffer::Config config(4, 512);
 
   using Record = std::vector<std::byte>;
 
-  Log log(initial_lsn, n_blocks, block_size);
+  Log log(initial_lsn, config);
   
   /* Write multiple entries */
   constexpr int num_writes = 10;
   for (int i = 0; i < num_writes; ++i) {
     auto slot = log.reserve(record_size);
-    Record data(record_size, std::byte{static_cast<unsigned char>(i)});
+    Record data(record_size, std::byte{static_cast<unsigned char>('A' + i)});
     
     auto result = log.write(slot, data);
     assert(result.has_value());
@@ -348,7 +383,7 @@ static void test_log_multiple_writes() {
   
   /* Verify buffer state */
   assert(!log.is_empty());
-  assert(log.check_margin() < log.m_buffer.get_total_data_size());
+  assert(log.check_margin() == log.m_buffer.get_total_data_size() - record_size * num_writes);
   
   std::fprintf(stderr, "[test_log_multiple_writes] done\n");
 }
@@ -357,10 +392,9 @@ static void test_log_to_string() {
   std::fprintf(stderr, "[test_log_to_string] start\n");
   
   constexpr lsn_t initial_lsn = 100;
-  constexpr size_t n_blocks = 4;
-  constexpr size_t block_size = 512;
+  Circular_buffer::Config config(4, 512);
   
-  Log log(initial_lsn, n_blocks, block_size);
+  Log log(initial_lsn, config);
   
   auto str = log.to_string();
   assert(!str.empty());
