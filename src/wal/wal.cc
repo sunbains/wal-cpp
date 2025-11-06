@@ -63,7 +63,7 @@ namespace wal {
       const auto n_slots = flush_batch_size * 3;
 
       for (std::size_t i{}; i < n_slots; i += 3) {
-        const auto block_index{(block_start_no + i) % m_config.m_n_blocks};
+        const auto block_index{(block_start_no + i / 3) % m_config.m_n_blocks};
         auto [header, span, crc32] = get_block(block_index);
 
         assert(header->get_block_no() == expected_block_start_no++);
