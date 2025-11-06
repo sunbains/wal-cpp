@@ -9,7 +9,7 @@ namespace wal {
   Circular_buffer::Circular_buffer(lsn_t hwm, Config config) noexcept
     : m_lwm(hwm),
       m_hwm(hwm),
-      m_committed_lsn(hwm),
+      m_written_lsn(hwm),
       m_config(config),
       m_total_data_size(m_config.get_data_size_in_block() * m_config.m_n_blocks) {
 
@@ -32,9 +32,15 @@ namespace wal {
 
   std::string Circular_buffer::to_string() const noexcept {
     return std::format(
-      "Circular_buffer: lwm: {}, hwm: {}, n_blocks: {}, block_size: {}, total_data_size: {}, data_size_in_block: {}",
-      m_lwm.load(std::memory_order_relaxed), m_hwm.load(std::memory_order_relaxed),
-      m_config.m_n_blocks, m_config.m_block_size, m_total_data_size, m_config.get_data_size_in_block()
+      "Circular_buffer: lwm: {}, hwm: {}, n_blocks: {}, block_size: {}, total_data_size: {}, data_size_in_block: {}, n_pending_writes: {}, written_lsn: {}",
+      m_lwm.load(std::memory_order_relaxed),
+      m_hwm.load(std::memory_order_relaxed),
+      m_config.m_n_blocks,
+      m_config.m_block_size,
+      m_total_data_size,
+      m_config.get_data_size_in_block(),
+      m_n_pending_writes.load(std::memory_order_relaxed),
+      m_written_lsn.load(std::memory_order_relaxed)
     );
   }
 
@@ -44,11 +50,16 @@ namespace wal {
 
     IO_vecs iovecs;
 
-    auto block_start_no = m_lwm / m_config.get_data_size_in_block();
-    const auto n_bytes_to_flush = m_committed_lsn - m_lwm;
+    // log_inf("m_lwm: {}", m_lwm.load(std::memory_order_relaxed));
+    // log_inf("m_hwm: {}", m_hwm.load(std::memory_order_relaxed));
+    // log_inf("m_written_lsn: {}", m_written_lsn.load(std::memory_order_relaxed));
+
+    const auto data_size{m_config.get_data_size_in_block()};
+    auto block_start_no = m_lwm / data_size;
+    const auto n_bytes_to_flush = m_written_lsn - m_lwm;
 
     /* Ceiling division: (a + b - 1) / b avoids modulo and conditional */
-    auto n_blocks_to_flush = (n_bytes_to_flush + m_config.get_data_size_in_block() - 1) / m_config.get_data_size_in_block();
+    auto n_blocks_to_flush = (n_bytes_to_flush + data_size - 1) / data_size;
     const auto last_block_no = block_start_no + n_blocks_to_flush - 1;
 
     /* We create IO vectors for each block. One for the header,
@@ -59,17 +70,25 @@ namespace wal {
 
     iovecs.resize(iovecs_size);
 
-    auto expected_block_no = m_lwm / m_config.get_data_size_in_block();
+    auto expected_block_no = m_lwm / data_size;
 
     lsn_t persisted_lsn{};
 
-    log_inf("n_blocks_to_flush: {}", n_blocks_to_flush);
+    // log_inf("n_blocks_to_flush: {}", n_blocks_to_flush);
 
-    while (n_blocks_to_flush > 0) {
+    /* We need to handle the case the same last blocks is flushed multiple times.
+     * This can happen if the last block is not full and is flushed multiple times
+     * if more data is appended after the last flush.
+     */
+    auto old_data_len = m_lwm.load(std::memory_order_acquire) % data_size;
+
+    while (n_blocks_to_flush > 0) [[likely]] {
       /* Use the maximum blocks per batch based on the actual iovecs_size we allocated.
        * This ensures we use all available iovecs efficiently without exceeding the vector size. */
       const auto flush_batch_size{std::min(n_blocks_to_flush, max_blocks_per_batch)};
       const auto n_slots = flush_batch_size * 3;
+
+      std::size_t data_len{};
 
       for (std::size_t i{}; i < n_slots; i += 3) {
         const auto block_index{(block_start_no + i / 3) % m_config.m_n_blocks};
@@ -79,9 +98,11 @@ namespace wal {
 
         ++expected_block_no;
 
-        [[maybe_unused]] const auto is_last_block = header->m_data.m_block_no == last_block_no;
+        data_len += std::atomic_ref<uint16_t>(header->m_data.m_len).load(std::memory_order_acquire);
 
-        if (header->m_data.m_block_no == last_block_no) [[unlikely]] {
+        const auto is_last_block = header->m_data.m_block_no == last_block_no;
+
+        if (is_last_block) [[unlikely]] {
           header->set_flush_bit(true);
         }
 
@@ -101,23 +122,14 @@ namespace wal {
         iovecs[i + 2].iov_base = static_cast<void*>(crc32);
         iovecs[i + 2].iov_len = sizeof(crc32_t);
       }
+      assert(data_len > 0);
 
       n_blocks_to_flush -= flush_batch_size;
       block_start_no = block_start_no + flush_batch_size;
 
-      if (n_blocks_to_flush == 0) {
-        auto data = reinterpret_cast<Block_header::Data*>(iovecs[iovecs.size() - 3].iov_base);
+      auto result = callback(m_lwm.load(std::memory_order_acquire) / data_size * data_size, iovecs);
 
-        data->m_block_no = util::ntoh(data->m_block_no);
-        data->m_block_no |= Block_header::FLUSH_BIT_MASK;
-        data->m_block_no = util::hton(data->m_block_no);
-      }
-
-      log_inf("iovecs: {}", iovecs.size());
-
-      auto result = callback(m_lwm, iovecs);
-
-      if (!result.has_value()) {
+      if (!result.has_value()) [[unlikely]] {
         switch (result.error()) {
           case Status::Success:
             std::unreachable();
@@ -136,32 +148,37 @@ namespace wal {
       bytes written. */
       persisted_lsn += result.value();
 
-      assert(persisted_lsn >= m_lwm);
+      assert(persisted_lsn % m_config.get_data_size_in_block() == 0);
+
+      if (old_data_len > 0) {
+        /* Adjust for block rewrite. */
+        assert(old_data_len < data_len);
+        data_len -= old_data_len;
+        old_data_len = 0;
+      }
+
+      clear(m_lwm, m_lwm.load(std::memory_order_acquire) + data_len);
+
+      m_lwm.fetch_add(data_len, std::memory_order_release);
+
+      assert(m_lwm.load(std::memory_order_relaxed) <= m_written_lsn.load(std::memory_order_relaxed));
     }
 
-    log_inf("persisted_lsn: {}", persisted_lsn);
+    // log_inf("persisted_lsn: {}", persisted_lsn);
+    // log_inf("written_lsn: {}, expected_block_no: {}", m_written_lsn.load(std::memory_order_relaxed), expected_block_no);
 
     /* The last block may not be full and may have to be rewritten. We need to preseve its header,
     and advance the LWM only by the valid data length. Round down to lower block boundary */
-    const auto last_block_index = (expected_block_no - 1) % m_config.m_n_blocks;
-    auto& block_header = m_block_header_array[last_block_index];
 
-    log_inf("committed_lsn: {}, expected_block_no: {}", m_committed_lsn.load(std::memory_order_relaxed), expected_block_no);
-
-    if (util::ntoh(block_header.get_data_len()) < m_config.get_data_size_in_block()) {
-      /* Convert back from network byte order to host byte order. */
-      // block_header.prepare_to_read();
+    if (m_written_lsn.load(std::memory_order_relaxed) % m_config.get_data_size_in_block() != 0) {
+      /* The last block is not full, we need to rewrite it. */
+      // last_block_header.prepare_to_read();
     }
 
-    const auto end_lsn = (m_committed_lsn.load(std::memory_order_acquire) / m_config.get_data_size_in_block()) * m_config.get_data_size_in_block();
-
-    clear(m_lwm.load(std::memory_order_acquire), end_lsn);
-
-    m_lwm.store(std::min(persisted_lsn, m_committed_lsn.load()), std::memory_order_release);
-
-    log_inf("m_lwm: {}", m_lwm.load(std::memory_order_relaxed));
-    log_inf("m_hwm: {}", m_hwm.load(std::memory_order_relaxed));
-    log_inf("m_committed_lsn: {}", m_committed_lsn.load(std::memory_order_relaxed));
+    // log_inf("persisted_lsn: {}", persisted_lsn);
+    // log_inf("m_lwm: {}", m_lwm.load(std::memory_order_relaxed));
+    // log_inf("m_hwm: {}", m_hwm.load(std::memory_order_relaxed));
+    // log_inf("m_written_lsn: {}", m_written_lsn.load(std::memory_order_relaxed));
 
     return Result<lsn_t>(persisted_lsn);
   }

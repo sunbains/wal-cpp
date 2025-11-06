@@ -15,6 +15,14 @@ using wal::Status;
 using wal::Circular_buffer;
 using wal::block_no_t;
 
+/* Null writer callback that simulates writing to storage without actually doing I/O */
+static wal::Result<lsn_t> null_writer(lsn_t lsn, const wal::Log::IO_vecs &iovecs) {
+  std::size_t bytes_written{};
+  for (std::size_t i = 1; i < iovecs.size(); i += 3) {
+    bytes_written += iovecs[i].iov_len;
+  }
+  return wal::Result<lsn_t>(lsn + bytes_written);
+}
 
 static void test_circular_buffer_basic() {
   std::fprintf(stderr, "[test_circular_buffer_basic] start\n");
@@ -37,7 +45,7 @@ static void test_circular_buffer_basic() {
   /* After reserve, HWM should be incremented but still empty until write */
   assert(buffer.m_lwm == initial_lsn);
   assert(buffer.m_hwm == initial_lsn + 100);
-  assert(buffer.m_committed_lsn == initial_lsn);
+  assert(buffer.m_written_lsn == initial_lsn);
   
   std::fprintf(stderr, "[test_circular_buffer_basic] done\n");
 }
@@ -79,28 +87,32 @@ static void test_circular_buffer_multiple_writes() {
 
   const size_t n_records = (buffer.get_total_data_size() / record_size) + 1;
   
-  /* Write multiple slots */
-  for (size_t i = 0; i < n_records; ++i) {
+  /* Write multipleslots */
+  size_t i{};
+  for (;;) {
     auto slot = buffer.reserve(record_size);
-    Record record(record_size, std::byte{static_cast<unsigned char>('0' + i)});
+    Record record(record_size, std::byte{static_cast<unsigned char>('A' + (i % 26))});
     
     auto result = buffer.write(slot, record);
-    assert(result.has_value());
-    assert(result.value() == record_size || result.value() == record_size / 2);
+    if (!result.has_value()) {
+      assert(result.error() == Status::Not_enough_space);
+      break;
+    }
+    ++i;
   }
 
   auto span = buffer.data();
   auto ptr = span.data();
 
-  // Verify the data written matches the contents of the data array
+  /* Verify the data written matches the contents of the data array */
   for (size_t i = 0; i < n_records - 1; ++i, ptr += record_size) {
-    Record record(record_size, std::byte{static_cast<unsigned char>('0' + i)});
+    Record record(record_size, std::byte{static_cast<unsigned char>('A' + (i % 26))});
 
     assert(::memcmp(ptr, record.data(), record_size) == 0);
   }
 
-  // The last record wrote only half of the record size
-  Record record(record_size / 2, std::byte{static_cast<unsigned char>('0' + n_records - 1)});
+  /* The last record wrote only half of the record size */
+  Record record(record_size / 2, std::byte{static_cast<unsigned char>('A' + ((n_records - 1) % 26))});
   assert(::memcmp(ptr, record.data(), record.size()) == 0);
 
   assert(buffer.m_lwm == initial_lsn);
@@ -211,17 +223,7 @@ static void test_circular_buffer_write_to_store() {
   using Record = std::vector<std::byte>;
   Circular_buffer buffer(initial_lsn, config);
 
-  auto null_writer = [](lsn_t lsn, const wal::Log::IO_vecs &iovecs) -> wal::Result<lsn_t> { 
-    std::size_t bytes_written{};
-
-    for (std::size_t i = 1; i < iovecs.size(); i += 3) {
-      /* Skip the header and checksum */
-      bytes_written += iovecs[i].iov_len;
-    }
-    return wal::Result<lsn_t>(lsn + bytes_written);
-  };
-
-  std::pair<wal::Circular_buffer::Slot, size_t> pending{};
+  Circular_buffer::Slot pending{};
 
   Record record(config.m_block_size, std::byte{'F'});
   std::span<const std::byte> span(record);
@@ -229,15 +231,15 @@ static void test_circular_buffer_write_to_store() {
   for (size_t i = 0; i < config.m_n_blocks; ++i) {
     auto slot = buffer.reserve(config.m_block_size);
     
-    auto result = buffer.write(slot, span);
-    assert(result.has_value());
-
-    assert(result.value() == config.m_block_size ||
-          result.value() == config.m_block_size - (config.m_block_size - buffer.get_data_size_in_block()) * config.m_n_blocks);
-
-    slot.m_lsn += result.value();
-    slot.m_len -= result.value();
-    pending = {slot, result.value()};
+    do {
+      auto result = buffer.write(slot, span);
+      if (!result.has_value()) {
+        assert(result.error() == Status::Not_enough_space);
+        pending = slot;
+        span = span.subspan(config.m_block_size - slot.m_len, slot.m_len);
+        break;
+      }
+    } while (slot.m_len > 0);
   }
 
   assert(buffer.is_full());
@@ -247,47 +249,50 @@ static void test_circular_buffer_write_to_store() {
 
   auto result = buffer.write_to_store(null_writer);
 
+  const auto data_size = buffer.get_data_size_in_block();
+
   assert(result.has_value());
-  assert(result.value() == initial_lsn + config.m_n_blocks * buffer.get_data_size_in_block());
+  assert(result.value() == initial_lsn + config.m_n_blocks * data_size);
   assert(buffer.check_margin() == buffer.get_total_data_size());
 
   assert(buffer.pending_writes());
 
-  auto result2 = buffer.write(pending.first, span.subspan(pending.second, pending.first.m_len));
+  auto result2 = buffer.write(pending, span);
+  assert(pending.m_len == 0);
 
   assert(result2.has_value());
-  assert(result2.value() == pending.first.m_len);
   assert(!buffer.pending_writes());
-  assert(buffer.check_margin() == buffer.get_total_data_size() - pending.first.m_len);
+  assert(buffer.check_margin() == buffer.get_total_data_size() - span.size());
 
-  assert(buffer.m_lwm == buffer.m_hwm - pending.first.m_len);
-  assert(buffer.m_hwm == buffer.m_committed_lsn);
+  assert(buffer.m_lwm == buffer.m_hwm - span.size());
+  assert(buffer.m_hwm == buffer.m_written_lsn);
+  assert(buffer.m_n_pending_writes == 0);
 
   auto result3 = buffer.write_to_store(null_writer);
   assert(result3.has_value());
 
   /* Round up to block boundary and calculate number of blocks written */
-  const auto total_bytes = config.m_n_blocks * buffer.get_data_size_in_block() + pending.first.m_len;
-  const auto n_blocks_written = (total_bytes + buffer.get_data_size_in_block() - 1) / buffer.get_data_size_in_block();
-  const auto expected_lsn = initial_lsn + n_blocks_written * buffer.get_data_size_in_block();
+  const auto total_bytes = config.m_n_blocks * data_size + span.size();
+  const auto n_blocks_written = (total_bytes + data_size - 1) / data_size;
+  const auto expected_lsn = initial_lsn + n_blocks_written * data_size;
 
   assert(result3.value() == expected_lsn);
 
-  /* Since we only partially filled the block (pending.first.m_len bytes),
+  /* Since we only partially filled the block (span.size() bytes),
   the LWM should not advance past that. */
-  const auto expected_lwm = initial_lsn + config.m_n_blocks * buffer.get_data_size_in_block() + pending.first.m_len;
+  const auto expected_lwm = initial_lsn + config.m_n_blocks * data_size + span.size();
 
   assert(buffer.m_lwm == expected_lwm);
   assert(buffer.m_lwm == buffer.m_hwm);
-  assert(buffer.m_lwm == buffer.m_committed_lsn);
+  assert(buffer.m_lwm == buffer.m_written_lsn);
 
   /* The block header for the last block should not be cleared. */
-  const auto block_no = expected_lwm / buffer.get_data_size_in_block();
+  const auto block_no = expected_lwm / data_size;
   const auto block_index = block_no % buffer.m_config.m_n_blocks;
   const auto block_header = buffer.get_block_header(block_index);
   assert(block_header.get_block_no() == block_no);
   assert(block_header.get_flush_bit());
-  assert(block_header.get_data_len() == pending.first.m_len);
+  assert(block_header.get_data_len() == span.size());
 
   // FIXME: First rec group checks.
 
@@ -303,20 +308,12 @@ static void test_circular_buffer_wrap_around_basic() {
   using Record = std::vector<std::byte>;
   Circular_buffer buffer(initial_lsn, config);
 
-  auto null_writer = [](lsn_t lsn, const wal::Log::IO_vecs &iovecs) -> wal::Result<lsn_t> {
-    std::size_t bytes_written{};
-    for (std::size_t i = 1; i < iovecs.size(); i += 3) {
-      bytes_written += iovecs[i].iov_len;
-    }
-    return wal::Result<lsn_t>(lsn + bytes_written);
-  };
-
   const auto data_size_per_block = static_cast<std::uint16_t>(buffer.get_data_size_in_block());
 
   /* Fill the buffer completely */
   for (size_t i = 0; i < config.m_n_blocks; ++i) {
     auto slot = buffer.reserve(data_size_per_block);
-    Record data(data_size_per_block, std::byte{static_cast<unsigned char>('A' + i)});
+    Record data(data_size_per_block, std::byte{static_cast<unsigned char>('A' + (i % 26))});
 
     auto result = buffer.write(slot, data);
     assert(result.has_value());
@@ -338,7 +335,7 @@ static void test_circular_buffer_wrap_around_basic() {
   /* Now write more data - this tests wrap-around */
   for (size_t i = 0; i < config.m_n_blocks; ++i) {
     auto slot = buffer.reserve(data_size_per_block);
-    Record data(data_size_per_block, std::byte{static_cast<unsigned char>('W' + i)});
+    Record data(data_size_per_block, std::byte{static_cast<unsigned char>('W' + (i % 4))});
 
     auto result = buffer.write(slot, data);
     assert(result.has_value());
@@ -349,7 +346,7 @@ static void test_circular_buffer_wrap_around_basic() {
   auto span = buffer.data();
   for (size_t i = 0; i < config.m_n_blocks; ++i) {
     const auto offset = i * data_size_per_block;
-    Record expected(data_size_per_block, std::byte{static_cast<unsigned char>('W' + i)});
+    Record expected(data_size_per_block, std::byte{static_cast<unsigned char>('W' + (i % 4))});
     assert(::memcmp(span.data() + offset, expected.data(), data_size_per_block) == 0);
   }
 
@@ -362,57 +359,51 @@ static void test_circular_buffer_wrap_around_spanning() {
   std::fprintf(stderr, "[test_circular_buffer_wrap_around_spanning] start\n");
 
   constexpr lsn_t initial_lsn = 0;
-  Circular_buffer::Config config(8, 512);  // Larger buffer to avoid edge cases
+  Circular_buffer::Config config(8, 512);
 
   using Record = std::vector<std::byte>;
   Circular_buffer buffer(initial_lsn, config);
 
-  auto null_writer = [](lsn_t lsn, const wal::Log::IO_vecs &iovecs) -> wal::Result<lsn_t> {
-    std::size_t bytes_written{};
-    for (std::size_t i = 1; i < iovecs.size(); i += 3) {
-      bytes_written += iovecs[i].iov_len;
-    }
-    return wal::Result<lsn_t>(lsn + bytes_written);
-  };
-
-  const auto data_size_per_block = static_cast<std::uint16_t>(buffer.get_data_size_in_block());
-
-  /* NOTE: This test currently reveals a bug in the wrap-around logic when
-   * flushing partial buffers. For now, we test simpler scenarios. */
+  const auto data_size = buffer.get_data_size_in_block();
 
   /* Fill exactly half the buffer with aligned writes */
-  const std::uint16_t record_size = data_size_per_block;
+  const std::uint16_t record_size = data_size;
 
   const size_t blocks_to_write = config.m_n_blocks / 2;
+
   for (size_t i = 0; i < blocks_to_write; ++i) {
     auto slot = buffer.reserve(record_size);
-    Record data(record_size, std::byte{static_cast<unsigned char>('A' + i)});
+    Record data(record_size, std::byte{static_cast<unsigned char>('A' + (i % 26))});
 
     auto result = buffer.write(slot, data);
     assert(result.has_value());
     assert(result.value() == record_size);
   }
 
-  std::fprintf(stderr, "  Wrote %zu blocks before flush\n", blocks_to_write);
-
   /* Flush to make room */
   auto flush_result = buffer.write_to_store(null_writer);
   assert(flush_result.has_value());
 
-  /* Write same number of blocks again - this tests wrap-around */
+  /* Write same number of blocks again - this test wraps-around */
   size_t post_flush_writes = 0;
+
   for (size_t i = 0; i < blocks_to_write && buffer.check_margin() >= record_size; ++i) {
     auto slot = buffer.reserve(record_size);
-    Record data(record_size, std::byte{static_cast<unsigned char>('X' + i)});
+    Record data(record_size, std::byte{static_cast<unsigned char>('X' + (i % 3))});
+    std::span<const std::byte> data_span = data;
 
-    auto result = buffer.write(slot, data);
-    if (result.has_value()) {
-      assert(result.value() == record_size);
-      ++post_flush_writes;
-    }
+    do {
+      auto result = buffer.write(slot, data_span);
+      if (result.has_value()) {
+        assert(result.value() == record_size);
+        ++post_flush_writes;
+      } else {
+        assert(result.error() == Status::Not_enough_space);
+        data_span = data_span.subspan(data_span.size() - slot.m_len, slot.m_len);
+      }
+    } while (slot.m_len > 0);
   }
 
-  std::fprintf(stderr, "  Wrote %zu blocks after flush (wrap-around)\n", post_flush_writes);
   assert(post_flush_writes == blocks_to_write);
 
   std::fprintf(stderr, "[test_circular_buffer_wrap_around_spanning] done\n");
@@ -422,18 +413,10 @@ static void test_circular_buffer_multiple_cycles() {
   std::fprintf(stderr, "[test_circular_buffer_multiple_cycles] start\n");
 
   constexpr lsn_t initial_lsn = 0;
-  Circular_buffer::Config config(8, 512);  // Larger buffer
+  Circular_buffer::Config config(8, 512);
 
   using Record = std::vector<std::byte>;
   Circular_buffer buffer(initial_lsn, config);
-
-  auto null_writer = [](lsn_t lsn, const wal::Log::IO_vecs &iovecs) -> wal::Result<lsn_t> {
-    std::size_t bytes_written{};
-    for (std::size_t i = 1; i < iovecs.size(); i += 3) {
-      bytes_written += iovecs[i].iov_len;
-    }
-    return wal::Result<lsn_t>(lsn + bytes_written);
-  };
 
   const std::uint16_t record_size = 128;
 
@@ -455,8 +438,6 @@ static void test_circular_buffer_multiple_cycles() {
         break;
       }
     }
-
-    std::fprintf(stderr, "  Cycle %zu: wrote %zu records\n", cycle, writes);
 
     /* Flush */
     auto flush_result = buffer.write_to_store(null_writer);
@@ -482,24 +463,16 @@ static void test_circular_buffer_large_dataset() {
   std::fprintf(stderr, "[test_circular_buffer_large_dataset] start\n");
 
   constexpr lsn_t initial_lsn = 0;
-  Circular_buffer::Config config(16, 1024);  // 16 blocks, 1KB each
+  Circular_buffer::Config config(16, 1024);
 
   using Record = std::vector<std::byte>;
   Circular_buffer buffer(initial_lsn, config);
 
-  auto null_writer = [](lsn_t lsn, const wal::Log::IO_vecs &iovecs) -> wal::Result<lsn_t> {
-    std::size_t bytes_written{};
-    for (std::size_t i = 1; i < iovecs.size(); i += 3) {
-      bytes_written += iovecs[i].iov_len;
-    }
-    return wal::Result<lsn_t>(lsn + bytes_written);
-  };
-
   const std::uint16_t record_size = 256;
-  constexpr size_t target_records = 1000;  // Write 1000 records
+  constexpr size_t target_records = 1000;
 
-  size_t total_written = 0;
   size_t flush_count = 0;
+  size_t total_written = 0;
 
   for (size_t i = 0; i < target_records; ++i) {
     /* Check if we need to flush */
@@ -530,10 +503,6 @@ static void test_circular_buffer_large_dataset() {
     ++flush_count;
   }
 
-  std::fprintf(stderr, "  Wrote %zu records with %zu flushes\n", total_written, flush_count);
-  std::fprintf(stderr, "  Final LWM: %lu, HWM: %lu\n",
-               buffer.m_lwm.load(), buffer.m_hwm.load());
-
   assert(total_written == target_records);
   assert(flush_count > 0);
 
@@ -549,28 +518,19 @@ static void test_circular_buffer_wrap_around_partial_block() {
   using Record = std::vector<std::byte>;
   Circular_buffer buffer(initial_lsn, config);
 
-  auto null_writer = [](lsn_t lsn, const wal::Log::IO_vecs &iovecs) -> wal::Result<lsn_t> {
-    std::size_t bytes_written{};
-    for (std::size_t i = 1; i < iovecs.size(); i += 3) {
-      bytes_written += iovecs[i].iov_len;
-    }
-    std::fprintf(stderr, "  wrote %zu bytes at LSN %lu\n", bytes_written, lsn);
-    return wal::Result<lsn_t>(lsn + bytes_written);
-  };
-
-  const auto data_size_per_block = static_cast<std::uint16_t>(buffer.get_data_size_in_block());
+  const auto data_size = buffer.get_data_size_in_block();
 
   /* Fill buffer mostly, leaving a partial block */
   for (size_t i = 0; i < config.m_n_blocks - 1; ++i) {
-    auto slot = buffer.reserve(data_size_per_block);
-    Record data(data_size_per_block, std::byte{static_cast<unsigned char>('F')});
+    auto slot = buffer.reserve(data_size);
+    Record data(data_size, std::byte{static_cast<unsigned char>('F')});
 
     auto result = buffer.write(slot, data);
     assert(result.has_value());
   }
 
   /* Write partial block */
-  const std::uint16_t partial_size = data_size_per_block / 2;
+  const std::uint16_t partial_size = data_size / 2;
   auto partial_slot = buffer.reserve(partial_size);
   Record partial_data(partial_size, std::byte{static_cast<unsigned char>('P')});
 
@@ -583,25 +543,24 @@ static void test_circular_buffer_wrap_around_partial_block() {
   assert(flush_result.has_value());
 
   /* Write more data to test wrap-around with partial block */
-  for (size_t i = 0; i < config.m_n_blocks &&buffer.check_margin() >= data_size_per_block; ++i) {
-    auto slot = buffer.reserve(data_size_per_block);
-    Record data(data_size_per_block, std::byte{static_cast<unsigned char>('N')});
+  for (size_t i = 0; i < config.m_n_blocks &&buffer.check_margin() >= data_size; ++i) {
+    auto slot = buffer.reserve(data_size);
+    Record data(data_size, std::byte{static_cast<unsigned char>('N')});
+    std::span<const std::byte> data_span = data;
 
-    auto result = buffer.write(slot, data);
-    assert(result.has_value());
-    // May be partial write if buffer wraps around
-    assert(result.value() > 0);
-    assert(result.value() <= data_size_per_block);
-  }
-
-  /* Another flush */
-  if (!buffer.is_empty()) {
-    auto flush_result2 = buffer.write_to_store(null_writer);
-    assert(flush_result2.has_value());
+    do {
+      auto result = buffer.write(slot, data_span);
+      if (!result.has_value()) {
+        assert(result.error() == Status::Not_enough_space);
+        auto flush_result = buffer.write_to_store(null_writer);
+        assert(flush_result.has_value());
+        data_span = data_span.subspan(data_span.size() - slot.m_len, slot.m_len);
+      }
+    } while (slot.m_len > 0);
   }
 
   /* Buffer should be mostly empty after final flush */
-  assert(buffer.check_margin() >= buffer.get_total_data_size() / 2);
+  assert(buffer.check_margin() >= data_size / 2);
 
   std::fprintf(stderr, "[test_circular_buffer_wrap_around_partial_block] done\n");
 }
@@ -622,7 +581,7 @@ static void test_circular_buffer_reserve_write_gap() {
 
   /* HWM has advanced by 1500, but nothing committed yet */
   assert(buffer.m_hwm == 1500);
-  assert(buffer.m_committed_lsn == 0);
+  assert(buffer.m_written_lsn == 0);
   assert(buffer.pending_writes());
 
   /* check_margin() should reflect committed data, not reserved */
@@ -637,13 +596,13 @@ static void test_circular_buffer_reserve_write_gap() {
   auto result1 = buffer.write(slot1, data1);
   assert(result1.has_value());
   assert(result1.value() == 500);
-  assert(buffer.m_committed_lsn == 500);
+  assert(buffer.m_written_lsn == 500);
 
   Record data2(500, std::byte{'B'});
   auto result2 = buffer.write(slot2, data2);
   assert(result2.has_value());
   assert(result2.value() == 500);
-  assert(buffer.m_committed_lsn == 1000);
+  assert(buffer.m_written_lsn == 1000);
 
   /* Now check_margin reflects the committed data */
   assert(buffer.check_margin() == buffer.get_total_data_size() - 1000);
@@ -652,7 +611,7 @@ static void test_circular_buffer_reserve_write_gap() {
   auto result3 = buffer.write(slot3, data3);
   assert(result3.has_value());
   assert(result3.value() == 500);
-  assert(buffer.m_committed_lsn == 1500);
+  assert(buffer.m_written_lsn == 1500);
   assert(!buffer.pending_writes());
 
   std::fprintf(stderr, "[test_circular_buffer_reserve_write_gap] done\n");
@@ -667,13 +626,6 @@ static void test_circular_buffer_incremental_partial_block() {
   using Record = std::vector<std::byte>;
   Circular_buffer buffer(initial_lsn, config);
 
-  auto null_writer = [](lsn_t lsn, const wal::Log::IO_vecs &iovecs) -> wal::Result<lsn_t> {
-    std::size_t bytes_written{};
-    for (std::size_t i = 1; i < iovecs.size(); i += 3) {
-      bytes_written += iovecs[i].iov_len;
-    }
-    return wal::Result<lsn_t>(lsn + bytes_written);
-  };
 
   const auto data_size_per_block = static_cast<std::uint16_t>(buffer.get_data_size_in_block());
 
@@ -696,7 +648,7 @@ static void test_circular_buffer_incremental_partial_block() {
   assert(partial_result.has_value());
   assert(partial_result.value() == partial_size);
 
-  const auto committed_before_flush = buffer.m_committed_lsn.load();
+  const auto committed_before_flush = buffer.m_written_lsn.load();
   const auto block_3_index = 3;
   const auto block_3_len_before = buffer.get_block_header(block_3_index).get_data_len();
   assert(block_3_len_before == partial_size);
@@ -750,7 +702,7 @@ static void test_circular_buffer_single_byte_writes() {
   assert(block_0_len == data_size_per_block);
 
   /* Verify committed_lsn */
-  assert(buffer.m_committed_lsn == data_size_per_block);
+  assert(buffer.m_written_lsn == data_size_per_block);
 
   /* Verify data integrity - read back the bytes */
   auto span = buffer.data();
@@ -826,9 +778,9 @@ static void test_circular_buffer_nonzero_initial_lsn() {
   assert(result.has_value());
   assert(result.value() == 500);
 
-  /* Verify LSNs are correct */
-  assert(slot.m_lsn == initial_lsn);
-  assert(buffer.m_committed_lsn == initial_lsn + 500);
+  /* Verify LSNs are correct, we update the LSN of the slot to the length the written data. */
+  assert(slot.m_lsn == initial_lsn + 500);
+  assert(buffer.m_written_lsn == initial_lsn + 500);
 
   /* Verify block number */
   const auto block_0_no = buffer.get_block_header(0).get_block_no();
@@ -846,13 +798,6 @@ static void test_circular_buffer_block_number_continuity() {
   using Record = std::vector<std::byte>;
   Circular_buffer buffer(initial_lsn, config);
 
-  auto null_writer = [](lsn_t lsn, const wal::Log::IO_vecs &iovecs) -> wal::Result<lsn_t> {
-    std::size_t bytes_written{};
-    for (std::size_t i = 1; i < iovecs.size(); i += 3) {
-      bytes_written += iovecs[i].iov_len;
-    }
-    return wal::Result<lsn_t>(lsn + bytes_written);
-  };
 
   const auto data_size_per_block = static_cast<std::uint16_t>(buffer.get_data_size_in_block());
 
@@ -985,18 +930,10 @@ static void test_circular_buffer_flush_partial_block() {
   assert(result.value() == 100);
 
   /* Verify state before flush */
-  assert(buffer.m_committed_lsn == 100);
+  assert(buffer.m_written_lsn == 100);
   assert(buffer.m_lwm == 0);
 
   /* Flush */
-  auto null_writer = [](lsn_t lsn, const std::vector<iovec>& iovecs) -> wal::Result<lsn_t> {
-    /* Calculate bytes written from iovecs */
-    std::size_t bytes_written{};
-    for (std::size_t i = 1; i < iovecs.size(); i += 3) {
-      bytes_written += iovecs[i].iov_len;
-    }
-    return wal::Result<lsn_t>(lsn + bytes_written);
-  };
 
   auto flush_result = buffer.write_to_store(null_writer);
   assert(flush_result.has_value());
@@ -1035,16 +972,9 @@ static void test_circular_buffer_flush_exact_blocks() {
   assert(result.value() == write_size);
 
   /* Verify committed */
-  assert(buffer.m_committed_lsn == 1488);
+  assert(buffer.m_written_lsn == 1488);
 
   /* Flush */
-  auto null_writer = [](lsn_t lsn, const std::vector<iovec>& iovecs) -> wal::Result<lsn_t> {
-    std::size_t bytes_written{};
-    for (std::size_t i = 1; i < iovecs.size(); i += 3) {
-      bytes_written += iovecs[i].iov_len;
-    }
-    return wal::Result<lsn_t>(lsn + bytes_written);
-  };
 
   auto flush_result = buffer.write_to_store(null_writer);
   assert(flush_result.has_value());
@@ -1149,13 +1079,6 @@ static void test_circular_buffer_pattern_verification() {
   }
 
   /* Flush */
-  auto null_writer = [](lsn_t lsn, const std::vector<iovec>& iovecs) -> wal::Result<lsn_t> {
-    std::size_t bytes_written{};
-    for (std::size_t i = 1; i < iovecs.size(); i += 3) {
-      bytes_written += iovecs[i].iov_len;
-    }
-    return wal::Result<lsn_t>(lsn + bytes_written);
-  };
 
   auto flush_result = buffer.write_to_store(null_writer);
   assert(flush_result.has_value());
@@ -1200,15 +1123,6 @@ static void test_circular_buffer_minimal_write_flush_cycle() {
 
   Circular_buffer::Config config(4, 512);
   Circular_buffer buffer(0, config);
-
-  auto null_writer = [](lsn_t lsn, const std::vector<iovec>& iovecs) -> wal::Result<lsn_t> {
-    std::size_t bytes_written{};
-    for (std::size_t i = 1; i < iovecs.size(); i += 3) {
-      bytes_written += iovecs[i].iov_len;
-    }
-    log_inf("lsn: {}, bytes_written: {}", lsn, bytes_written);
-    return wal::Result<lsn_t>(lsn + bytes_written);
-  };
 
   /* Perform multiple iterations of small write + flush */
   /* Write at least one full block per iteration to avoid clear() issues with partial blocks */

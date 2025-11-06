@@ -290,7 +290,6 @@ struct [[nodiscard]] Circular_buffer {
     const auto lsn = m_hwm.fetch_add(len, std::memory_order_release);
 
     m_n_pending_writes.fetch_add(1, std::memory_order_release);
-    m_n_pending_bytes.fetch_add(len, std::memory_order_release);
 
     return Slot {
       .m_lsn = lsn,
@@ -331,7 +330,7 @@ struct [[nodiscard]] Circular_buffer {
 
     assert(m_lwm <= slot.m_lsn);
 
-    log_inf("m_total_data_size: {}, slot.m_lsn: {}, m_lwm: {}, check_margin: {}", m_total_data_size, slot.m_lsn, m_lwm.load(), check_margin());
+    // log_inf("m_total_data_size: {}, slot.m_lsn: {}, m_lwm: {}, check_margin: {}", m_total_data_size, slot.m_lsn, m_lwm.load(), check_margin());
 
     if (m_total_data_size <= slot.m_lsn - m_lwm) {
       return std::unexpected(Status::Not_enough_space);
@@ -340,7 +339,7 @@ struct [[nodiscard]] Circular_buffer {
     std::size_t rel_off = static_cast<std::size_t>(slot.m_lsn % m_total_data_size);
     const std::size_t len = std::min(size_t(slot.m_len), m_total_data_size - rel_off);
 
-    log_inf("lwm: {}, writing {} bytes at LSN {} (rel_off: {}, len: {})", m_lwm.load(), slot.m_len, slot.m_lsn, rel_off, len);
+    // log_inf("lwm: {}, writing {} bytes at LSN {} (rel_off: {}, len: {})", m_lwm.load(), slot.m_len, slot.m_lsn, rel_off, len);
 
     assert(len > 0);
 
@@ -362,7 +361,7 @@ struct [[nodiscard]] Circular_buffer {
 
     for (;;) {
 
-      log_inf("block_index: {}, copied: {}, check_margin: {}, committed_lsn: {}", block_index, copied, check_margin(), m_committed_lsn.load());
+      // log_inf("block_index: {}, copied: {}, check_margin: {}, committed_lsn: {}", block_index, copied, check_margin(), m_committed_lsn.load());
 
       auto &hdr = get_block_header(block_index);
 
@@ -372,7 +371,7 @@ struct [[nodiscard]] Circular_buffer {
       const std::size_t avail_in_block = m_config.get_data_size_in_block() - offset_in_block;
       const std::size_t to_copy = std::min(len - copied, avail_in_block);
 
-      log_inf("writing {} bytes to block {} (block_no: {}, block_index: {})", to_copy, block_no, block_no, block_index);
+      // log_inf("writing {} bytes to block {} (block_no: {}, block_index: {})", to_copy, block_no, block_no, block_index);
 
       assert(to_copy > 0);
 
@@ -404,7 +403,7 @@ struct [[nodiscard]] Circular_buffer {
         /* Check if we've wrapped around to the start of the circular buffer (LWM block) */
         if (block_index == lwm_block_index) {
           /* We've wrapped around and reached the LWM block - stop writing to avoid overwriting unflushed data */
-          log_inf("Wrapped around to LWM block (block_index: {}), stopping write. copied: {}, len: {}, remaining: {}", block_index, copied, len, len - copied);
+          // log_inf("Wrapped around to LWM block (block_index: {}), stopping write. copied: {}, len: {}, remaining: {}", block_index, copied, len, len - copied);
           break;
         }
         /* Continue to next iteration to write remaining data */
@@ -422,31 +421,26 @@ struct [[nodiscard]] Circular_buffer {
     slot.m_lsn += copied;
     slot.m_len -= uint16_t(copied);
 
-    m_n_pending_bytes.fetch_sub(copied, std::memory_order_release);
-
     if (slot.m_len == 0) {
       m_n_pending_writes.fetch_sub(1, std::memory_order_release);
     }
 
-    m_committed_lsn.fetch_add(copied, std::memory_order_release);
+    m_written_lsn.fetch_add(copied, std::memory_order_release);
 
-    // log_inf("wrote {} bytes to slot {} (len: {}), m_committed_lsn: {}", copied, slot.m_lsn, len, m_committed_lsn.load());
-
-    /* Caller can detect partial write via return value. */
-    return Result<std::size_t>(copied);
+    return slot.m_len == 0 ? Result<std::size_t>(copied) : std::unexpected(Status::Not_enough_space);
   }
 
   [[nodiscard]] bool is_full() const noexcept {
-    assert(m_committed_lsn >= m_lwm);
-    assert(m_committed_lsn <= m_hwm);
-    assert(m_committed_lsn - m_lwm <= get_total_data_size());
-    return m_committed_lsn - m_lwm == get_total_data_size();
+    assert(m_written_lsn >= m_lwm);
+    assert(m_written_lsn <= m_hwm);
+    assert(m_written_lsn - m_lwm <= get_total_data_size());
+    return m_written_lsn - m_lwm == get_total_data_size();
   }
 
   [[nodiscard]] bool is_empty() const noexcept {
-    assert(m_committed_lsn >= m_lwm);
-    assert(m_committed_lsn <= m_hwm);
-    return m_committed_lsn == m_lwm;
+    assert(m_written_lsn >= m_lwm);
+    assert(m_written_lsn <= m_hwm);
+    return m_written_lsn == m_lwm;
   }
 
   /**
@@ -455,7 +449,7 @@ struct [[nodiscard]] Circular_buffer {
    * @return True if there are pending writes, false otherwise.
    */
   [[nodiscard]] bool pending_writes() const noexcept {
-    return m_committed_lsn < m_hwm;
+    return m_written_lsn < m_hwm;
   }
 
   /**
@@ -463,8 +457,8 @@ struct [[nodiscard]] Circular_buffer {
    * @return The number of bytes left in the buffer.
    */
   [[nodiscard]] std::size_t check_margin() const noexcept {
-    assert(m_committed_lsn >= m_lwm);
-    return m_total_data_size - (m_committed_lsn - m_lwm);
+    assert(m_written_lsn >= m_lwm);
+    return m_total_data_size - (m_written_lsn - m_lwm);
   }
 
   /**
@@ -493,20 +487,27 @@ struct [[nodiscard]] Circular_buffer {
   */
   void clear(lsn_t start_lsn, lsn_t end_lsn) noexcept {
     assert(start_lsn <= end_lsn);
-    assert(start_lsn >= m_lwm);
-    assert(end_lsn <= m_committed_lsn);
+    assert(end_lsn <= m_written_lsn);
 
-    log_inf("clearing from LSN {} to LSN {}", start_lsn, end_lsn);
+    const auto end_ptr = m_block_header_array + m_config.m_n_blocks;
 
-    auto n_blocks_to_clear = ((end_lsn - start_lsn) / m_config.get_data_size_in_block());
+    //log_inf("clearing from LSN {} to LSN {}", start_lsn, end_lsn);
+
+    const auto data_size = m_config.get_data_size_in_block();
+    const auto first_block_no = start_lsn / data_size;
+    const auto last_block_no = end_lsn / data_size;
+
+    if (last_block_no == first_block_no) {
+      return;
+    }
+
+    const auto n_blocks_to_clear = last_block_no - first_block_no;
     auto n_bytes_to_clear = n_blocks_to_clear * sizeof(Block_header);
 
     assert(n_bytes_to_clear <= sizeof(Block_header) * m_config.m_n_blocks);
 
-    const auto start_block_index = (start_lsn / m_config.get_data_size_in_block()) % m_config.m_n_blocks;
-
+    const auto start_block_index = first_block_no % m_config.m_n_blocks;
     auto ptr = m_block_header_array + start_block_index;
-    const auto end_ptr = m_block_header_array + m_config.m_n_blocks;
 
     {
       using uptrdiff_t = std::make_unsigned_t<std::ptrdiff_t>;
@@ -536,8 +537,14 @@ struct [[nodiscard]] Circular_buffer {
   */
   alignas(kCLS) std::atomic<lsn_t> m_hwm{};
 
-  /** LSN of the last write. This is the LSN of the last write that has been committed. */
-  alignas(kCLS) std::atomic<lsn_t> m_committed_lsn{};
+  /** @note written_lsn is a simple counter that increments by bytes written, 
+   * it doesn't track which specific LSN ranges are written. Out-of-order writes 
+   * will work but written_lsn does not represent a contiguous range.
+   */ 
+  alignas(kCLS) std::atomic<lsn_t> m_written_lsn{};
+
+  /** Number of pending writes. */
+  alignas(kCLS) std::atomic<std::size_t> m_n_pending_writes{};
 
   Config m_config;
 
@@ -552,12 +559,6 @@ struct [[nodiscard]] Circular_buffer {
 
   /** Array of block headers for each block. It points to an offset in m_buffer */
   Block_header *m_block_header_array{};
-
-  /** Number of pending writes. */
-  std::atomic<std::size_t> m_n_pending_writes{};
-
-  /** Number of pending bytes,  reserved but not written yet. */
-  std::atomic<std::size_t> m_n_pending_bytes{};
 
   /** Buffer for all the data. */
   std::vector<std::byte> m_buffer{};
