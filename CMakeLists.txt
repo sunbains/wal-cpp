@@ -9,7 +9,7 @@ include(CMakePackageConfigHelpers)
 option(WAL_BUILD_TESTS "Build tests" ON)
 # Build the wal library (may be WIP). OFF so tests can build independently.
 option(WAL_BUILD_LIB "Build wal library" OFF)
-option(WAL_WARNINGS_AS_ERRORS "Treat warnings as errors" OFF)
+# Warnings as errors are always enabled for all builds
 
 # Sensible default build type for single-config generators.
 if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
@@ -60,23 +60,26 @@ if(WAL_BUILD_LIB OR WAL_BUILD_TESTS)
     EXPORT_NAME wal
   )
 
-  # Warnings (portable baseline) + optional -Werror.
+  # Warnings (portable baseline) + always treat warnings as errors.
   if(MSVC)
     target_compile_options(wal PRIVATE
       /W4
-      $<$<BOOL:${WAL_WARNINGS_AS_ERRORS}>:/WX>
+      /WX
+      # Maximum safe optimization for Release builds
+      $<$<CONFIG:Release>:/O2 /Ob2 /Oi /Ot /GL>
+      $<$<CONFIG:RelWithDebInfo>:/O2 /Ob1 /Oi /Ot>
     )
   else()
     target_compile_options(wal PRIVATE
       -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion
-      $<$<BOOL:${WAL_WARNINGS_AS_ERRORS}>:-Werror>
+      -Werror
       # SSE4.2 for CRC intrinsics in checksum.h
       -msse4.2
-      # Always build with rich debug info in every config.
       $<$<CONFIG:Debug>:-g3 -ggdb3>
-      $<$<CONFIG:Release>:-g3 -ggdb3>
       $<$<CONFIG:RelWithDebInfo>:-g3 -ggdb3>
-      $<$<CONFIG:MinSizeRel>:-g3 -ggdb3>
+      # Maximum safe optimization for Release builds
+      $<$<CONFIG:Release>:-O3 -flto -march=native -mtune=native>
+      $<$<CONFIG:RelWithDebInfo>:-O3 -flto>
     )
   endif()
 
@@ -85,7 +88,12 @@ if(WAL_BUILD_LIB OR WAL_BUILD_TESTS)
     if(MOLD_LD)
       target_link_options(wal PRIVATE -fuse-ld=mold)
     endif()
-    target_link_options(wal PRIVATE -Wl,--build-id)
+    target_link_options(wal PRIVATE
+      -Wl,--build-id
+      # Enable LTO in linker for Release builds
+      $<$<CONFIG:Release>:-flto>
+      $<$<CONFIG:RelWithDebInfo>:-flto>
+    )
   endif()
 
   # ------------------------------ Install ------------------------------------

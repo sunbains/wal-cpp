@@ -38,7 +38,7 @@ int main() {
   wal::Log log(0, config);
   wal::Log::Write_callback null_writer = Null_writer{};
 
-  constexpr std::size_t kIterationsSingle = 100'000;
+  constexpr std::size_t kIterationsSingle = 100'000'000;
   std::mt19937 rng(42);
   std::uniform_int_distribution<int> len_dist(12, 256);
   std::uniform_int_distribution<int> byte_dist(0, 255);
