@@ -130,6 +130,10 @@ namespace wal {
 
     m_lwm.store(std::min(persisted_lsn, m_committed_lsn.load()), std::memory_order_release);
 
+    log_inf("m_lwm: {}", m_lwm.load(std::memory_order_relaxed));
+    log_inf("m_hwm: {}", m_hwm.load(std::memory_order_relaxed));
+    log_inf("m_committed_lsn: {}", m_committed_lsn.load(std::memory_order_relaxed));
+
     return Result<lsn_t>(persisted_lsn);
   }
 

@@ -348,14 +348,16 @@ struct [[nodiscard]] Circular_buffer {
 
     assert(m_lwm <= slot.m_lsn);
 
-    if (m_total_data_size < slot.m_lsn - m_lwm) {
+    log_inf("m_total_data_size: {}, slot.m_lsn: {}, m_lwm: {}, check_margin: {}", m_total_data_size, slot.m_lsn, m_lwm.load(), check_margin());
+
+    if (m_total_data_size <= slot.m_lsn - m_lwm) {
       return std::unexpected(Status::Not_enough_space);
     }
 
     std::size_t rel_off = static_cast<std::size_t>(slot.m_lsn % m_total_data_size);
     const std::size_t len = std::min(size_t(slot.m_len), m_total_data_size - rel_off);
 
-    log_inf("writing {} bytes at LSN {} (rel_off: {}, len: {})", slot.m_len, slot.m_lsn, rel_off, len);
+    log_inf("lwm: {}, writing {} bytes at LSN {} (rel_off: {}, len: {})", m_lwm.load(), slot.m_len, slot.m_lsn, rel_off, len);
 
     assert(len > 0);
 
@@ -365,16 +367,19 @@ struct [[nodiscard]] Circular_buffer {
 
     assert(block_no < std::numeric_limits<block_no_t>::max());
 
-    std::size_t block_index = static_cast<std::size_t>(block_no - front().get_block_no()) % m_config.m_n_blocks;
+    auto block_index = (get_first_block_index() + (block_no - front().get_block_no())) % m_config.m_n_blocks;
     assert(block_index < m_config.m_n_blocks);
 
-    std::size_t copied = 0;
+    std::size_t copied{};
     std::byte* ptr = m_data_array + rel_off;
 
     /* Process current block, then subsequent blocks as needed. */
     std::size_t offset_in_block = off_in_blk;
+    const auto lwm_block_index = (m_lwm / m_config.get_data_size_in_block()) % m_config.m_n_blocks;
 
     while (copied < len) {
+
+      log_inf("block_index: {}, copied: {}, check_margin: {}, committed_lsn: {}", block_index, copied, check_margin(), m_committed_lsn.load());
 
       auto &hdr = get_block_header(block_index);
 
@@ -400,10 +405,16 @@ struct [[nodiscard]] Circular_buffer {
       /* Next block starts at 0 */
       offset_in_block = 0;
 
+      assert(std::atomic_ref<len_t>(hdr.m_data.m_len).load() <= m_config.get_data_size_in_block());
+
       ++block_no;
       block_index = (block_index + 1) % m_config.m_n_blocks;
 
-      assert(std::atomic_ref<len_t>(hdr.m_data.m_len).load() <= m_config.get_data_size_in_block());
+      log_inf("block_index: {}, lwm_block_index: {}", block_index, lwm_block_index);
+      /* Check if we have wrapped around to the first block. */
+      if (block_index == lwm_block_index) {
+        break;
+      }
     }
 
     assert(copied > 0 && copied <= len);
@@ -476,6 +487,8 @@ struct [[nodiscard]] Circular_buffer {
     assert(start_lsn >= m_lwm);
     assert(end_lsn <= m_committed_lsn);
 
+    log_inf("clearing from LSN {} to LSN {}", start_lsn, end_lsn);
+
     auto n_blocks_to_clear = ((end_lsn - start_lsn) / m_config.get_data_size_in_block());
     auto n_bytes_to_clear = n_blocks_to_clear * sizeof(Block_header);
 
@@ -491,8 +504,13 @@ struct [[nodiscard]] Circular_buffer {
 
       assert(sizeof(Block_header) * n_blocks_to_clear >= n_bytes_to_clear);
       const auto len = std::min(n_bytes_to_clear, uptrdiff_t(end_ptr - ptr) * sizeof(Block_header));
+      log_inf("clearing {} bytes from block index {}", len, start_block_index);
       std::memset(ptr, 0, len);
       n_bytes_to_clear -= len;
+
+      for (std::size_t i = 0; i < m_config.m_n_blocks; ++i) {
+        log_inf("Block header {}", m_block_header_array[i].to_string());
+      }
     }
 
     /* Check for wrap around. */
