@@ -33,7 +33,6 @@ static void test_circular_buffer_basic() {
   auto slot1 = buffer.reserve(100);
   assert(slot1.m_lsn == initial_lsn);
   assert(slot1.m_len == 100);
-  assert(!slot1.m_committed);
   
   /* After reserve, HWM should be incremented but still empty until write */
   assert(buffer.m_lwm == initial_lsn);

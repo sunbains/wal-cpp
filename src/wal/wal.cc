@@ -49,17 +49,26 @@ namespace wal {
 
     /* Ceiling division: (a + b - 1) / b avoids modulo and conditional */
     auto n_blocks_to_flush = (n_bytes_to_flush + m_config.get_data_size_in_block() - 1) / m_config.get_data_size_in_block();
+    const auto last_block_no = block_start_no + n_blocks_to_flush - 1;
 
     /* We create IO vectors for each block. One for the header,
-    one for the data for the block and the last for the checksum. */
-    iovecs.resize((std::min(n_blocks_to_flush * 3, size_t(IOV_MAX))));
+    one for the data for the block and the last for the checksum.
+    Each block needs 3 iovecs (header, data, checksum). */
+    const auto iovecs_size = std::min(n_blocks_to_flush * 3, static_cast<std::size_t>(IOV_MAX));
+    const auto max_blocks_per_batch = iovecs_size / 3;
+
+    iovecs.resize(iovecs_size);
 
     auto expected_block_no = m_lwm / m_config.get_data_size_in_block();
 
     lsn_t persisted_lsn{};
 
+    log_inf("n_blocks_to_flush: {}", n_blocks_to_flush);
+
     while (n_blocks_to_flush > 0) {
-      const auto flush_batch_size{std::min(n_blocks_to_flush, iovecs.size() / 3)};
+      /* Use the maximum blocks per batch based on the actual iovecs_size we allocated.
+       * This ensures we use all available iovecs efficiently without exceeding the vector size. */
+      const auto flush_batch_size{std::min(n_blocks_to_flush, max_blocks_per_batch)};
       const auto n_slots = flush_batch_size * 3;
 
       for (std::size_t i{}; i < n_slots; i += 3) {
@@ -70,7 +79,18 @@ namespace wal {
 
         ++expected_block_no;
 
-        header->prepare_to_write();
+        [[maybe_unused]] const auto is_last_block = header->m_data.m_block_no == last_block_no;
+
+        if (header->m_data.m_block_no == last_block_no) [[unlikely]] {
+          header->set_flush_bit(true);
+        }
+
+        assert(header->m_data.m_len == uint16_t(m_config.get_data_size_in_block())
+               || (is_last_block
+                   && header->get_flush_bit()
+                   && header->m_data.m_len < uint16_t(m_config.get_data_size_in_block())));
+
+        // header->prepare_to_write();
 
         *crc32 = util::Checksum::compute(span, util::ChecksumAlgorithm::CRC32C);
 
@@ -93,6 +113,8 @@ namespace wal {
         data->m_block_no = util::hton(data->m_block_no);
       }
 
+      log_inf("iovecs: {}", iovecs.size());
+
       auto result = callback(m_lwm, iovecs);
 
       if (!result.has_value()) {
@@ -112,10 +134,12 @@ namespace wal {
       /* The persisted LSN is on block boundaries, due to padding to avoid
       read before write issues. We advance the LWM by the number of valid
       bytes written. */
-      persisted_lsn = result.value();
+      persisted_lsn += result.value();
 
       assert(persisted_lsn >= m_lwm);
     }
+
+    log_inf("persisted_lsn: {}", persisted_lsn);
 
     /* The last block may not be full and may have to be rewritten. We need to preseve its header,
     and advance the LWM only by the valid data length. Round down to lower block boundary */
@@ -126,7 +150,7 @@ namespace wal {
 
     if (util::ntoh(block_header.get_data_len()) < m_config.get_data_size_in_block()) {
       /* Convert back from network byte order to host byte order. */
-      block_header.prepare_to_read();
+      // block_header.prepare_to_read();
     }
 
     const auto end_lsn = (m_committed_lsn.load(std::memory_order_acquire) / m_config.get_data_size_in_block()) * m_config.get_data_size_in_block();
