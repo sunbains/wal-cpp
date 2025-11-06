@@ -816,7 +816,8 @@ static void test_circular_buffer_nonzero_initial_lsn() {
 
   /* Verify initial block numbers */
   const auto expected_start_block = initial_lsn / data_size_per_block;
-  assert(buffer.front().get_block_no() == expected_start_block);
+  auto block_header = buffer.get_block_header(expected_start_block % config.m_n_blocks);
+  assert(block_header.get_block_no() == expected_start_block);
 
   /* Write some data */
   auto slot = buffer.reserve(500);
@@ -975,8 +976,6 @@ static void test_circular_buffer_flush_partial_block() {
 
   Circular_buffer::Config config(4, 512);
   Circular_buffer buffer(0, config);
-
-  const auto data_size_per_block = buffer.get_data_size_in_block();
 
   /* Write only 100 bytes (less than one block) */
   auto slot = buffer.reserve(100);
@@ -1194,15 +1193,8 @@ static void test_circular_buffer_pattern_verification() {
  * Test: Minimal Write-Flush Cycle
  * Category: Flush Edge Cases
  * Purpose: Stress test with frequent flushes
- *
- * NOTE: This test is currently disabled because it exposes a bug in the clear() logic
- * when doing frequent single-block flushes. The block headers get corrupted after
- * clearing, causing write_to_store() to fail with mismatched block numbers.
- *
- * TODO: Re-enable this test after the clear() function is fixed to properly preserve
- * block headers at the new front position after clearing.
  */
-static void test_circular_buffer_minimal_write_flush_cycle_DISABLED() {
+static void test_circular_buffer_minimal_write_flush_cycle() {
   std::fprintf(stderr, "[test_circular_buffer_minimal_write_flush_cycle] start\n");
 
   using Record = std::vector<std::byte>;
@@ -1215,6 +1207,7 @@ static void test_circular_buffer_minimal_write_flush_cycle_DISABLED() {
     for (std::size_t i = 1; i < iovecs.size(); i += 3) {
       bytes_written += iovecs[i].iov_len;
     }
+    log_inf("lsn: {}, bytes_written: {}", lsn, bytes_written);
     return wal::Result<lsn_t>(lsn + bytes_written);
   };
 
@@ -1382,7 +1375,7 @@ int main() {
   test_circular_buffer_flush_exact_blocks();
   test_circular_buffer_write_buffer_full();
   test_circular_buffer_pattern_verification();
-  // test_circular_buffer_minimal_write_flush_cycle_DISABLED();  /* Disabled - see test comment */
+  test_circular_buffer_minimal_write_flush_cycle();  /* Disabled - see test comment */
 
   /* Log tests */
   test_log_basic();

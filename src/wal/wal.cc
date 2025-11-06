@@ -54,7 +54,7 @@ namespace wal {
     one for the data for the block and the last for the checksum. */
     iovecs.resize((std::min(n_blocks_to_flush * 3, size_t(IOV_MAX))));
 
-    [[maybe_unused]] auto expected_block_start_no = m_lwm / m_config.get_data_size_in_block();
+    auto expected_block_no = m_lwm / m_config.get_data_size_in_block();
 
     lsn_t persisted_lsn{};
 
@@ -66,7 +66,9 @@ namespace wal {
         const auto block_index{(block_start_no + i / 3) % m_config.m_n_blocks};
         auto [header, span, crc32] = get_block(block_index);
 
-        assert(header->get_block_no() == expected_block_start_no++);
+        assert(header->get_block_no() == expected_block_no);
+
+        ++expected_block_no;
 
         header->prepare_to_write();
 
@@ -117,7 +119,10 @@ namespace wal {
 
     /* The last block may not be full and may have to be rewritten. We need to preseve its header,
     and advance the LWM only by the valid data length. Round down to lower block boundary */
-    auto& block_header = m_block_header_array[get_last_block_index()];
+    const auto last_block_index = (expected_block_no - 1) % m_config.m_n_blocks;
+    auto& block_header = m_block_header_array[last_block_index];
+
+    log_inf("committed_lsn: {}, expected_block_no: {}", m_committed_lsn.load(std::memory_order_relaxed), expected_block_no);
 
     if (util::ntoh(block_header.get_data_len()) < m_config.get_data_size_in_block()) {
       /* Convert back from network byte order to host byte order. */

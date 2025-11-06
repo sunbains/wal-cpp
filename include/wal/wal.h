@@ -310,23 +310,6 @@ struct [[nodiscard]] Circular_buffer {
     return std::span<crc32_t>(m_crc32_array, m_config.m_n_blocks);
   }
 
-  [[nodiscard]] std::size_t get_first_block_index() const noexcept {
-    return (m_lwm / m_config.get_data_size_in_block()) % m_config.m_n_blocks;
-  }
-
-  [[nodiscard]] std::size_t get_last_block_index() const noexcept {
-    assert(m_committed_lsn >= m_lwm);
-    return ((m_committed_lsn - m_lwm) / (m_config.get_data_size_in_block() - 1)) % m_config.m_n_blocks;
-  }
-
-  [[nodiscard]] const Block_header &front() const noexcept {
-    return get_block_header(get_first_block_index());
-  }
-
-  [[nodiscard]] const Block_header &back() const noexcept {
-    return get_block_header(get_last_block_index());
-  }
-
   /** 
    * Write data to the buffer.
    * @note: There is no guarantee that the entire span will be written.
@@ -367,7 +350,7 @@ struct [[nodiscard]] Circular_buffer {
 
     assert(block_no < std::numeric_limits<block_no_t>::max());
 
-    auto block_index = (get_first_block_index() + (block_no - front().get_block_no())) % m_config.m_n_blocks;
+    auto block_index = block_no % m_config.m_n_blocks;
     assert(block_index < m_config.m_n_blocks);
 
     std::size_t copied{};
