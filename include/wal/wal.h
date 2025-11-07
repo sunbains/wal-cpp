@@ -687,6 +687,9 @@ struct [[nodiscard]] Slot {
 
   /** Buffer for all the data. */
   std::vector<std::byte> m_buffer{};
+
+  /** Checksum for the data. */
+  util::Checksum m_checksum{util::ChecksumAlgorithm::CRC32C};
 };
 
 struct [[nodiscard]] Log {

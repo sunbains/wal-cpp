@@ -48,7 +48,17 @@ inline crc32_t crc32c_hw(crc32_t crc, const void* data, size_t length) noexcept 
 #if defined(__x86_64__) || defined(_M_X64)
     const uint8_t* buf = static_cast<const uint8_t*>(data);
 
-    /* Process 8-byte chunks. */
+    /* Process 32-byte chunks (4x8 bytes) with loop unrolling for better throughput. */
+    while (length >= 32) {
+        crc = static_cast<crc32_t>(_mm_crc32_u64(crc, *reinterpret_cast<const uint64_t*>(buf)));
+        crc = static_cast<crc32_t>(_mm_crc32_u64(crc, *reinterpret_cast<const uint64_t*>(buf + 8)));
+        crc = static_cast<crc32_t>(_mm_crc32_u64(crc, *reinterpret_cast<const uint64_t*>(buf + 16)));
+        crc = static_cast<crc32_t>(_mm_crc32_u64(crc, *reinterpret_cast<const uint64_t*>(buf + 24)));
+        buf += 32;
+        length -= 32;
+    }
+
+    /* Process remaining 8-byte chunks. */
     while (length >= 8) {
         crc = static_cast<crc32_t>(_mm_crc32_u64(crc, *reinterpret_cast<const uint64_t*>(buf)));
         buf += 8;
@@ -139,11 +149,15 @@ enum class ChecksumAlgorithm {
  * @note This class is used to compute the checksum of a data stream.
  */
 struct Checksum {
+    using update_fn_t = crc32_t(*)(crc32_t, const void*, size_t) noexcept;
+
     explicit constexpr Checksum(ChecksumAlgorithm algo = ChecksumAlgorithm::CRC32C) noexcept
-        : m_use_hw(false), m_state(0), m_algorithm(algo) {
+        : m_use_hw(false), m_state(0), m_algorithm(algo), m_update_fn(crc32c_sw) {
 #if defined(__x86_64__) || defined(_M_X64)
         if (algo == ChecksumAlgorithm::CRC32C) {
-            m_use_hw = has_sse42();
+            static const bool sse42_supported = has_sse42();
+            m_use_hw = sse42_supported;
+            m_update_fn = sse42_supported ? crc32c_hw : crc32c_sw;
         }
 #endif /* defined(__x86_64__) || defined(_M_X64) */
     }
@@ -168,13 +182,8 @@ struct Checksum {
     }
 
     void update(const void* data, size_t length) noexcept {
-        if (m_algorithm == ChecksumAlgorithm::CRC32C) {
-            if (m_use_hw) [[likely]] {
-                m_state = crc32c_hw(m_state, data, length);
-            } else [[unlikely]] {
-                m_state = crc32c_sw(m_state, data, length);
-            }
-        }
+        // Avoid branch: use function pointer set in constructor
+        m_state = m_update_fn(m_state, data, length);
     }
 
     /** Get current checksum value
@@ -197,7 +206,7 @@ struct Checksum {
 
     /** Compute checksum for data in one call (convenience method)
      * @note This method is used to compute the checksum for data in one call.
-     * 
+     *
      * @param[in] data Pointer to the data
      * @param[in] length Length of the data in bytes
      * @return The checksum value.
@@ -212,7 +221,7 @@ struct Checksum {
 
     /** Compute checksum for data in one call (convenience method)
      * @note This method is used to compute the checksum for data in one call.
-     * 
+     *
      * @param[in] data Pointer to the data
      * @param[in] length Length of the data in bytes
      * @return The checksum value.
@@ -227,6 +236,7 @@ private:
     bool m_use_hw{};
     crc32_t m_state{0};
     ChecksumAlgorithm m_algorithm{ChecksumAlgorithm::CRC32C};
+    update_fn_t m_update_fn{crc32c_sw};
 };
 
 /**
