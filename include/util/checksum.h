@@ -37,8 +37,9 @@ inline bool has_sse42() noexcept {
 }
 
 /** Hardware-accelerated CRC32C (Castagnoli)
- * @note This function is used to compute the CRC32C checksum using hardware acceleration.
- * 
+ * @note Uses aggressive loop unrolling to give the out-of-order execution engine
+ *       more instructions to schedule, helping hide CRC32 instruction latency.
+ *
  * @param[in] crc Initial CRC value
  * @param[in] data Pointer to the data
  * @param[in] length Length of the data in bytes
@@ -48,7 +49,35 @@ inline crc32_t crc32c_hw(crc32_t crc, const void* data, size_t length) noexcept 
 #if defined(__x86_64__) || defined(_M_X64)
     const uint8_t* buf = static_cast<const uint8_t*>(data);
 
-    /* Process 32-byte chunks (4x8 bytes) with loop unrolling for better throughput. */
+    /* CRC32C uses ones' complement pre/post conditioning */
+    crc = ~crc;
+
+    /* Aggressive unrolling: process 128-byte chunks (16 qwords).
+     * While this creates a long dependency chain, modern CPUs can overlap
+     * memory fetches with CRC computation, and the unrolling gives the
+     * out-of-order execution engine more instructions to schedule. */
+    while (length >= 128) {
+        crc = static_cast<crc32_t>(_mm_crc32_u64(crc, *reinterpret_cast<const uint64_t*>(buf)));
+        crc = static_cast<crc32_t>(_mm_crc32_u64(crc, *reinterpret_cast<const uint64_t*>(buf + 8)));
+        crc = static_cast<crc32_t>(_mm_crc32_u64(crc, *reinterpret_cast<const uint64_t*>(buf + 16)));
+        crc = static_cast<crc32_t>(_mm_crc32_u64(crc, *reinterpret_cast<const uint64_t*>(buf + 24)));
+        crc = static_cast<crc32_t>(_mm_crc32_u64(crc, *reinterpret_cast<const uint64_t*>(buf + 32)));
+        crc = static_cast<crc32_t>(_mm_crc32_u64(crc, *reinterpret_cast<const uint64_t*>(buf + 40)));
+        crc = static_cast<crc32_t>(_mm_crc32_u64(crc, *reinterpret_cast<const uint64_t*>(buf + 48)));
+        crc = static_cast<crc32_t>(_mm_crc32_u64(crc, *reinterpret_cast<const uint64_t*>(buf + 56)));
+        crc = static_cast<crc32_t>(_mm_crc32_u64(crc, *reinterpret_cast<const uint64_t*>(buf + 64)));
+        crc = static_cast<crc32_t>(_mm_crc32_u64(crc, *reinterpret_cast<const uint64_t*>(buf + 72)));
+        crc = static_cast<crc32_t>(_mm_crc32_u64(crc, *reinterpret_cast<const uint64_t*>(buf + 80)));
+        crc = static_cast<crc32_t>(_mm_crc32_u64(crc, *reinterpret_cast<const uint64_t*>(buf + 88)));
+        crc = static_cast<crc32_t>(_mm_crc32_u64(crc, *reinterpret_cast<const uint64_t*>(buf + 96)));
+        crc = static_cast<crc32_t>(_mm_crc32_u64(crc, *reinterpret_cast<const uint64_t*>(buf + 104)));
+        crc = static_cast<crc32_t>(_mm_crc32_u64(crc, *reinterpret_cast<const uint64_t*>(buf + 112)));
+        crc = static_cast<crc32_t>(_mm_crc32_u64(crc, *reinterpret_cast<const uint64_t*>(buf + 120)));
+        buf += 128;
+        length -= 128;
+    }
+
+    /* Process remaining 32-byte chunks */
     while (length >= 32) {
         crc = static_cast<crc32_t>(_mm_crc32_u64(crc, *reinterpret_cast<const uint64_t*>(buf)));
         crc = static_cast<crc32_t>(_mm_crc32_u64(crc, *reinterpret_cast<const uint64_t*>(buf + 8)));
@@ -58,28 +87,31 @@ inline crc32_t crc32c_hw(crc32_t crc, const void* data, size_t length) noexcept 
         length -= 32;
     }
 
-    /* Process remaining 8-byte chunks. */
+    /* Process remaining 8-byte chunks */
     while (length >= 8) {
         crc = static_cast<crc32_t>(_mm_crc32_u64(crc, *reinterpret_cast<const uint64_t*>(buf)));
         buf += 8;
         length -= 8;
     }
 
-    /* Process 4-byte chunk. */
+    /* Process 4-byte chunk */
     if (length >= 4) {
         crc = _mm_crc32_u32(crc, *reinterpret_cast<const crc32_t*>(buf));
         buf += 4;
         length -= 4;
     }
 
-    /* Process remaining bytes. */
+    /* Process remaining bytes */
     while (length > 0) {
         crc = _mm_crc32_u8(crc, *buf);
         ++buf;
         --length;
     }
-#endif /* defined(__x86_64__) || defined(_M_X64) */
+
+    return ~crc;
+#else
     return crc;
+#endif /* defined(__x86_64__) || defined(_M_X64) */
 }
 
 /** Software fallback CRC32C implementation
