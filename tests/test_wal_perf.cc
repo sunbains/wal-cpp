@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <getopt.h>
 #include <limits>
 #include <memory>
 #include <span>
@@ -39,8 +40,8 @@ inline std::uint32_t fast_rand(std::uint32_t& state) noexcept {
 }
 
 // Common configuration
-constexpr std::size_t kBlocks = 512 * 32;
-constexpr std::size_t kBlockSize = 4096;
+constexpr std::size_t kDefaultBlocks = 512 * 32;
+constexpr std::size_t kDefaultBlockSizeBytes = 4096;
 constexpr std::size_t kMarginCheckInterval = 50000;
 constexpr std::size_t kDefaultPayloadBytes = 32;
 constexpr double kDefaultDurationSeconds = 1.0;
@@ -134,9 +135,10 @@ void test_memcpy_baseline() noexcept {
 }
 
 // Streaming memcpy baseline that walks the same sized ring buffer as wal::Circular_buffer
-void test_memcpy_ring(std::size_t chunk_size, std::chrono::nanoseconds target_duration) noexcept {
-  wal::Circular_buffer::Config config(kBlocks, kBlockSize);
-  const std::size_t ring_size = config.get_data_size_in_block() * kBlocks;
+void test_memcpy_ring(const wal::Circular_buffer::Config& config,
+                      std::size_t chunk_size,
+                      std::chrono::nanoseconds target_duration) noexcept {
+  const std::size_t ring_size = config.get_data_size_in_block() * config.m_n_blocks;
 
   std::vector<std::byte> ring(ring_size);
   std::vector<std::byte> src(chunk_size);
@@ -166,9 +168,9 @@ void test_memcpy_ring(std::size_t chunk_size, std::chrono::nanoseconds target_du
 }
 
 // Test with randomized payload data
-void test_wal_random_data(std::uint16_t write_size,
+void test_wal_random_data(const wal::Circular_buffer::Config& config,
+                          std::uint16_t write_size,
                           std::chrono::nanoseconds target_duration) noexcept {
-  wal::Circular_buffer::Config config(kBlocks, kBlockSize);
   wal::Log log(0, config);
   wal::Log::Write_callback null_writer = Null_writer{};
   Flush_metrics flush_metrics{};
@@ -254,9 +256,9 @@ void test_wal_random_data(std::uint16_t write_size,
 }
 
 // Test with fixed data (no data generation overhead)
-void test_wal_fixed_data(std::uint16_t write_size,
+void test_wal_fixed_data(const wal::Circular_buffer::Config& config,
+                         std::uint16_t write_size,
                          std::chrono::nanoseconds target_duration) noexcept {
-  wal::Circular_buffer::Config config(kBlocks, kBlockSize);
   wal::Log log(0, config);
   wal::Log::Write_callback null_writer = Null_writer{};
   Flush_metrics flush_metrics{};
@@ -345,71 +347,217 @@ void test_wal_fixed_data(std::uint16_t write_size,
                flush_ratio);
 }
 
+void print_usage(const char* program_name) noexcept {
+  std::fprintf(stderr,
+               "Usage: %s [OPTIONS]\n"
+               "\n"
+               "Options:\n"
+               "  -p, --payload BYTES     Payload size in bytes (default: %zu)\n"
+               "  -d, --duration SECONDS  Test duration in seconds (default: %.1f)\n"
+               "  -b, --batch BYTES       Batch size in bytes (default: %zu)\n"
+               "  -n, --blocks BLOCKS     Number of blocks in buffer (default: %zu)\n"
+               "  -s, --block-size BYTES  Block size in bytes (default: %zu)\n"
+               "  -t, --tests TESTS       Comma-separated test list: memcpy,ring,random,fixed (default: all)\n"
+               "  -h, --help              Show this help message\n"
+               "\n"
+               "Examples:\n"
+               "  %s -p 4096 -d 5.0\n"
+               "  %s --payload 1024 --duration 2.0 --batch 512\n"
+               "  %s -t memcpy,fixed -p 4096\n"
+               "  %s -n 16384 -s 4096 -p 4096\n",
+               program_name,
+               kDefaultPayloadBytes,
+               kDefaultDurationSeconds,
+               kDefaultBatchBytes,
+               kDefaultBlocks,
+               kDefaultBlockSizeBytes,
+               program_name,
+               program_name,
+               program_name,
+               program_name);
+}
+
+struct TestFlags {
+  bool memcpy_baseline{true};
+  bool memcpy_ring{true};
+  bool wal_random{true};
+  bool wal_fixed{true};
+};
+
+TestFlags parse_test_list(const char* test_list) noexcept {
+  TestFlags flags{};
+  flags.memcpy_baseline = false;
+  flags.memcpy_ring = false;
+  flags.wal_random = false;
+  flags.wal_fixed = false;
+
+  // Make a copy for strtok (which modifies the string)
+  const std::size_t len = std::strlen(test_list);
+  std::vector<char> list_copy(len + 1);
+  std::memcpy(list_copy.data(), test_list, len + 1);
+
+  char* token = std::strtok(list_copy.data(), ",");
+  while (token) {
+    if (std::strcmp(token, "memcpy") == 0) {
+      flags.memcpy_baseline = true;
+    } else if (std::strcmp(token, "ring") == 0) {
+      flags.memcpy_ring = true;
+    } else if (std::strcmp(token, "random") == 0) {
+      flags.wal_random = true;
+    } else if (std::strcmp(token, "fixed") == 0) {
+      flags.wal_fixed = true;
+    } else {
+      std::fprintf(stderr, "[wal_perf] unknown test: '%s'\n", token);
+    }
+    token = std::strtok(nullptr, ",");
+  }
+
+  return flags;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
   std::size_t payload_bytes = kDefaultPayloadBytes;
+  std::size_t n_blocks = kDefaultBlocks;
+  std::size_t block_size = kDefaultBlockSizeBytes;
+  bool show_help = false;
+  TestFlags test_flags{};
 
-  if (argc > 1) {
-    char* end = nullptr;
-    errno = 0;
-    const auto parsed = std::strtoull(argv[1], &end, 10);
-    const bool invalid = (end == argv[1]) || (errno != 0);
-    if (invalid || parsed == 0) {
-      std::fprintf(stderr, "[wal_perf] invalid payload size '%s'\n", argv[1]);
-      return EXIT_FAILURE;
+  static const struct option long_options[] = {
+    {"payload", required_argument, nullptr, 'p'},
+    {"duration", required_argument, nullptr, 'd'},
+    {"batch", required_argument, nullptr, 'b'},
+    {"blocks", required_argument, nullptr, 'n'},
+    {"block-size", required_argument, nullptr, 's'},
+    {"tests", required_argument, nullptr, 't'},
+    {"help", no_argument, nullptr, 'h'},
+    {nullptr, 0, nullptr, 0}
+  };
+
+  int opt;
+  int option_index = 0;
+  while ((opt = getopt_long(argc, argv, "p:d:b:n:s:t:h", long_options, &option_index)) != -1) {
+    switch (opt) {
+      case 'p': {
+        char* end = nullptr;
+        errno = 0;
+        const auto parsed = std::strtoull(optarg, &end, 10);
+        const bool invalid = (end == optarg) || (*end != '\0') || (errno != 0);
+        if (invalid || parsed == 0) {
+          std::fprintf(stderr, "[wal_perf] invalid payload size '%s'\n", optarg);
+          return EXIT_FAILURE;
+        }
+        if (parsed > std::numeric_limits<std::uint16_t>::max()) {
+          std::fprintf(stderr,
+                       "[wal_perf] payload must be <= %u bytes\n",
+                       std::numeric_limits<std::uint16_t>::max());
+          return EXIT_FAILURE;
+        }
+        payload_bytes = static_cast<std::size_t>(parsed);
+        break;
+      }
+      case 'd': {
+        char* end = nullptr;
+        errno = 0;
+        const double seconds = std::strtod(optarg, &end);
+        const bool invalid = (end == optarg) || (*end != '\0') || (errno != 0) || seconds <= 0.0;
+        if (invalid) {
+          std::fprintf(stderr, "[wal_perf] invalid duration '%s'\n", optarg);
+          return EXIT_FAILURE;
+        }
+        g_target_duration = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration<double>(seconds));
+        break;
+      }
+      case 'b': {
+        char* end = nullptr;
+        errno = 0;
+        const auto parsed = std::strtoull(optarg, &end, 10);
+        const bool invalid = (end == optarg) || (*end != '\0') || (errno != 0);
+        if (invalid || parsed == 0) {
+          std::fprintf(stderr, "[wal_perf] invalid batch size '%s'\n", optarg);
+          return EXIT_FAILURE;
+        }
+        g_batch_bytes = static_cast<std::size_t>(parsed);
+        break;
+      }
+      case 'n': {
+        char* end = nullptr;
+        errno = 0;
+        const auto parsed = std::strtoull(optarg, &end, 10);
+        const bool invalid = (end == optarg) || (*end != '\0') || (errno != 0);
+        if (invalid || parsed == 0) {
+          std::fprintf(stderr, "[wal_perf] invalid number of blocks '%s'\n", optarg);
+          return EXIT_FAILURE;
+        }
+        n_blocks = static_cast<std::size_t>(parsed);
+        break;
+      }
+      case 's': {
+        char* end = nullptr;
+        errno = 0;
+        const auto parsed = std::strtoull(optarg, &end, 10);
+        const bool invalid = (end == optarg) || (*end != '\0') || (errno != 0);
+        if (invalid || parsed == 0) {
+          std::fprintf(stderr, "[wal_perf] invalid block size '%s'\n", optarg);
+          return EXIT_FAILURE;
+        }
+        block_size = static_cast<std::size_t>(parsed);
+        break;
+      }
+      case 't': {
+        test_flags = parse_test_list(optarg);
+        break;
+      }
+      case 'h': {
+        show_help = true;
+        break;
+      }
+      default: {
+        print_usage(argv[0]);
+        return EXIT_FAILURE;
+      }
     }
-    if (parsed > std::numeric_limits<std::uint16_t>::max()) {
-      std::fprintf(stderr,
-                   "[wal_perf] payload must be <= %u bytes\n",
-                   std::numeric_limits<std::uint16_t>::max());
-      return EXIT_FAILURE;
-    }
-    payload_bytes = parsed;
   }
 
-  if (argc > 2) {
-    char* end = nullptr;
-    errno = 0;
-    const double seconds = std::strtod(argv[2], &end);
-    const bool invalid = (end == argv[2]) || (errno != 0) || seconds <= 0.0;
-    if (invalid) {
-      std::fprintf(stderr, "[wal_perf] invalid duration '%s'\n", argv[2]);
-      return EXIT_FAILURE;
-    }
-    g_target_duration = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration<double>(seconds));
-  } else {
-    g_target_duration = std::chrono::seconds(1);
+  if (optind < argc) {
+    std::fprintf(stderr, "[wal_perf] unexpected argument: '%s'\n", argv[optind]);
+    print_usage(argv[0]);
+    return EXIT_FAILURE;
   }
 
-  if (argc > 3) {
-    char* end = nullptr;
-    errno = 0;
-    const auto parsed = std::strtoull(argv[3], &end, 10);
-    const bool invalid = (end == argv[3]) || (errno != 0);
-    if (invalid || parsed == 0) {
-      std::fprintf(stderr, "[wal_perf] invalid batch size '%s'\n", argv[3]);
-      return EXIT_FAILURE;
-    }
-    g_batch_bytes = static_cast<std::size_t>(parsed);
-  } else {
-    g_batch_bytes = kDefaultBatchBytes;
+  if (show_help) {
+    print_usage(argv[0]);
+    return EXIT_SUCCESS;
   }
 
   g_payload_bytes = payload_bytes;
   const auto payload_u16 = static_cast<std::uint16_t>(payload_bytes);
 
+  // Create buffer configuration from command-line options
+  wal::Circular_buffer::Config config(n_blocks, block_size);
+
   const double duration_s = static_cast<double>(g_target_duration.count()) / 1'000'000'000.0;
   std::fprintf(stderr,
-               "[wal_perf] start (payload=%zu bytes, duration=%.3fs, batch=%zu bytes)\n",
+               "[wal_perf] start (payload=%zu bytes, duration=%.3fs, batch=%zu bytes, blocks=%zu, block_size=%zu bytes)\n",
                g_payload_bytes,
                duration_s,
-               g_batch_bytes);
+               g_batch_bytes,
+               n_blocks,
+               block_size);
   
-  test_memcpy_baseline();
-  test_memcpy_ring(g_payload_bytes, g_target_duration);
-  test_wal_random_data(payload_u16, g_target_duration);
-  test_wal_fixed_data(payload_u16, g_target_duration);
+  if (test_flags.memcpy_baseline) {
+    test_memcpy_baseline();
+  }
+  if (test_flags.memcpy_ring) {
+    test_memcpy_ring(config, g_payload_bytes, g_target_duration);
+  }
+  if (test_flags.wal_random) {
+    test_wal_random_data(config, payload_u16, g_target_duration);
+  }
+  if (test_flags.wal_fixed) {
+    test_wal_fixed_data(config, payload_u16, g_target_duration);
+  }
   
   return EXIT_SUCCESS;
 }
