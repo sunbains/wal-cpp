@@ -322,9 +322,9 @@ struct [[nodiscard]] Circular_buffer {
    * @return slot that was reserved.
    */
   [[nodiscard]] Slot reserve(std::uint16_t len) noexcept {
-    /* Use relaxed ordering - the release semantics are provided by the write() operation */
-    const auto lsn = m_hwm.fetch_add(len, std::memory_order_relaxed);
-    m_n_pending_writes.fetch_add(1, std::memory_order_relaxed);
+    const auto lsn = m_reserve_counters.m_hwm;
+    m_reserve_counters.m_hwm += len;
+    m_reserve_counters.m_n_pending_writes += 1;
 
     return Slot {
       .m_lsn = lsn,
@@ -363,15 +363,15 @@ struct [[nodiscard]] Circular_buffer {
 
     using len_t = decltype(Block_header::Data::m_len);
 
-    WAL_ASSERT(m_lwm <= slot.m_lsn);
+    WAL_ASSERT(m_lsn_counters.m_lwm <= slot.m_lsn);
 
-    // log_inf("m_total_data_size: {}, slot.m_lsn: {}, m_lwm: {}, check_margin: {}", m_total_data_size, slot.m_lsn, m_lwm.load(), check_margin());
+    // log_inf("m_total_data_size: {}, slot.m_lsn: {}, m_lwm: {}, check_margin: {}", m_total_data_size, slot.m_lsn, m_lsn_counters.m_lwm, check_margin());
 
     /* Cache frequently used values to reduce function calls */
     const auto data_size_in_block = m_config.get_data_size_in_block();
     
     /* Use relaxed load for LWM check - we only need approximate value for space check */
-    const auto lwm = m_lwm.load(std::memory_order_relaxed);
+    const auto lwm = m_lsn_counters.m_lwm;
     /* Fast path: check if we have space without expensive modulo */
     const auto distance = slot.m_lsn - lwm;
     if (distance >= m_total_data_size) {
@@ -423,15 +423,15 @@ struct [[nodiscard]] Circular_buffer {
       const auto current_block_no = static_cast<block_no_t>(block_no);
       hdr->m_data.m_block_no = (hdr->m_data.m_block_no & Block_header::FLUSH_BIT_MASK) | current_block_no;
 
-      /* Update m_len - use direct atomic store for maximum performance */
+      /* Update m_len */
       const auto new_len = static_cast<len_t>(off_in_blk + len);
-      std::atomic_ref<len_t>(hdr->m_data.m_len).store(new_len, std::memory_order_relaxed);
+      hdr->m_data.m_len = new_len;
       
       /* Always update m_written_lsn - this is the critical path */
-      m_written_lsn.fetch_add(len, std::memory_order_relaxed);
+      m_lsn_counters.m_written_lsn += len;
       
       if (remaining_len == 0) {
-        m_n_pending_writes.fetch_sub(1, std::memory_order_relaxed);
+        m_reserve_counters.m_n_pending_writes -= 1;
         return Result<std::size_t>(len);
       }
       
@@ -488,7 +488,7 @@ struct [[nodiscard]] Circular_buffer {
       
       if (block_finished || write_finished) {
         const auto new_len = static_cast<len_t>(write_end > data_size_in_block ? data_size_in_block : write_end);
-        std::atomic_ref<len_t>(hdr->m_data.m_len).store(new_len, std::memory_order_relaxed);
+        hdr->m_data.m_len = new_len;
       }
 
       /* Check if we've finished writing all data */
@@ -535,25 +535,25 @@ struct [[nodiscard]] Circular_buffer {
     slot.m_len -= uint16_t(copied);
 
     if (slot.m_len == 0) {
-      m_n_pending_writes.fetch_sub(1, std::memory_order_relaxed);
+      m_reserve_counters.m_n_pending_writes -= 1;
     }
 
-    m_written_lsn.fetch_add(copied, std::memory_order_relaxed);
+    m_lsn_counters.m_written_lsn += copied;
 
     return slot.m_len == 0 ? Result<std::size_t>(copied) : std::unexpected(Status::Not_enough_space);
   }
 
   [[nodiscard]] bool is_full() const noexcept {
-    WAL_ASSERT(m_written_lsn >= m_lwm);
-    WAL_ASSERT(m_written_lsn <= m_hwm);
-    WAL_ASSERT(m_written_lsn - m_lwm <= get_total_data_size());
-    return m_written_lsn - m_lwm == get_total_data_size();
+    WAL_ASSERT(m_lsn_counters.m_written_lsn >= m_lsn_counters.m_lwm);
+    WAL_ASSERT(m_lsn_counters.m_written_lsn <= m_reserve_counters.m_hwm);
+    WAL_ASSERT(m_lsn_counters.m_written_lsn - m_lsn_counters.m_lwm <= get_total_data_size());
+    return m_lsn_counters.m_written_lsn - m_lsn_counters.m_lwm == get_total_data_size();
   }
 
   [[nodiscard]] bool is_empty() const noexcept {
-    WAL_ASSERT(m_written_lsn >= m_lwm);
-    WAL_ASSERT(m_written_lsn <= m_hwm);
-    return m_written_lsn == m_lwm;
+    WAL_ASSERT(m_lsn_counters.m_written_lsn >= m_lsn_counters.m_lwm);
+    WAL_ASSERT(m_lsn_counters.m_written_lsn <= m_reserve_counters.m_hwm);
+    return m_lsn_counters.m_written_lsn == m_lsn_counters.m_lwm;
   }
 
   /**
@@ -562,7 +562,7 @@ struct [[nodiscard]] Circular_buffer {
    * @return True if there are pending writes, false otherwise.
    */
   [[nodiscard]] bool pending_writes() const noexcept {
-    return m_written_lsn < m_hwm;
+    return m_lsn_counters.m_written_lsn < m_reserve_counters.m_hwm;
   }
 
   /**
@@ -570,8 +570,8 @@ struct [[nodiscard]] Circular_buffer {
    * @return The number of bytes left in the buffer.
    */
   [[nodiscard]] std::size_t check_margin() const noexcept {
-    WAL_ASSERT(m_written_lsn >= m_lwm);
-    return m_total_data_size - (m_written_lsn - m_lwm);
+    WAL_ASSERT(m_lsn_counters.m_written_lsn >= m_lsn_counters.m_lwm);
+    return m_total_data_size - (m_lsn_counters.m_written_lsn - m_lsn_counters.m_lwm);
   }
 
   /**
@@ -600,7 +600,7 @@ struct [[nodiscard]] Circular_buffer {
   */
   void clear(lsn_t start_lsn, lsn_t end_lsn) noexcept {
     WAL_ASSERT(start_lsn <= end_lsn);
-    WAL_ASSERT(end_lsn <= m_written_lsn);
+    WAL_ASSERT(end_lsn <= m_lsn_counters.m_written_lsn);
 
     const auto end_ptr = m_block_header_array + m_config.m_n_blocks;
 
@@ -642,22 +642,42 @@ struct [[nodiscard]] Circular_buffer {
 
   [[nodiscard]] std::string to_string() const noexcept;
 
-  /** Low water mark, the circular buffer starts at this LSN. */
-  alignas(kCLS) std::atomic<lsn_t> m_lwm{};
+  /** Group of counters updated together in write() for better cache locality.
+   * m_lwm and m_written_lsn are both accessed together in write() and write_to_store().
+   */
+  struct alignas(kCLS) Lsn_counters {
+    /** Low water mark, the circular buffer starts at this LSN. */
+    lsn_t m_lwm{};
+    
+    /** @note written_lsn is a simple counter that increments by bytes written, 
+     * it doesn't track which specific LSN ranges are written. Out-of-order writes 
+     * will work but written_lsn does not represent a contiguous range.
+     */ 
+    lsn_t m_written_lsn{};
+    
+    // Padding to ensure we use a full cache line
+    char padding[kCLS - (2 * sizeof(lsn_t))];
+  };
+  static_assert(sizeof(Lsn_counters) == kCLS, "Lsn_counters must be exactly one cache line");
+  Lsn_counters m_lsn_counters{};
 
-  /** High water mark. We have reserved this many bytes to the buffer.
-   * The writes may not have completed yet.
-  */
-  alignas(kCLS) std::atomic<lsn_t> m_hwm{};
-
-  /** @note written_lsn is a simple counter that increments by bytes written, 
-   * it doesn't track which specific LSN ranges are written. Out-of-order writes 
-   * will work but written_lsn does not represent a contiguous range.
-   */ 
-  alignas(kCLS) std::atomic<lsn_t> m_written_lsn{};
-
-  /** Number of pending writes. */
-  alignas(kCLS) std::atomic<std::size_t> m_n_pending_writes{};
+  /** Group of counters updated together in reserve() for better cache locality.
+   * m_hwm and m_n_pending_writes are both updated atomically in reserve().
+   */
+  struct alignas(kCLS) Reserve_counters {
+    /** High water mark. We have reserved this many bytes to the buffer.
+     * The writes may not have completed yet.
+     */
+    lsn_t m_hwm{};
+    
+    /** Number of pending writes. */
+    std::size_t m_n_pending_writes{};
+    
+    // Padding to ensure we use a full cache line
+    char padding[kCLS - (sizeof(lsn_t) + sizeof(std::size_t))];
+  };
+  static_assert(sizeof(Reserve_counters) == kCLS, "Reserve_counters must be exactly one cache line");
+  Reserve_counters m_reserve_counters{};
 
   Config m_config;
 

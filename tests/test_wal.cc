@@ -43,9 +43,9 @@ static void test_circular_buffer_basic() {
   assert(slot1.m_len == 100);
   
   /* After reserve, HWM should be incremented but still empty until write */
-  assert(buffer.m_lwm == initial_lsn);
-  assert(buffer.m_hwm == initial_lsn + 100);
-  assert(buffer.m_written_lsn == initial_lsn);
+  assert(buffer.m_lsn_counters.m_lwm == initial_lsn);
+  assert(buffer.m_reserve_counters.m_hwm == initial_lsn + 100);
+  assert(buffer.m_lsn_counters.m_written_lsn == initial_lsn);
   
   std::fprintf(stderr, "[test_circular_buffer_basic] done\n");
 }
@@ -69,8 +69,8 @@ static void test_circular_buffer_reserve_and_write() {
   /* Buffer should no longer be empty */
   assert(!buffer.is_empty());
   assert(buffer.check_margin() == buffer.get_total_data_size() - 50);
-  assert(buffer.m_lwm == initial_lsn);
-  assert(buffer.m_hwm == initial_lsn + 50);
+  assert(buffer.m_lsn_counters.m_lwm == initial_lsn);
+  assert(buffer.m_reserve_counters.m_hwm == initial_lsn + 50);
   
   std::fprintf(stderr, "[test_circular_buffer_reserve_and_write] done\n");
 }
@@ -115,8 +115,8 @@ static void test_circular_buffer_multiple_writes() {
   Record record(record_size / 2, std::byte{static_cast<unsigned char>('A' + ((n_records - 1) % 26))});
   assert(::memcmp(ptr, record.data(), record.size()) == 0);
 
-  assert(buffer.m_lwm == initial_lsn);
-  assert(buffer.m_hwm == initial_lsn + n_records * record_size);
+  assert(buffer.m_lsn_counters.m_lwm == initial_lsn);
+  assert(buffer.m_reserve_counters.m_hwm == initial_lsn + n_records * record_size);
   
   /* Verify buffer state */
   assert(!buffer.is_empty());
@@ -161,8 +161,8 @@ static void test_circular_buffer_block_boundary() {
   assert(result3.has_value());
   assert(result3.value() == data_size_per_block / 2);
 
-  assert(buffer.m_lwm == initial_lsn);
-  assert(buffer.m_hwm == initial_lsn + data_size_per_block * 2);
+  assert(buffer.m_lsn_counters.m_lwm == initial_lsn);
+  assert(buffer.m_reserve_counters.m_hwm == initial_lsn + data_size_per_block * 2);
   assert(buffer.is_full());
   assert(buffer.check_margin() == 0);
 
@@ -208,8 +208,8 @@ static void test_circular_buffer_full() {
     assert(buffer.check_margin() == 0);
   }
 
-  assert(buffer.m_lwm == initial_lsn);
-  assert(buffer.m_hwm == initial_lsn + written);
+  assert(buffer.m_lsn_counters.m_lwm == initial_lsn);
+  assert(buffer.m_reserve_counters.m_hwm == initial_lsn + written);
   
   std::fprintf(stderr, "[test_circular_buffer_full] done (wrote %zu bytes)\n", written);
 }
@@ -244,8 +244,8 @@ static void test_circular_buffer_write_to_store() {
 
   assert(buffer.is_full());
   assert(buffer.check_margin() == 0);
-  assert(buffer.m_lwm == initial_lsn);
-  assert(buffer.m_hwm == initial_lsn + config.m_n_blocks * config.m_block_size);
+  assert(buffer.m_lsn_counters.m_lwm == initial_lsn);
+  assert(buffer.m_reserve_counters.m_hwm == initial_lsn + config.m_n_blocks * config.m_block_size);
 
   auto result = buffer.write_to_store(null_writer);
 
@@ -264,9 +264,9 @@ static void test_circular_buffer_write_to_store() {
   assert(!buffer.pending_writes());
   assert(buffer.check_margin() == buffer.get_total_data_size() - span.size());
 
-  assert(buffer.m_lwm == buffer.m_hwm - span.size());
-  assert(buffer.m_hwm == buffer.m_written_lsn);
-  assert(buffer.m_n_pending_writes == 0);
+  assert(buffer.m_lsn_counters.m_lwm == buffer.m_reserve_counters.m_hwm - span.size());
+  assert(buffer.m_reserve_counters.m_hwm == buffer.m_lsn_counters.m_written_lsn);
+  assert(buffer.m_reserve_counters.m_n_pending_writes == 0);
 
   auto result3 = buffer.write_to_store(null_writer);
   assert(result3.has_value());
@@ -282,9 +282,9 @@ static void test_circular_buffer_write_to_store() {
   the LWM should not advance past that. */
   const auto expected_lwm = initial_lsn + config.m_n_blocks * data_size + span.size();
 
-  assert(buffer.m_lwm == expected_lwm);
-  assert(buffer.m_lwm == buffer.m_hwm);
-  assert(buffer.m_lwm == buffer.m_written_lsn);
+  assert(buffer.m_lsn_counters.m_lwm == expected_lwm);
+  assert(buffer.m_lsn_counters.m_lwm == buffer.m_reserve_counters.m_hwm);
+  assert(buffer.m_lsn_counters.m_lwm == buffer.m_lsn_counters.m_written_lsn);
 
   /* The block header for the last block should not be cleared. */
   const auto block_no = expected_lwm / data_size;
@@ -321,14 +321,14 @@ static void test_circular_buffer_wrap_around_basic() {
   }
 
   assert(buffer.is_full());
-  assert(buffer.m_lwm == initial_lsn);
-  const auto lwm_before_flush = buffer.m_lwm.load();
+  assert(buffer.m_lsn_counters.m_lwm == initial_lsn);
+  const auto lwm_before_flush = buffer.m_lsn_counters.m_lwm;
 
   /* Flush to store - this should advance LWM */
   auto flush_result = buffer.write_to_store(null_writer);
   assert(flush_result.has_value());
 
-  const auto lwm_after_flush = buffer.m_lwm.load();
+  const auto lwm_after_flush = buffer.m_lsn_counters.m_lwm;
   assert(lwm_after_flush > lwm_before_flush);
   assert(buffer.check_margin() == buffer.get_total_data_size());
 
@@ -444,7 +444,7 @@ static void test_circular_buffer_multiple_cycles() {
     assert(flush_result.has_value());
 
     /* Verify LWM is advancing */
-    const auto current_lwm = buffer.m_lwm.load();
+    const auto current_lwm = buffer.m_lsn_counters.m_lwm;
     assert(current_lwm > last_lwm);
     last_lwm = current_lwm;
 
@@ -453,10 +453,10 @@ static void test_circular_buffer_multiple_cycles() {
   }
 
   /* Verify we've advanced significantly through the LSN space */
-  assert(buffer.m_lwm.load() > initial_lsn + buffer.get_total_data_size() * (num_cycles - 1));
+  assert(buffer.m_lsn_counters.m_lwm > initial_lsn + buffer.get_total_data_size() * (num_cycles - 1));
 
   std::fprintf(stderr, "[test_circular_buffer_multiple_cycles] done (final LWM: %lu)\n",
-               buffer.m_lwm.load());
+               buffer.m_lsn_counters.m_lwm);
 }
 
 static void test_circular_buffer_large_dataset() {
@@ -580,8 +580,8 @@ static void test_circular_buffer_reserve_write_gap() {
   auto slot3 = buffer.reserve(500);
 
   /* HWM has advanced by 1500, but nothing committed yet */
-  assert(buffer.m_hwm == 1500);
-  assert(buffer.m_written_lsn == 0);
+  assert(buffer.m_reserve_counters.m_hwm == 1500);
+  assert(buffer.m_lsn_counters.m_written_lsn == 0);
   assert(buffer.pending_writes());
 
   /* check_margin() should reflect committed data, not reserved */
@@ -596,13 +596,13 @@ static void test_circular_buffer_reserve_write_gap() {
   auto result1 = buffer.write(slot1, data1);
   assert(result1.has_value());
   assert(result1.value() == 500);
-  assert(buffer.m_written_lsn == 500);
+  assert(buffer.m_lsn_counters.m_written_lsn == 500);
 
   Record data2(500, std::byte{'B'});
   auto result2 = buffer.write(slot2, data2);
   assert(result2.has_value());
   assert(result2.value() == 500);
-  assert(buffer.m_written_lsn == 1000);
+  assert(buffer.m_lsn_counters.m_written_lsn == 1000);
 
   /* Now check_margin reflects the committed data */
   assert(buffer.check_margin() == buffer.get_total_data_size() - 1000);
@@ -611,7 +611,7 @@ static void test_circular_buffer_reserve_write_gap() {
   auto result3 = buffer.write(slot3, data3);
   assert(result3.has_value());
   assert(result3.value() == 500);
-  assert(buffer.m_written_lsn == 1500);
+  assert(buffer.m_lsn_counters.m_written_lsn == 1500);
   assert(!buffer.pending_writes());
 
   std::fprintf(stderr, "[test_circular_buffer_reserve_write_gap] done\n");
@@ -648,7 +648,7 @@ static void test_circular_buffer_incremental_partial_block() {
   assert(partial_result.has_value());
   assert(partial_result.value() == partial_size);
 
-  const auto committed_before_flush = buffer.m_written_lsn.load();
+  const auto committed_before_flush = buffer.m_lsn_counters.m_written_lsn;
   const auto block_3_index = 3;
   const auto block_3_len_before = buffer.get_block_header(block_3_index).get_data_len();
   assert(block_3_len_before == partial_size);
@@ -702,7 +702,7 @@ static void test_circular_buffer_single_byte_writes() {
   assert(block_0_len == data_size_per_block);
 
   /* Verify committed_lsn */
-  assert(buffer.m_written_lsn == data_size_per_block);
+  assert(buffer.m_lsn_counters.m_written_lsn == data_size_per_block);
 
   /* Verify data integrity - read back the bytes */
   auto span = buffer.data();
@@ -780,7 +780,7 @@ static void test_circular_buffer_nonzero_initial_lsn() {
 
   /* Verify LSNs are correct, we update the LSN of the slot to the length the written data. */
   assert(slot.m_lsn == initial_lsn + 500);
-  assert(buffer.m_written_lsn == initial_lsn + 500);
+  assert(buffer.m_lsn_counters.m_written_lsn == initial_lsn + 500);
 
   /* Verify block number */
   const auto block_0_no = buffer.get_block_header(0).get_block_no();
@@ -930,8 +930,8 @@ static void test_circular_buffer_flush_partial_block() {
   assert(result.value() == 100);
 
   /* Verify state before flush */
-  assert(buffer.m_written_lsn == 100);
-  assert(buffer.m_lwm == 0);
+  assert(buffer.m_lsn_counters.m_written_lsn == 100);
+  assert(buffer.m_lsn_counters.m_lwm == 0);
 
   /* Flush */
 
@@ -939,7 +939,7 @@ static void test_circular_buffer_flush_partial_block() {
   assert(flush_result.has_value());
 
   /* After flush, lwm advances to end of flushed data even for partial blocks */
-  assert(buffer.m_lwm == 100);
+  assert(buffer.m_lsn_counters.m_lwm == 100);
 
   /* The partial block data is preserved in the buffer for potential continuation */
   /* Only full blocks are cleared by the clear() function */
@@ -972,7 +972,7 @@ static void test_circular_buffer_flush_exact_blocks() {
   assert(result.value() == write_size);
 
   /* Verify committed */
-  assert(buffer.m_written_lsn == 1488);
+  assert(buffer.m_lsn_counters.m_written_lsn == 1488);
 
   /* Flush */
 
@@ -981,7 +981,7 @@ static void test_circular_buffer_flush_exact_blocks() {
   assert(flush_result.value() == 1488);
 
   /* All 3 blocks should be cleared, lwm should advance to 1488 */
-  assert(buffer.m_lwm == 1488);
+  assert(buffer.m_lsn_counters.m_lwm == 1488);
 
   /* Verify blocks 0, 1, 2 are cleared */
   assert(buffer.get_block_header(0).get_data_len() == 0);
@@ -1145,7 +1145,7 @@ static void test_circular_buffer_minimal_write_flush_cycle() {
 
   /* Verify total bytes written */
   lsn_t expected_lsn = num_iterations * data_size_per_block;
-  assert(buffer.m_lwm == expected_lsn);
+  assert(buffer.m_lsn_counters.m_lwm == expected_lsn);
 
   std::fprintf(stderr, "[test_circular_buffer_minimal_write_flush_cycle] done "
                "(%zu iterations)\n", num_iterations);

@@ -150,8 +150,8 @@ static void test_multiple_writers(std::size_t num_threads,
   assert(actual_writes == expected_writes);
 
   // Verify buffer state is consistent
-  assert(log.m_buffer.m_lwm <= log.m_buffer.m_hwm);
-  assert(log.m_buffer.m_hwm <= log.m_buffer.m_written_lsn);
+  assert(log.m_buffer.m_lsn_counters.m_lwm <= log.m_buffer.m_reserve_counters.m_hwm);
+  assert(log.m_buffer.m_reserve_counters.m_hwm <= log.m_buffer.m_lsn_counters.m_written_lsn);
 }
 
 static void print_usage(const char* program_name) noexcept {
