@@ -2,10 +2,19 @@
 
 #include <atomic>
 #include <bit>
+#include <cstring>
 #include <concepts>
 #include <new>
 #include <type_traits>
 #include <utility>
+
+#if defined(__GNUC__) || defined(__clang__)
+  #define PREFETCH_FOR_READ(addr) __builtin_prefetch((addr), 0, 3)
+  #define PREFETCH_FOR_WRITE(addr) __builtin_prefetch((addr), 1, 3)
+#else
+  #define PREFETCH_FOR_READ(addr) ((void)0)
+  #define PREFETCH_FOR_WRITE(addr) ((void)0)
+#endif
 
 namespace util {
 
@@ -39,7 +48,11 @@ struct Bounded_queue {
   ~Bounded_queue() = default;
 
   [[nodiscard]] bool enqueue(T const &data) noexcept(noexcept(std::declval<T &>() = std::declval<T const &>())) requires std::assignable_from<T &, T const &> {
-    return enqueue_impl([&](T &slot) { slot = data; });
+    if constexpr (std::is_trivially_copyable_v<T>) {
+      return enqueue_impl([&](T &slot) { std::memcpy(&slot, &data, sizeof(T)); });
+    } else {
+      return enqueue_impl([&](T &slot) { slot = data; });
+    }
   }
 
   [[nodiscard]] bool enqueue(T &&data) noexcept(noexcept(std::declval<T &>() = std::declval<T &&>())) requires std::assignable_from<T &, T &&> {
@@ -53,10 +66,13 @@ struct Bounded_queue {
 
   [[nodiscard]] bool dequeue(T &data) noexcept {
     Cell *cell;
+    Cell *ring_ptr = m_ring.get();
     auto pos{m_dpos.load(std::memory_order_relaxed)};
 
     for (;;) {
-      cell = &m_ring.get()[pos & m_capacity];
+      cell = &ring_ptr[pos & m_capacity];
+      /* Prefetch next cell - for small queues (L1 cache), single prefetch is optimal */
+      PREFETCH_FOR_READ(&ring_ptr[(pos + 1) & m_capacity]);
       const auto seq{cell->m_pos.load(std::memory_order_acquire)};
       const auto diff = static_cast<std::ptrdiff_t>(seq) - static_cast<std::ptrdiff_t>(pos + 1);
 
@@ -77,7 +93,11 @@ struct Bounded_queue {
       }
     }
 
-    data = cell->m_data;
+    if constexpr (std::is_trivially_copyable_v<T>) {
+      std::memcpy(&data, &cell->m_data, sizeof(T));
+    } else {
+      data = cell->m_data;
+    }
 
     /* Set the sequence to what the head sequence should be next time around */
     cell->m_pos.store(pos + m_capacity + 1, std::memory_order_release);
@@ -138,12 +158,15 @@ struct Bounded_queue {
   template <typename Writer>
   [[nodiscard]] bool enqueue_impl(Writer &&write) noexcept(noexcept(write(std::declval<T &>()))) {
     Cell *cell;
+    Cell *ring_ptr = m_ring.get();
 
     /* m_epos only wraps at MAX(m_epos); use capacity as mask for index. */
     auto pos{m_epos.load(std::memory_order_relaxed)};
 
     for (;;) {
-      cell = &m_ring[pos & m_capacity];
+      cell = &ring_ptr[pos & m_capacity];
+      /* Prefetch next cell - for small queues (L1 cache), single prefetch is optimal */
+      PREFETCH_FOR_WRITE(&ring_ptr[(pos + 1) & m_capacity]);
       const auto seq{cell->m_pos.load(std::memory_order_acquire)};
       const auto diff = static_cast<std::ptrdiff_t>(seq) - static_cast<std::ptrdiff_t>(pos);
 

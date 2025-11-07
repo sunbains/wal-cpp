@@ -12,10 +12,15 @@ option(WAL_BUILD_LIB "Build wal library" OFF)
 # Warnings as errors are always enabled for all builds
 
 # Sensible default build type for single-config generators.
+# Default to Release if not specified.
 if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
   set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS Debug Release RelWithDebInfo MinSizeRel)
+elseif(NOT CMAKE_CONFIGURATION_TYPES AND CMAKE_BUILD_TYPE STREQUAL "")
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
+
+message("Build type: " ${CMAKE_BUILD_TYPE})
 
 # ---------------------------- C++ standard -----------------------------------
 set(CMAKE_CXX_STANDARD 23)
@@ -78,8 +83,8 @@ if(WAL_BUILD_LIB OR WAL_BUILD_TESTS)
       $<$<CONFIG:Debug>:-g3 -ggdb3>
       $<$<CONFIG:RelWithDebInfo>:-g3 -ggdb3>
       # Maximum safe optimization for Release builds
-      $<$<CONFIG:Release>:-O3 -flto -march=native -mtune=native>
-      $<$<CONFIG:RelWithDebInfo>:-O3 -flto>
+      $<$<CONFIG:Release>:-g -O3 -flto -march=native -mtune=native -fno-omit-frame-pointer>
+      $<$<CONFIG:RelWithDebInfo>:-g -O3 -flto -fno-omit-frame-pointer>
     )
   endif()
 
