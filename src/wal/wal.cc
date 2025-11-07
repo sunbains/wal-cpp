@@ -15,7 +15,8 @@ namespace wal {
       m_hwm(hwm),
       m_written_lsn(hwm),
       m_config(config),
-      m_total_data_size(m_config.get_data_size_in_block() * m_config.m_n_blocks) {
+      m_total_data_size(m_config.get_data_size_in_block() * m_config.m_n_blocks),
+      m_checksum(m_config.m_checksum_algorithm) {
 
     m_buffer.resize(m_total_data_size + (sizeof(crc32_t) + sizeof(Block_header)) * m_config.m_n_blocks);
 
@@ -31,7 +32,7 @@ namespace wal {
       block_header.initialize(block_no_t(block_start_no + i));
     }
 
-    m_iovecs.resize(IOV_MAX);
+    m_iovecs.resize((IOV_MAX / 3) * 3);
  }
 
   Circular_buffer::~Circular_buffer() noexcept {}
@@ -69,7 +70,7 @@ namespace wal {
     /* We create IO vectors for each block. One for the header,
     one for the data for the block and the last for the checksum.
     Each block needs 3 iovecs (header, data, checksum). */
-    const auto iovecs_size = std::min(n_blocks_to_flush * 3, static_cast<std::size_t>(IOV_MAX));
+    const auto iovecs_size = std::min(n_blocks_to_flush * 3, m_iovecs.size());
     const auto max_blocks_per_batch = iovecs_size / 3;
 
     WAL_ASSERT(m_iovecs.size() >= iovecs_size);

@@ -51,6 +51,7 @@ constexpr std::size_t kDefaultBatchBytes = 512;
 std::size_t g_payload_bytes = kDefaultPayloadBytes;
 std::chrono::nanoseconds g_target_duration = std::chrono::seconds(1);
 std::size_t g_batch_bytes = kDefaultBatchBytes;
+bool g_disable_checksums = false;
 
 struct Flush_metrics {
   std::chrono::nanoseconds total{};
@@ -358,19 +359,22 @@ void print_usage(const char* program_name) noexcept {
                "  -n, --blocks BLOCKS     Number of blocks in buffer (default: %zu)\n"
                "  -s, --block-size BYTES  Block size in bytes (default: %zu)\n"
                "  -t, --tests TESTS       Comma-separated test list: memcpy,ring,random,fixed (default: all)\n"
+               "  -c, --no-checksums      Disable CRC32 checksum computation (for performance testing)\n"
                "  -h, --help              Show this help message\n"
                "\n"
                "Examples:\n"
                "  %s -p 4096 -d 5.0\n"
                "  %s --payload 1024 --duration 2.0 --batch 512\n"
                "  %s -t memcpy,fixed -p 4096\n"
-               "  %s -n 16384 -s 4096 -p 4096\n",
+               "  %s -n 16384 -s 4096 -p 4096\n"
+               "  %s -c -p 4096 -d 1.0\n",
                program_name,
                kDefaultPayloadBytes,
                kDefaultDurationSeconds,
                kDefaultBatchBytes,
                kDefaultBlocks,
                kDefaultBlockSizeBytes,
+               program_name,
                program_name,
                program_name,
                program_name,
@@ -431,13 +435,14 @@ int main(int argc, char** argv) {
     {"blocks", required_argument, nullptr, 'n'},
     {"block-size", required_argument, nullptr, 's'},
     {"tests", required_argument, nullptr, 't'},
+    {"no-checksums", no_argument, nullptr, 'c'},
     {"help", no_argument, nullptr, 'h'},
     {nullptr, 0, nullptr, 0}
   };
 
   int opt;
   int option_index = 0;
-  while ((opt = getopt_long(argc, argv, "p:d:b:n:s:t:h", long_options, &option_index)) != -1) {
+  while ((opt = getopt_long(argc, argv, "p:d:b:n:s:t:ch", long_options, &option_index)) != -1) {
     switch (opt) {
       case 'p': {
         char* end = nullptr;
@@ -509,6 +514,10 @@ int main(int argc, char** argv) {
         test_flags = parse_test_list(optarg);
         break;
       }
+      case 'c': {
+        g_disable_checksums = true;
+        break;
+      }
       case 'h': {
         show_help = true;
         break;
@@ -535,16 +544,17 @@ int main(int argc, char** argv) {
   const auto payload_u16 = static_cast<std::uint16_t>(payload_bytes);
 
   // Create buffer configuration from command-line options
-  wal::Circular_buffer::Config config(n_blocks, block_size);
+  wal::Circular_buffer::Config config(n_blocks, block_size, g_disable_checksums ? util::ChecksumAlgorithm::NONE : util::ChecksumAlgorithm::CRC32C);
 
   const double duration_s = static_cast<double>(g_target_duration.count()) / 1'000'000'000.0;
   std::fprintf(stderr,
-               "[wal_perf] start (payload=%zu bytes, duration=%.3fs, batch=%zu bytes, blocks=%zu, block_size=%zu bytes)\n",
+               "[wal_perf] start (payload=%zu bytes, duration=%.3fs, batch=%zu bytes, blocks=%zu, block_size=%zu bytes, checksums=%s)\n",
                g_payload_bytes,
                duration_s,
                g_batch_bytes,
                n_blocks,
-               block_size);
+               block_size,
+               g_disable_checksums ? "disabled" : "enabled");
   
   if (test_flags.memcpy_baseline) {
     test_memcpy_baseline();

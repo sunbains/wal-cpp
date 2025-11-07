@@ -174,6 +174,7 @@ inline crc32_t crc32c_sw(crc32_t crc, const void* data, size_t length) noexcept 
  *         - CRC32C: CRC-32C (Castagnoli) - hardware accelerated when available
  */
 enum class ChecksumAlgorithm {
+    NONE, /* No checksum */
     CRC32C, /* CRC-32C (Castagnoli) - hardware accelerated when available */
 };
 
@@ -185,6 +186,9 @@ struct Checksum {
 
     explicit constexpr Checksum(ChecksumAlgorithm algo = ChecksumAlgorithm::CRC32C) noexcept
         : m_use_hw(false), m_state(0), m_algorithm(algo), m_update_fn(crc32c_sw) {
+        if (algo == ChecksumAlgorithm::NONE) {
+           m_update_fn = nullptr;
+        }
 #if defined(__x86_64__) || defined(_M_X64)
         if (algo == ChecksumAlgorithm::CRC32C) {
             static const bool sse42_supported = has_sse42();
@@ -214,8 +218,7 @@ struct Checksum {
     }
 
     void update(const void* data, size_t length) noexcept {
-        // Avoid branch: use function pointer set in constructor
-        m_state = m_update_fn(m_state, data, length);
+        m_state = m_update_fn ? m_update_fn(m_state, data, length) : 0;
     }
 
     /** Get current checksum value

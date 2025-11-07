@@ -233,15 +233,16 @@ struct [[nodiscard]] Circular_buffer {
      * @param[in] n_blocks The number of blocks in the circular buffer.
      * @param[in] block_size The size of the block in the circular buffer.
      */
-    explicit Config(size_t n_blocks = kDefaultBlockCount,
-                    size_t block_size = kDefaultBlockSize) noexcept
+    explicit Config(size_t n_blocks = kDefaultBlockCount, size_t block_size = kDefaultBlockSize, util::ChecksumAlgorithm algo = util::ChecksumAlgorithm::CRC32C) noexcept
       : m_n_blocks(n_blocks),
-        m_block_size(block_size) {}
+        m_block_size(block_size),
+        m_checksum_algorithm(algo) {}
 
     ~Config() = default;
 
     const size_t m_n_blocks;
     const size_t m_block_size;
+    const util::ChecksumAlgorithm m_checksum_algorithm;
 
     std::size_t get_data_size_in_block() const noexcept {
       return m_block_size - sizeof(Block_header::Data) - sizeof(crc32_t);
@@ -266,12 +267,12 @@ struct [[nodiscard]] Circular_buffer {
    */
   using Write_callback = std::function<Result<lsn_t>(lsn_t lsn, const IO_vecs& iovecs)>;
 
-struct [[nodiscard]] Slot {
-  /** Start LSN of this slot. */
-  lsn_t m_lsn{};
-  /** Number of bytes reserved. */
-  std::uint16_t m_len{};
-};
+  struct [[nodiscard]] Slot {
+    /** Start LSN of this slot. */
+    lsn_t m_lsn{};
+    /** Number of bytes reserved. */
+    std::uint16_t m_len{};
+  };
 
   using Block = std::tuple<Block_header*, std::span<const std::byte>, crc32_t*>;
 
