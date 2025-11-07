@@ -11,8 +11,47 @@
 #include <sys/uio.h>
 #include <string>
 #include <format>
-#include <cassert>
+#if defined(NDEBUG)
+#  define WAL_ASSERT(cond) ((void)0)
+#else
+#  include <cassert>
+#  define WAL_ASSERT(cond) assert(cond)
+#endif
 #include <thread>
+
+#if !defined(WAL_TRACK_PENDING_WRITES)
+#  if defined(NDEBUG)
+#    define WAL_TRACK_PENDING_WRITES 0
+#  else
+#    define WAL_TRACK_PENDING_WRITES 1
+#  endif
+#endif
+
+constexpr std::size_t kPrefetchDistanceBytes = 256;
+constexpr std::size_t kDefaultBlockSize = 4096;
+constexpr std::size_t kDefaultBufferBytes = 64ull * 1024ull * 1024ull;
+constexpr std::size_t kDefaultBlockCount = kDefaultBufferBytes / kDefaultBlockSize;
+constexpr std::size_t kDefaultLogBatchBytes = 512;
+static_assert((kDefaultBlockCount * kDefaultBlockSize) == kDefaultBufferBytes);
+
+#if defined(__GNUC__) || defined(__clang__)
+template<int Locality>
+inline void prefetch_for_read(const void* ptr) noexcept {
+  static_assert(Locality >= 0 && Locality <= 3);
+  __builtin_prefetch(ptr, 0, Locality);
+}
+
+template<int Locality>
+inline void prefetch_for_write(const void* ptr) noexcept {
+  static_assert(Locality >= 0 && Locality <= 3);
+  __builtin_prefetch(ptr, 1, Locality);
+}
+#else
+template<int>
+inline void prefetch_for_read(const void*) noexcept {}
+template<int>
+inline void prefetch_for_write(const void*) noexcept {}
+#endif
 
 #include "util/checksum.h"
 #include "util/byte_order.h"
@@ -193,7 +232,8 @@ struct [[nodiscard]] Circular_buffer {
      * @param[in] n_blocks The number of blocks in the circular buffer.
      * @param[in] block_size The size of the block in the circular buffer.
      */
-    explicit Config(size_t n_blocks, size_t block_size) noexcept
+    explicit Config(size_t n_blocks = kDefaultBlockCount,
+                    size_t block_size = kDefaultBlockSize) noexcept
       : m_n_blocks(n_blocks),
         m_block_size(block_size) {}
 
@@ -225,12 +265,12 @@ struct [[nodiscard]] Circular_buffer {
    */
   using Write_callback = std::function<Result<lsn_t>(lsn_t lsn, const IO_vecs& iovecs)>;
 
-  struct [[nodiscard]] Slot {
-    /** Start LSN of this slot. */
-    lsn_t m_lsn{};
-    /** Number of bytes reserved. */
-    std::uint16_t m_len{};
-  };
+struct [[nodiscard]] Slot {
+  /** Start LSN of this slot. */
+  lsn_t m_lsn{};
+  /** Number of bytes reserved. */
+  std::uint16_t m_len{};
+};
 
   using Block = std::tuple<Block_header*, std::span<const std::byte>, crc32_t*>;
 
@@ -239,18 +279,18 @@ struct [[nodiscard]] Circular_buffer {
   ~Circular_buffer() noexcept;
 
   [[nodiscard]] Block_header &get_block_header(std::size_t block_index) noexcept {
-    assert(block_index < m_config.m_n_blocks);
+    WAL_ASSERT(block_index < m_config.m_n_blocks);
 
     return m_block_header_array[block_index];
   }
 
   [[nodiscard]] const Block_header &get_block_header(std::size_t block_index) const noexcept {
-    assert(block_index < m_config.m_n_blocks);
+    WAL_ASSERT(block_index < m_config.m_n_blocks);
     return m_block_header_array[block_index];
   }
 
   [[nodiscard]] const std::span<const std::byte> get_data(std::size_t block_index) const noexcept {
-    assert(block_index < m_config.m_n_blocks);
+    WAL_ASSERT(block_index < m_config.m_n_blocks);
     return std::span<std::byte>(&m_data_array[(m_config.get_data_size_in_block() * block_index)], m_config.get_data_size_in_block());
   }
 
@@ -268,7 +308,7 @@ struct [[nodiscard]] Circular_buffer {
   }
 
   [[nodiscard]] const crc32_t &get_crc32(std::size_t block_index) const noexcept {
-    assert(block_index < m_config.m_n_blocks);
+    WAL_ASSERT(block_index < m_config.m_n_blocks);
     return m_crc32_array[block_index];
   }
 
@@ -277,7 +317,7 @@ struct [[nodiscard]] Circular_buffer {
   }
 
   [[nodiscard]] Block get_block(std::size_t block_index) noexcept {
-    assert(block_index < m_config.m_n_blocks);
+    WAL_ASSERT(block_index < m_config.m_n_blocks);
     return std::make_tuple(&get_block_header(block_index), get_data(block_index), &get_crc32(block_index));
   }
 
@@ -287,9 +327,11 @@ struct [[nodiscard]] Circular_buffer {
    * @return slot that was reserved.
    */
   [[nodiscard]] Slot reserve(std::uint16_t len) noexcept {
-    const auto lsn = m_hwm.fetch_add(len, std::memory_order_release);
-
-    m_n_pending_writes.fetch_add(1, std::memory_order_release);
+    /* Use relaxed ordering - the release semantics are provided by the write() operation */
+    const auto lsn = m_hwm.fetch_add(len, std::memory_order_relaxed);
+#if WAL_TRACK_PENDING_WRITES
+    m_n_pending_writes.fetch_add(1, std::memory_order_relaxed);
+#endif
 
     return Slot {
       .m_lsn = lsn,
@@ -323,88 +365,171 @@ struct [[nodiscard]] Circular_buffer {
    * @return The number of bytes written.
    */
   [[nodiscard]] Result<std::size_t> write(Slot &slot, std::span<const std::byte> span) noexcept {
-    assert(span.size() > 0);
-    assert(slot.m_len == span.size());
+    WAL_ASSERT(span.size() > 0);
+    WAL_ASSERT(slot.m_len == span.size());
 
     using len_t = decltype(Block_header::Data::m_len);
 
-    assert(m_lwm <= slot.m_lsn);
+    WAL_ASSERT(m_lwm <= slot.m_lsn);
 
     // log_inf("m_total_data_size: {}, slot.m_lsn: {}, m_lwm: {}, check_margin: {}", m_total_data_size, slot.m_lsn, m_lwm.load(), check_margin());
 
-    if (m_total_data_size <= slot.m_lsn - m_lwm) {
+    /* Cache frequently used values to reduce function calls */
+    const auto data_size_in_block = m_config.get_data_size_in_block();
+    
+    /* Use relaxed load for LWM check - we only need approximate value for space check */
+    const auto lwm = m_lwm.load(std::memory_order_relaxed);
+    /* Fast path: check if we have space without expensive modulo */
+    const auto distance = slot.m_lsn - lwm;
+    if (distance >= m_total_data_size) {
+      return std::unexpected(Status::Not_enough_space);
+    }
+    static_cast<void>(distance);
+
+    /* Use bit masking for modulo if m_total_data_size is power of 2, otherwise use modulo */
+    std::size_t rel_off;
+    if ((m_total_data_size & (m_total_data_size - 1)) == 0) {
+      /* Power of 2 - use bit mask instead of modulo */
+      rel_off = slot.m_lsn & (m_total_data_size - 1);
+    } else {
+      rel_off = static_cast<std::size_t>(slot.m_lsn % m_total_data_size);
+    }
+    const std::size_t len = std::min(size_t(slot.m_len), m_total_data_size - rel_off);
+
+    WAL_ASSERT(len > 0);
+
+    /* Use division and modulo for block calculations - optimize if data_size_in_block is power of 2 */
+    auto block_no = slot.m_lsn / data_size_in_block;
+    const auto off_in_blk = static_cast<std::size_t>(slot.m_lsn % data_size_in_block);
+
+    WAL_ASSERT(block_no < std::numeric_limits<block_no_t>::max());
+
+    /* Optimize block_index calculation - m_n_blocks is always power of 2, use bit mask */
+    auto block_index = static_cast<std::size_t>(block_no) & (m_config.m_n_blocks - 1);
+    WAL_ASSERT(block_index < m_config.m_n_blocks);
+
+    /* Fast path: single block write (most common case) */
+    const auto remaining_in_block = data_size_in_block - off_in_blk;
+    if (len <= remaining_in_block) [[likely]] {
+      /* Prefetch current and next destinations to reduce write latency */
+      prefetch_for_write<3>(&m_block_header_array[block_index]);
+      prefetch_for_write<2>(m_data_array + rel_off);
+      
+      /* Write fits entirely in one block - optimized path */
+      std::memcpy(m_data_array + rel_off, span.data(), len);
+      
+      /* Inline block header access to avoid function call overhead */
+      auto* hdr = &m_block_header_array[block_index];
+      
+      /* Update slot early to allow instruction-level parallelism */
+      slot.m_lsn += len;
+      const auto remaining_len = static_cast<std::uint16_t>(slot.m_len - len);
+      slot.m_len = remaining_len;
+      
+      /* Update block_no only if needed - most writes are sequential so this is often a no-op */
+      const auto current_block_no = static_cast<block_no_t>(block_no);
+      auto& block_no_field = hdr->m_data.m_block_no;
+      if ((block_no_field & ~Block_header::FLUSH_BIT_MASK) != current_block_no) [[unlikely]] {
+        block_no_field = (block_no_field & Block_header::FLUSH_BIT_MASK) | current_block_no;
+      }
+      
+      /* Update m_len - use direct atomic store for maximum performance */
+      const auto new_len = static_cast<len_t>(off_in_blk + len);
+      std::atomic_ref<len_t>(hdr->m_data.m_len).store(new_len, std::memory_order_relaxed);
+      
+      /* Always update m_written_lsn - this is the critical path */
+      m_written_lsn.fetch_add(len, std::memory_order_relaxed);
+      
+      if (remaining_len == 0) {
+#if WAL_TRACK_PENDING_WRITES
+        m_n_pending_writes.fetch_sub(1, std::memory_order_relaxed);
+#endif
+        return Result<std::size_t>(len);
+      }
+      
       return std::unexpected(Status::Not_enough_space);
     }
 
-    std::size_t rel_off = static_cast<std::size_t>(slot.m_lsn % m_total_data_size);
-    const std::size_t len = std::min(size_t(slot.m_len), m_total_data_size - rel_off);
-
-    // log_inf("lwm: {}, writing {} bytes at LSN {} (rel_off: {}, len: {})", m_lwm.load(), slot.m_len, slot.m_lsn, rel_off, len);
-
-    assert(len > 0);
-
-    auto block_no = slot.m_lsn / m_config.get_data_size_in_block();
-
-    const auto off_in_blk = static_cast<std::size_t>(slot.m_lsn % m_config.get_data_size_in_block());
-
-    assert(block_no < std::numeric_limits<block_no_t>::max());
-
-    auto block_index = block_no % m_config.m_n_blocks;
-    assert(block_index < m_config.m_n_blocks);
-
+    /* Slow path: multi-block write */
     std::size_t copied{};
     std::byte* ptr = m_data_array + rel_off;
 
     /* Process current block, then subsequent blocks as needed. */
     std::size_t offset_in_block = off_in_blk;
-    const auto lwm_block_index = (m_lwm.load(std::memory_order_acquire) / m_config.get_data_size_in_block()) % m_config.m_n_blocks;
+    const auto lwm_block_index = (lwm / data_size_in_block) % m_config.m_n_blocks;
+    
+    /* Cache block header pointer to avoid repeated lookups */
+    auto* hdr = &get_block_header(block_index);
+    const auto initial_block_no = static_cast<block_no_t>(block_no);
+    auto current_block_no = initial_block_no;
+    
+    /* Set block_no for first block only if needed */
+    const auto raw_block_no = hdr->m_data.m_block_no & ~Block_header::FLUSH_BIT_MASK;
+    if (raw_block_no != current_block_no) {
+      hdr->set_block_no(current_block_no);
+    }
 
     for (;;) {
 
       // log_inf("block_index: {}, copied: {}, check_margin: {}, committed_lsn: {}", block_index, copied, check_margin(), m_committed_lsn.load());
 
-      auto &hdr = get_block_header(block_index);
-
-      hdr.set_block_no(static_cast<block_no_t>(block_no));
-
       /* Copy bounded by remaining bytes and remaining space in this block. */
-      const std::size_t avail_in_block = m_config.get_data_size_in_block() - offset_in_block;
+      const std::size_t avail_in_block = data_size_in_block - offset_in_block;
       const std::size_t to_copy = std::min(len - copied, avail_in_block);
 
       // log_inf("writing {} bytes to block {} (block_no: {}, block_index: {})", to_copy, block_no, block_no, block_index);
 
-      assert(to_copy > 0);
+      WAL_ASSERT(to_copy > 0);
+
+      prefetch_for_write<2>(ptr);
+      if (copied + kPrefetchDistanceBytes < span.size()) {
+        prefetch_for_read<1>(span.data() + copied + kPrefetchDistanceBytes);
+      }
 
       std::memcpy(ptr, span.data() + copied, to_copy);
 
-      std::atomic_ref<len_t>(hdr.m_data.m_len).fetch_add(static_cast<len_t>(to_copy));
-
       /* Advance pointers/counters. */
       copied += to_copy;
+      const std::size_t write_end = offset_in_block + to_copy;
       rel_off = (rel_off + to_copy) % m_total_data_size;
       ptr = m_data_array + rel_off;
 
-      assert(copied <= len);
+      /* Update m_len only when we finish a block or finish the write - reduces atomic operations */
+      const bool block_finished = (write_end >= data_size_in_block);
+      const bool write_finished = (copied == len);
+      
+      if (block_finished || write_finished) {
+        const auto new_len = static_cast<len_t>(write_end > data_size_in_block ? data_size_in_block : write_end);
+        std::atomic_ref<len_t>(hdr->m_data.m_len).store(new_len, std::memory_order_relaxed);
+      }
+
       /* Check if we've finished writing all data */
-      if (copied == len) {
-        /* Verify the block length is within bounds */
-        assert(std::atomic_ref<len_t>(hdr.m_data.m_len).load() <= m_config.get_data_size_in_block());
+      if (write_finished) {
         break;
       }
 
       /* Check if current block is full - if so, move to next block */
-      const std::size_t write_end = offset_in_block + to_copy;
-      if (write_end >= m_config.get_data_size_in_block()) {
+      if (block_finished) {
         /* Block is full, move to next block */
-        ++block_no;
+        ++current_block_no;
         offset_in_block = 0;
         block_index = (block_index + 1) % m_config.m_n_blocks;
+        const auto next_block_index = (block_index + 1) % m_config.m_n_blocks;
+        prefetch_for_write<2>(&m_block_header_array[next_block_index]);
+        prefetch_for_write<1>(m_data_array + (rel_off % m_total_data_size));
         
         /* Check if we've wrapped around to the start of the circular buffer (LWM block) */
         if (block_index == lwm_block_index) {
           /* We've wrapped around and reached the LWM block - stop writing to avoid overwriting unflushed data */
           // log_inf("Wrapped around to LWM block (block_index: {}), stopping write. copied: {}, len: {}, remaining: {}", block_index, copied, len, len - copied);
           break;
+        }
+        
+        /* Update block header pointer and set block_no for new block */
+        hdr = &get_block_header(block_index);
+        const auto raw_next_block_no = hdr->m_data.m_block_no & ~Block_header::FLUSH_BIT_MASK;
+        if (raw_next_block_no != current_block_no) {
+          hdr->set_block_no(current_block_no);
         }
         /* Continue to next iteration to write remaining data */
       } else {
@@ -415,31 +540,33 @@ struct [[nodiscard]] Circular_buffer {
       }
     }
 
-    assert(copied <= slot.m_len);
-    assert(copied > 0 && copied <= len);
+    WAL_ASSERT(copied <= slot.m_len);
+    WAL_ASSERT(copied > 0 && copied <= len);
 
     slot.m_lsn += copied;
     slot.m_len -= uint16_t(copied);
 
     if (slot.m_len == 0) {
-      m_n_pending_writes.fetch_sub(1, std::memory_order_release);
+#if WAL_TRACK_PENDING_WRITES
+      m_n_pending_writes.fetch_sub(1, std::memory_order_relaxed);
+#endif
     }
 
-    m_written_lsn.fetch_add(copied, std::memory_order_release);
+    m_written_lsn.fetch_add(copied, std::memory_order_relaxed);
 
     return slot.m_len == 0 ? Result<std::size_t>(copied) : std::unexpected(Status::Not_enough_space);
   }
 
   [[nodiscard]] bool is_full() const noexcept {
-    assert(m_written_lsn >= m_lwm);
-    assert(m_written_lsn <= m_hwm);
-    assert(m_written_lsn - m_lwm <= get_total_data_size());
+    WAL_ASSERT(m_written_lsn >= m_lwm);
+    WAL_ASSERT(m_written_lsn <= m_hwm);
+    WAL_ASSERT(m_written_lsn - m_lwm <= get_total_data_size());
     return m_written_lsn - m_lwm == get_total_data_size();
   }
 
   [[nodiscard]] bool is_empty() const noexcept {
-    assert(m_written_lsn >= m_lwm);
-    assert(m_written_lsn <= m_hwm);
+    WAL_ASSERT(m_written_lsn >= m_lwm);
+    WAL_ASSERT(m_written_lsn <= m_hwm);
     return m_written_lsn == m_lwm;
   }
 
@@ -457,7 +584,7 @@ struct [[nodiscard]] Circular_buffer {
    * @return The number of bytes left in the buffer.
    */
   [[nodiscard]] std::size_t check_margin() const noexcept {
-    assert(m_written_lsn >= m_lwm);
+    WAL_ASSERT(m_written_lsn >= m_lwm);
     return m_total_data_size - (m_written_lsn - m_lwm);
   }
 
@@ -486,8 +613,8 @@ struct [[nodiscard]] Circular_buffer {
    * @param[in] end_lsn The end LSN to clear.
   */
   void clear(lsn_t start_lsn, lsn_t end_lsn) noexcept {
-    assert(start_lsn <= end_lsn);
-    assert(end_lsn <= m_written_lsn);
+    WAL_ASSERT(start_lsn <= end_lsn);
+    WAL_ASSERT(end_lsn <= m_written_lsn);
 
     const auto end_ptr = m_block_header_array + m_config.m_n_blocks;
 
@@ -504,7 +631,7 @@ struct [[nodiscard]] Circular_buffer {
     const auto n_blocks_to_clear = last_block_no - first_block_no;
     auto n_bytes_to_clear = n_blocks_to_clear * sizeof(Block_header);
 
-    assert(n_bytes_to_clear <= sizeof(Block_header) * m_config.m_n_blocks);
+    WAL_ASSERT(n_bytes_to_clear <= sizeof(Block_header) * m_config.m_n_blocks);
 
     const auto start_block_index = first_block_no % m_config.m_n_blocks;
     auto ptr = m_block_header_array + start_block_index;
@@ -512,7 +639,7 @@ struct [[nodiscard]] Circular_buffer {
     {
       using uptrdiff_t = std::make_unsigned_t<std::ptrdiff_t>;
 
-      assert(sizeof(Block_header) * n_blocks_to_clear >= n_bytes_to_clear);
+      WAL_ASSERT(sizeof(Block_header) * n_blocks_to_clear >= n_bytes_to_clear);
       const auto len = std::min(n_bytes_to_clear, uptrdiff_t(end_ptr - ptr) * sizeof(Block_header));
       std::memset(ptr, 0, len);
       n_bytes_to_clear -= len;
@@ -524,7 +651,7 @@ struct [[nodiscard]] Circular_buffer {
       n_bytes_to_clear = 0;
     }
 
-    assert(n_bytes_to_clear == 0);
+    WAL_ASSERT(n_bytes_to_clear == 0);
   }
 
   [[nodiscard]] std::string to_string() const noexcept;
@@ -568,6 +695,7 @@ struct [[nodiscard]] Log {
   using Slot = Circular_buffer::Slot;
   using IO_vecs = Circular_buffer::IO_vecs;
   using Write_callback = Circular_buffer::Write_callback;
+  struct Batch;
 
   /**
    * Constructor.
@@ -580,8 +708,8 @@ struct [[nodiscard]] Log {
   ~Log() noexcept;
 
   [[nodiscard]] Result<std::size_t> write(Slot &slot, std::span<const std::byte> span) noexcept {
-    assert(span.size() > 0);
-    assert(slot.m_len == span.size());
+    WAL_ASSERT(span.size() > 0);
+    WAL_ASSERT(slot.m_len == span.size());
 
     auto result = m_buffer.write(slot, span);
     if (!result.has_value()) {
@@ -610,7 +738,51 @@ struct [[nodiscard]] Log {
     return m_buffer.check_margin();
   }
 
+  [[nodiscard]] Batch make_batch(std::size_t threshold = kDefaultLogBatchBytes);
+
+  [[nodiscard]] Status write_buffered(std::span<const std::byte> span) noexcept;
+
   Circular_buffer m_buffer;
+};
+
+struct [[nodiscard]] Log::Batch {
+  explicit Batch(Log& log, std::size_t threshold) noexcept
+    : m_log(&log),
+      m_threshold(std::max<std::size_t>(1, threshold)) {}
+
+  Batch(const Batch&) = delete;
+  Batch& operator=(const Batch&) = delete;
+  Batch(Batch&&) = default;
+  Batch& operator=(Batch&&) = default;
+
+  [[nodiscard]] Status append(std::span<const std::byte> data) noexcept {
+    if (data.empty()) {
+      return Status::Success;
+    }
+    m_buffer.insert(m_buffer.end(), data.begin(), data.end());
+    if (m_buffer.size() >= m_threshold) {
+      return flush();
+    }
+    return Status::Success;
+  }
+
+  [[nodiscard]] Status flush() noexcept {
+    if (m_buffer.empty()) {
+      return Status::Success;
+    }
+    auto status = m_log->write_buffered(std::span<const std::byte>(m_buffer.data(), m_buffer.size()));
+    if (status == Status::Success) {
+      m_buffer.clear();
+    }
+    return status;
+  }
+
+  [[nodiscard]] std::size_t size() const noexcept { return m_buffer.size(); }
+
+private:
+  Log* m_log{};
+  std::vector<std::byte> m_buffer;
+  std::size_t m_threshold{};
 };
 
 /* Simple process() example. Customize as needed. */
@@ -622,4 +794,3 @@ void process(const T& item) {
 }
 
 } // namespace wal
-

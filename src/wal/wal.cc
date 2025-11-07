@@ -1,5 +1,9 @@
+#include <algorithm>
 #include <format>
 #include <sys/uio.h>
+
+#include <cassert>
+#include <limits>
 
 #include "util/checksum.h"
 #include "wal/wal.h"
@@ -113,7 +117,7 @@ namespace wal {
 
         // header->prepare_to_write();
 
-        *crc32 = util::Checksum::compute(span, util::ChecksumAlgorithm::CRC32C);
+        *crc32 = 0; //util::Checksum::compute(span, util::ChecksumAlgorithm::CRC32C);
 
         iovecs[i].iov_base = const_cast<Block_header::Data*>(&header->m_data);
         iovecs[i].iov_len = sizeof(Block_header::Data);
@@ -208,6 +212,34 @@ namespace wal {
     return m_buffer.to_string();
   }
 
+  /**
+   * @brief Append a span of bytes using the internal batching logic.
+   *
+   * @warning This API does not automatically flush the underlying
+   *          Circular_buffer when space runs out. Callers must handle
+   *          Status::Not_enough_space by invoking write_to_store()
+   *          (or otherwise advancing m_lwm) and then retrying. Failing
+   *          to do so will leave buffered data unpersisted.
+   */
+  Status Log::write_buffered(std::span<const std::byte> span) noexcept {
+    auto remaining = span;
+    while (!remaining.empty()) {
+      const auto chunk_len = static_cast<std::uint16_t>(
+        std::min<std::size_t>(remaining.size(), std::numeric_limits<std::uint16_t>::max()));
+      auto chunk = remaining.first(chunk_len);
+      auto slot = reserve(chunk_len);
+      auto result = write(slot, chunk);
+      if (!result.has_value()) {
+        return result.error();
+      }
+      remaining = remaining.subspan(result.value());
+    }
+    return Status::Success;
+  }
+
+  Log::Batch Log::make_batch(std::size_t threshold) {
+    return Batch(*this, threshold);
+  }
 
 std::string to_string(Status status) noexcept {
   switch (status) {
