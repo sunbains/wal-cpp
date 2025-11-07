@@ -65,7 +65,7 @@ inline crc32_t crc32c_hw(crc32_t crc, const void* data, size_t length) noexcept 
     /* Process remaining bytes. */
     while (length > 0) {
         crc = _mm_crc32_u8(crc, *buf);
-        --buf;
+        ++buf;
         --length;
     }
 #endif /* defined(__x86_64__) || defined(_M_X64) */
