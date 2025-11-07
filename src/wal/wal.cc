@@ -30,6 +30,8 @@ namespace wal {
       auto& block_header = m_block_header_array[i];
       block_header.initialize(block_no_t(block_start_no + i));
     }
+
+    m_iovecs.resize(IOV_MAX);
  }
 
   Circular_buffer::~Circular_buffer() noexcept {}
@@ -52,8 +54,6 @@ namespace wal {
     assert(!is_empty());
     assert(m_hwm > m_lwm);
 
-    IO_vecs iovecs;
-
     // log_inf("m_lwm: {}", m_lwm.load(std::memory_order_relaxed));
     // log_inf("m_hwm: {}", m_hwm.load(std::memory_order_relaxed));
     // log_inf("m_written_lsn: {}", m_written_lsn.load(std::memory_order_relaxed));
@@ -72,7 +72,7 @@ namespace wal {
     const auto iovecs_size = std::min(n_blocks_to_flush * 3, static_cast<std::size_t>(IOV_MAX));
     const auto max_blocks_per_batch = iovecs_size / 3;
 
-    iovecs.resize(iovecs_size);
+    WAL_ASSERT(m_iovecs.size() >= iovecs_size);
 
     auto expected_block_no = m_lwm / data_size;
 
@@ -121,19 +121,19 @@ namespace wal {
         m_checksum.update(span);
         *crc32 = m_checksum.value();
 
-        iovecs[i].iov_base = const_cast<Block_header::Data*>(&header->m_data);
-        iovecs[i].iov_len = sizeof(Block_header::Data);
-        iovecs[i + 1].iov_base = const_cast<std::byte*>(span.data());
-        iovecs[i + 1].iov_len = span.size();
-        iovecs[i + 2].iov_base = static_cast<void*>(crc32);
-        iovecs[i + 2].iov_len = sizeof(crc32_t);
+        m_iovecs[i].iov_base = const_cast<Block_header::Data*>(&header->m_data);
+        m_iovecs[i].iov_len = sizeof(Block_header::Data);
+        m_iovecs[i + 1].iov_base = const_cast<std::byte*>(span.data());
+        m_iovecs[i + 1].iov_len = span.size();
+        m_iovecs[i + 2].iov_base = static_cast<void*>(crc32);
+        m_iovecs[i + 2].iov_len = sizeof(crc32_t);
       }
       assert(data_len > 0);
 
       n_blocks_to_flush -= flush_batch_size;
       block_start_no = block_start_no + flush_batch_size;
 
-      auto result = callback(m_lwm.load(std::memory_order_acquire) / data_size * data_size, iovecs);
+      auto result = callback(m_lwm.load(std::memory_order_acquire) / data_size * data_size, m_iovecs);
 
       if (!result.has_value()) [[unlikely]] {
         switch (result.error()) {

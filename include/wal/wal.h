@@ -685,6 +685,9 @@ struct [[nodiscard]] Slot {
   /** Array of block headers for each block. It points to an offset in m_buffer */
   Block_header *m_block_header_array{};
 
+  /** IO vectors for storing the data. */
+  IO_vecs m_iovecs{};
+
   /** Buffer for all the data. */
   std::vector<std::byte> m_buffer{};
 
