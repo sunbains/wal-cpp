@@ -11,6 +11,7 @@
 #include <sys/uio.h>
 #include <string>
 #include <format>
+
 #if defined(NDEBUG)
 #  define WAL_ASSERT(cond) ((void)0)
 #else

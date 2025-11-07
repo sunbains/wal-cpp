@@ -117,7 +117,7 @@ namespace wal {
 
         // header->prepare_to_write();
 
-        *crc32 = 0; //util::Checksum::compute(span, util::ChecksumAlgorithm::CRC32C);
+        *crc32 = util::Checksum::compute(span, util::ChecksumAlgorithm::CRC32C);
 
         iovecs[i].iov_base = const_cast<Block_header::Data*>(&header->m_data);
         iovecs[i].iov_len = sizeof(Block_header::Data);
