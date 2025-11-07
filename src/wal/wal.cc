@@ -102,7 +102,7 @@ namespace wal {
 
         ++expected_block_no;
 
-        data_len += std::atomic_ref<uint16_t>(header->m_data.m_len).load(std::memory_order_acquire);
+        data_len += std::atomic_ref<uint16_t>(header->m_data.m_len).load(std::memory_order_relaxed);
 
         const auto is_last_block = header->m_data.m_block_no == last_block_no;
 

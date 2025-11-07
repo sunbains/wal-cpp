@@ -420,19 +420,16 @@ struct [[nodiscard]] Slot {
       
       /* Inline block header access to avoid function call overhead */
       auto* hdr = &m_block_header_array[block_index];
-      
+
       /* Update slot early to allow instruction-level parallelism */
       slot.m_lsn += len;
       const auto remaining_len = static_cast<std::uint16_t>(slot.m_len - len);
       slot.m_len = remaining_len;
-      
-      /* Update block_no only if needed - most writes are sequential so this is often a no-op */
+
+      /* Unconditionally set block_no - avoid conditional branch on fast path */
       const auto current_block_no = static_cast<block_no_t>(block_no);
-      auto& block_no_field = hdr->m_data.m_block_no;
-      if ((block_no_field & ~Block_header::FLUSH_BIT_MASK) != current_block_no) [[unlikely]] {
-        block_no_field = (block_no_field & Block_header::FLUSH_BIT_MASK) | current_block_no;
-      }
-      
+      hdr->m_data.m_block_no = (hdr->m_data.m_block_no & Block_header::FLUSH_BIT_MASK) | current_block_no;
+
       /* Update m_len - use direct atomic store for maximum performance */
       const auto new_len = static_cast<len_t>(off_in_blk + len);
       std::atomic_ref<len_t>(hdr->m_data.m_len).store(new_len, std::memory_order_relaxed);
