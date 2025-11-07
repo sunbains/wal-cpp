@@ -11,12 +11,15 @@
 namespace wal {
 
   Circular_buffer::Circular_buffer(lsn_t hwm, Config config) noexcept
-    : m_lwm(hwm),
-      m_hwm(hwm),
-      m_written_lsn(hwm),
-      m_config(config),
+    : m_config(config),
       m_total_data_size(m_config.get_data_size_in_block() * m_config.m_n_blocks),
       m_checksum(m_config.m_checksum_algorithm) {
+    
+    // Initialize atomic counters
+    m_lwm.store(hwm, std::memory_order_relaxed);
+    m_written_lsn.store(hwm, std::memory_order_relaxed);
+    m_hwm.store(hwm, std::memory_order_relaxed);
+    m_n_pending_writes.store(0, std::memory_order_relaxed);
 
     m_buffer.resize(m_total_data_size + (sizeof(crc32_t) + sizeof(Block_header)) * m_config.m_n_blocks);
 
@@ -24,7 +27,7 @@ namespace wal {
     m_data_array = reinterpret_cast<std::byte*>(m_block_header_array + m_config.m_n_blocks);
     m_crc32_array = reinterpret_cast<crc32_t*>(m_data_array + m_total_data_size);
 
-    const auto block_start_no{m_lwm / m_config.get_data_size_in_block()};
+    const auto block_start_no{m_lwm.load(std::memory_order_relaxed) / m_config.get_data_size_in_block()};
     assert(block_start_no  + m_config.m_n_blocks < std::numeric_limits<block_no_t>::max());
 
     for (std::size_t i{}; i < m_config.m_n_blocks; ++i) {
@@ -55,9 +58,9 @@ namespace wal {
     assert(!is_empty());
     assert(m_hwm > m_lwm);
 
-    // log_inf("m_lwm: {}", m_lwm.load(std::memory_order_relaxed));
-    // log_inf("m_hwm: {}", m_hwm.load(std::memory_order_relaxed));
-    // log_inf("m_written_lsn: {}", m_written_lsn.load(std::memory_order_relaxed));
+    // log_inf("m_lwm: {}", m_lsn_counters.m_lwm.load(std::memory_order_relaxed));
+    // log_inf("m_hwm: {}", m_reserve_counters.m_hwm.load(std::memory_order_relaxed));
+    // log_inf("m_written_lsn: {}", m_lsn_counters.m_written_lsn.load(std::memory_order_relaxed));
 
     const auto data_size{m_config.get_data_size_in_block()};
     auto block_start_no = m_lwm / data_size;
@@ -134,7 +137,7 @@ namespace wal {
       n_blocks_to_flush -= flush_batch_size;
       block_start_no = block_start_no + flush_batch_size;
 
-      auto result = callback(m_lwm.load(std::memory_order_acquire) / data_size * data_size, m_iovecs);
+      auto result = callback(m_lwm.load(std::memory_order_acquire) / data_size * data_size, m_iovecs, n_slots);
 
       if (!result.has_value()) [[unlikely]] {
         switch (result.error()) {
@@ -172,7 +175,7 @@ namespace wal {
     }
 
     // log_inf("persisted_lsn: {}", persisted_lsn);
-    // log_inf("written_lsn: {}, expected_block_no: {}", m_written_lsn.load(std::memory_order_relaxed), expected_block_no);
+    // log_inf("written_lsn: {}, expected_block_no: {}", m_lsn_counters.m_written_lsn.load(std::memory_order_relaxed), expected_block_no);
 
     /* The last block may not be full and may have to be rewritten. We need to preseve its header,
     and advance the LWM only by the valid data length. Round down to lower block boundary */

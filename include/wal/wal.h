@@ -20,14 +20,6 @@
 #endif
 #include <thread>
 
-#if !defined(WAL_TRACK_PENDING_WRITES)
-#  if defined(NDEBUG)
-#    define WAL_TRACK_PENDING_WRITES 0
-#  else
-#    define WAL_TRACK_PENDING_WRITES 1
-#  endif
-#endif
-
 constexpr std::size_t kPrefetchDistanceBytes = 256;
 constexpr std::size_t kDefaultBlockSize = 4096;
 constexpr std::size_t kDefaultBufferBytes = 64ull * 1024ull * 1024ull;
@@ -263,9 +255,10 @@ struct [[nodiscard]] Circular_buffer {
    * 
    * @param lsn The LWM LSN from where the snapshot starts.
    * @param iovecs The IO vectors to flush.
+   * @param n_slots The number of slots in iovecs to flush.
    * @return The new LWM LSN.
    */
-  using Write_callback = std::function<Result<lsn_t>(lsn_t lsn, const IO_vecs& iovecs)>;
+  using Write_callback = std::function<Result<lsn_t>(lsn_t lsn, const IO_vecs& iovecs, std::size_t n_slots)>;
 
   struct [[nodiscard]] Slot {
     /** Start LSN of this slot. */
@@ -331,9 +324,7 @@ struct [[nodiscard]] Circular_buffer {
   [[nodiscard]] Slot reserve(std::uint16_t len) noexcept {
     /* Use relaxed ordering - the release semantics are provided by the write() operation */
     const auto lsn = m_hwm.fetch_add(len, std::memory_order_relaxed);
-#if WAL_TRACK_PENDING_WRITES
     m_n_pending_writes.fetch_add(1, std::memory_order_relaxed);
-#endif
 
     return Slot {
       .m_lsn = lsn,
@@ -440,9 +431,7 @@ struct [[nodiscard]] Circular_buffer {
       m_written_lsn.fetch_add(len, std::memory_order_relaxed);
       
       if (remaining_len == 0) {
-#if WAL_TRACK_PENDING_WRITES
         m_n_pending_writes.fetch_sub(1, std::memory_order_relaxed);
-#endif
         return Result<std::size_t>(len);
       }
       
@@ -546,9 +535,7 @@ struct [[nodiscard]] Circular_buffer {
     slot.m_len -= uint16_t(copied);
 
     if (slot.m_len == 0) {
-#if WAL_TRACK_PENDING_WRITES
       m_n_pending_writes.fetch_sub(1, std::memory_order_relaxed);
-#endif
     }
 
     m_written_lsn.fetch_add(copied, std::memory_order_relaxed);

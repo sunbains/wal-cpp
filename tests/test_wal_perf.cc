@@ -20,10 +20,10 @@ namespace {
 
 struct Null_writer {
   [[nodiscard]] wal::Result<wal::lsn_t>
-  operator()(wal::lsn_t lsn, const wal::Log::IO_vecs &iovecs) const noexcept {
+  operator()(wal::lsn_t lsn, const wal::Log::IO_vecs &iovecs, std::size_t n_slots) const noexcept {
     std::size_t data_bytes{};
 
-    for (std::size_t i = 1; i < iovecs.size(); i += 3) {
+    for (std::size_t i = 1; i < n_slots; i += 3) {
       data_bytes += iovecs[i].iov_len;
     }
 
@@ -62,9 +62,7 @@ struct Flush_metrics {
 void finalize_log(wal::Log& log,
                   wal::Log::Write_callback& null_writer,
                   Flush_metrics& metrics) noexcept {
-#if WAL_TRACK_PENDING_WRITES
   assert(log.m_buffer.m_n_pending_writes.load(std::memory_order_relaxed) == 0);
-#endif
   assert(log.m_buffer.m_written_lsn.load(std::memory_order_relaxed) == log.m_buffer.m_hwm.load(std::memory_order_relaxed));
   
   if (!log.m_buffer.is_empty()) {

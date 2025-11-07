@@ -15,9 +15,9 @@ using wal::Status;
 using wal::Circular_buffer;
 
 /* Null writer callback that simulates writing to storage without actually doing I/O */
-static wal::Result<lsn_t> null_writer(lsn_t lsn, const wal::Log::IO_vecs &iovecs) {
+static wal::Result<lsn_t> null_writer(lsn_t lsn, const wal::Log::IO_vecs &iovecs, std::size_t n_slots) {
   std::size_t bytes_written{};
-  for (std::size_t i = 1; i < iovecs.size(); i += 3) {
+  for (std::size_t i = 1; i < n_slots; i += 3) {
     bytes_written += iovecs[i].iov_len;
   }
   return wal::Result<lsn_t>(lsn + bytes_written);
