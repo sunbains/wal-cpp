@@ -46,6 +46,60 @@ if(NOT MSVC)
   endif()
 endif()
 
+# ----------------------------- Platform feature checks -----------------------
+# Check for pthread functions used in performance tests
+include(CheckCXXSourceCompiles)
+if(NOT MSVC)
+  # Save original required libraries
+  set(CMAKE_REQUIRED_LIBRARIES_SAVE ${CMAKE_REQUIRED_LIBRARIES})
+  
+  # Try to link with pthreads for the checks
+  set(CMAKE_REQUIRED_LIBRARIES pthread)
+  
+  # Check for pthread_setaffinity_np (Linux-specific, requires _GNU_SOURCE)
+  set(CMAKE_REQUIRED_DEFINITIONS "-D_GNU_SOURCE")
+  check_cxx_source_compiles("
+    #define _GNU_SOURCE
+    #include <pthread.h>
+    #include <sched.h>
+    int main() {
+      pthread_t thread;
+      cpu_set_t cpuset;
+      CPU_ZERO(&cpuset);
+      pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset);
+      return 0;
+    }
+  " HAVE_PTHREAD_SETAFFINITY_NP)
+  unset(CMAKE_REQUIRED_DEFINITIONS)
+  if(HAVE_PTHREAD_SETAFFINITY_NP)
+    message(STATUS "pthread_setaffinity_np() is available")
+  else()
+    message(STATUS "pthread_setaffinity_np() is not available")
+  endif()
+  
+  # Check for pthread_setschedparam (POSIX standard)
+  check_cxx_source_compiles("
+    #include <pthread.h>
+    #include <sched.h>
+    int main() {
+      pthread_t thread;
+      struct sched_param param;
+      param.sched_priority = 50;
+      pthread_setschedparam(thread, SCHED_FIFO, &param);
+      return 0;
+    }
+  " HAVE_PTHREAD_SETSCHEDPARAM)
+  if(HAVE_PTHREAD_SETSCHEDPARAM)
+    message(STATUS "pthread_setschedparam() is available")
+  else()
+    message(STATUS "pthread_setschedparam() is not available")
+  endif()
+  
+  # Restore original required libraries
+  set(CMAKE_REQUIRED_LIBRARIES ${CMAKE_REQUIRED_LIBRARIES_SAVE})
+  unset(CMAKE_REQUIRED_LIBRARIES_SAVE)
+endif()
+
 # ----------------------------- wal library -----------------------------------
 if(WAL_BUILD_LIB OR WAL_BUILD_TESTS)
   add_library(wal STATIC

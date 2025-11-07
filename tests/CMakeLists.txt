@@ -69,6 +69,14 @@ target_link_libraries(wal_tests_perf PRIVATE Threads::Threads wal::wal)
 target_link_libraries(wal_tests_mt PRIVATE Threads::Threads wal::wal)
 target_link_libraries(wal_tests_bounded_queue_perf PRIVATE Threads::Threads)
 
+# Pass pthread function availability to test
+if(HAVE_PTHREAD_SETAFFINITY_NP)
+  target_compile_definitions(wal_tests_bounded_queue_perf PRIVATE HAVE_PTHREAD_SETAFFINITY_NP)
+endif()
+if(HAVE_PTHREAD_SETSCHEDPARAM)
+  target_compile_definitions(wal_tests_bounded_queue_perf PRIVATE HAVE_PTHREAD_SETSCHEDPARAM)
+endif()
+
 target_compile_definitions(wal_tests_perf PRIVATE NDEBUG)
 
 # Force test_wal.cc, test_logger.cc, and test_wal_mt.cc to always be compiled with asserts enabled (even in Release builds)
