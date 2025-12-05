@@ -91,8 +91,8 @@ struct Test_config {
 /* Specialize Message_envelope to use Poison_pill, Fdatasync, and Fsync instead of monostate */
 template<>
 struct Message_envelope<Test_message> {
-  Pid m_sender;
   std::variant<Test_message, Poison_pill, Fdatasync, Fsync> m_payload;
+  Pid m_sender;
   Clock::time_point m_send_time{};  /* Timestamp when message was sent (for latency tracking) */
 };
 
@@ -335,7 +335,7 @@ Task<void> producer_actor(Producer_context ctx, std::size_t num_items, std::atom
     }
   }
 
-  Message_envelope<Payload_type> term_env{.m_sender = ctx.m_self, .m_payload = Poison_pill{}};
+  Message_envelope<Payload_type> term_env{.m_payload = Poison_pill{}, .m_sender = ctx.m_self};
 
   if (!ctx.m_proc->m_mailbox.enqueue(std::move(term_env))) {
     while (!ctx.m_proc->m_mailbox.enqueue(std::move(term_env))) {
@@ -361,7 +361,6 @@ Task<void> consumer_actor(
     util::cpu_pause();
   }
  
-  std::size_t local_consumed = 0;
   std::size_t completed_producers = 0;
   Message_envelope<Payload_type> msg;
   std::size_t no_work_iterations = 0;
@@ -464,13 +463,11 @@ Task<void> consumer_actor(
             /* Regular payload message */
             if (std::holds_alternative<Payload_type>(msg.m_payload)) {
               process_payload_message(*ctx.m_processor, std::get<Payload_type>(msg.m_payload), msg);
-              ++local_consumed;
             }
           } else {
             /* Only process if it's actually a payload message */
             if (std::holds_alternative<Payload_type>(msg.m_payload)) {
               process_payload_message(*ctx.m_processor, std::get<Payload_type>(msg.m_payload), msg);
-              ++local_consumed;
             }
           }
         }

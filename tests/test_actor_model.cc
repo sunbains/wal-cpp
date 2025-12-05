@@ -128,7 +128,6 @@ Task<void> consumer_actor(
     util::cpu_pause();
   }
 
-  std::size_t local_consumed = 0;
   std::size_t completed_producers = 0;
   Message_envelope<Payload_size_t> msg;
   std::size_t no_work_iterations = 0;
@@ -196,7 +195,6 @@ Task<void> consumer_actor(
           } else {
             /* Regular payload message */
             process_payload_message(process_msg, std::get<Payload_size_t>(msg.m_payload), msg);
-            ++local_consumed;
           }
         }
         
