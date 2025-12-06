@@ -568,7 +568,6 @@ static double test_throughput_actor_model_single_run(const Test_config& config) 
 
   Log_writer log_writer = [log_file_wrapper]
     (std::span<struct iovec> span, wal::Log::Sync_type sync_type) -> wal::Result<std::size_t> {
-
     
     auto result = log_file_wrapper->m_log_file->write(span);
     

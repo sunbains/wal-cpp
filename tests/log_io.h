@@ -93,6 +93,7 @@ struct Log_file {
       }
       break;
     }
+
     return wal::Result<std::size_t>{total_written};
   }
 

@@ -13,7 +13,6 @@
 #include "util/metrics.h"
 #include "wal/wal.h"
 #include "wal/buffer_pool.h"
-#include "wal/async_io.h"
 
 namespace wal {
 
