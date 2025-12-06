@@ -181,19 +181,19 @@ constexpr auto make_logger(W writer, Log_level min_level = Log_level::Trace)
 
 /* Macros to capture source_location at call site */
 #define log_trace(fmt, ...) \
-  (g_logger).trace(std::source_location::current(), fmt, ##__VA_ARGS__)
+  (g_logger).trace(std::source_location::current(), fmt __VA_OPT__(,) __VA_ARGS__)
 
 #define log_debug(fmt, ...) \
-  (g_logger).debug(std::source_location::current(), fmt, ##__VA_ARGS__)
+  (g_logger).debug(std::source_location::current(), fmt __VA_OPT__(,) __VA_ARGS__)
 
 #define log_info(fmt, ...) \
-  (g_logger).info(std::source_location::current(), fmt, ##__VA_ARGS__)
+  (g_logger).info(std::source_location::current(), fmt __VA_OPT__(,) __VA_ARGS__)
 
 #define log_warn(fmt, ...) \
-  (g_logger).warn(std::source_location::current(), fmt, ##__VA_ARGS__)
+  (g_logger).warn(std::source_location::current(), fmt __VA_OPT__(,) __VA_ARGS__)
 
 #define log_err(fmt, ...) \
-  (g_logger).err(std::source_location::current(), fmt, ##__VA_ARGS__)
+  (g_logger).err(std::source_location::current(), fmt __VA_OPT__(,) __VA_ARGS__)
 
 #define log_fatal(fmt, ...) \
-  (g_logger).fatal(std::source_location::current(), fmt, ##__VA_ARGS__)
+  (g_logger).fatal(std::source_location::current(), fmt __VA_OPT__(,) __VA_ARGS__)

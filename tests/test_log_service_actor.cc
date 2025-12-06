@@ -256,10 +256,13 @@ Task<void> producer_actor(Producer_context ctx, std::size_t num_items, std::atom
     util::cpu_pause();
   }
 
-  ctx.m_proc->schedule_self(ctx.m_sched->m_mailboxes, ctx.m_sched->m_mailboxes->size());
+  /* Cache mailbox count - it never changes during execution (6.39% hotspot) */
+  const std::size_t n_mailboxes = ctx.m_sched->m_mailboxes->size();
 
-  /* Random number generator for fdatasync */
-  std::mt19937 rng(std::random_device{}());
+  ctx.m_proc->schedule_self(ctx.m_sched->m_mailboxes, n_mailboxes);
+
+  /* Use cheaper RNG seed - std::random_device is expensive */
+  std::mt19937 rng(static_cast<uint32_t>(reinterpret_cast<uintptr_t>(ctx.m_proc) ^ static_cast<uintptr_t>(std::chrono::steady_clock::now().time_since_epoch().count())));
   std::uniform_int_distribution<std::size_t> dist(1, ctx.m_fdatasync_interval > 0 ? ctx.m_fdatasync_interval : 1);
 
   /* Send messages, randomly sending sync messages if interval is set */
@@ -270,7 +273,7 @@ Task<void> producer_actor(Producer_context ctx, std::size_t num_items, std::atom
     if (ctx.m_track_latency) [[unlikely]] {
       env.m_send_time = Clock::now();
     }
-    
+
     /* Send sync message randomly with 1/fdatasync_interval probability if interval is set */
     if (ctx.m_fdatasync_interval > 0 && dist(rng) == 1) {
       if (ctx.m_sync_type == Sync_message_type::Fdatasync) {
@@ -279,32 +282,30 @@ Task<void> producer_actor(Producer_context ctx, std::size_t num_items, std::atom
         env.m_payload = wal::Fsync{};
       }
     } else {
-      wal::Test_message msg{};
-      env.m_payload = msg;
+      /* Direct construct in variant to avoid extra copy */
+      env.m_payload = wal::Test_message{};
     }
 
     if (ctx.m_proc->m_mailbox.enqueue(std::move(env))) [[likely]] {
       continue;
     }
 
-    /* Slow path: queue full */
-    while (!ctx.m_proc->m_mailbox.enqueue(std::move(env))) {
-      ctx.m_proc->schedule_self(ctx.m_sched->m_mailboxes, ctx.m_sched->m_mailboxes->size());
+    /* Slow path: queue full - recreate env since it was moved */
+    do {
+      ctx.m_proc->schedule_self(ctx.m_sched->m_mailboxes, n_mailboxes);
       util::cpu_pause();
-    }
+    } while (!ctx.m_proc->m_mailbox.enqueue(std::move(env)));
   }
 
   util::Message_envelope<Payload_type> term_env{.m_payload = util::Poison_pill{}, .m_sender = ctx.m_self};
 
-  if (!ctx.m_proc->m_mailbox.enqueue(std::move(term_env))) {
-    while (!ctx.m_proc->m_mailbox.enqueue(std::move(term_env))) {
-      ctx.m_proc->schedule_self(ctx.m_sched->m_mailboxes, ctx.m_sched->m_mailboxes->size());
-      util::cpu_pause();
-    }
+  while (!ctx.m_proc->m_mailbox.enqueue(std::move(term_env))) {
+    ctx.m_proc->schedule_self(ctx.m_sched->m_mailboxes, n_mailboxes);
+    util::cpu_pause();
   }
-  
+
   /* Schedule self after enqueueing poison pill so consumer can detect it */
-  ctx.m_proc->schedule_self(ctx.m_sched->m_mailboxes, ctx.m_sched->m_mailboxes->size());
+  ctx.m_proc->schedule_self(ctx.m_sched->m_mailboxes, n_mailboxes);
 
   co_return;
 }

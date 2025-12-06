@@ -185,7 +185,7 @@ struct Checksum {
     using update_fn_t = crc32_t(*)(crc32_t, const void*, size_t) noexcept;
 
     explicit constexpr Checksum(ChecksumAlgorithm algo = ChecksumAlgorithm::CRC32C) noexcept
-        : m_use_hw(false), m_state(0), m_algorithm(algo), m_update_fn(crc32c_sw) {
+        : m_use_hw(false), m_state(0), m_update_fn(crc32c_sw) {
         if (algo == ChecksumAlgorithm::NONE) {
            m_update_fn = nullptr;
         }
@@ -270,7 +270,6 @@ struct Checksum {
 private:
     bool m_use_hw{};
     crc32_t m_state{0};
-    ChecksumAlgorithm m_algorithm{ChecksumAlgorithm::CRC32C};
     update_fn_t m_update_fn{crc32c_sw};
 };
 

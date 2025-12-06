@@ -52,7 +52,7 @@ void producer(
   for (std::size_t i = 0; i < num_messages; ++i) {
     /* Write directly to log - I/O coroutine handles buffer processing in background */
     /* For raw Log/IO performance test, we don't use the lambda - let I/O coroutine handle it */
-    auto write_result = log->append(msg.get_span(), pool);
+    [[maybe_unused]] auto write_result = log->append(msg.get_span(), pool);
 
     WAL_ASSERT(write_result.has_value());
   }
@@ -154,7 +154,7 @@ static void test_log_io_simple(const Test_config& config) {
 
   /* Flush any remaining data */
   if (!log->is_empty()) {
-    auto flush_result = log->write_to_store(log_writer);
+    [[maybe_unused]] auto flush_result = log->write_to_store(log_writer);
     WAL_ASSERT(flush_result.has_value());
   }
 
@@ -171,7 +171,7 @@ static void test_log_io_simple(const Test_config& config) {
                total_written, elapsed, throughput_mib, ops_per_sec);
 
   /* Shutdown log */
-  auto shutdown_result = log->shutdown(log_writer);
+  [[maybe_unused]] auto shutdown_result = log->shutdown(log_writer);
   WAL_ASSERT(shutdown_result.has_value());
 
   log->m_pool->stop_io_coroutine();

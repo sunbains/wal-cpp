@@ -249,8 +249,8 @@ struct Thread_pool {
     }
 
     Task() = default;
-    Task(const Task&) = default;
-    Task& operator=(const Task&) = default;
+    Task(const Task&) = delete;
+    Task& operator=(const Task&) = delete;
     ~Task() = default;
 
     std::size_t m_id{};

@@ -51,9 +51,9 @@ struct Metrics {
   static constexpr std::size_t kMetricCount = static_cast<std::size_t>(MetricType::Count);
 
   Metrics() = default;
-  Metrics(Metrics&&) = default;
+  Metrics(Metrics&&) = delete;
   Metrics(const Metrics&) = delete;
-  Metrics& operator=(Metrics&&) = default;
+  Metrics& operator=(Metrics&&) = delete;
   Metrics& operator=(const Metrics&) = delete;
   ~Metrics() = default;
 

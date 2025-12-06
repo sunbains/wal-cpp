@@ -42,7 +42,7 @@ void process_data(int* data, size_t size) {
 }
 
 // Example using audit assertions (only checked in debug builds)
-void expensive_validation(const int* data, size_t size) {
+void expensive_validation([[maybe_unused]] const int* data, size_t size) {
   // This check is expensive and only runs when NDEBUG is not defined
   audit_assert(data != nullptr, "Data must not be null");
 
@@ -56,7 +56,7 @@ void expensive_validation(const int* data, size_t size) {
 }
 
 // Example using assume for optimizer hints
-int fast_lookup(const int* sorted_array, size_t size, int value) {
+int fast_lookup(const int* sorted_array, size_t size, [[maybe_unused]] int value) {
   expects(sorted_array != nullptr, "Array must not be null");
   expects(size > 0, "Array must not be empty");
 

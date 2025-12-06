@@ -353,8 +353,8 @@ struct Bounded_queue {
  private:
   using Pad = std::byte[std::hardware_constructive_interference_size];
 
-  struct alignas(T) Cell {
-    T m_data{};
+  struct Cell {
+    alignas(std::max(alignof(T), alignof(std::atomic<Pos>))) T m_data{};
     std::atomic<Pos> m_pos{};
   };
 

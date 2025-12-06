@@ -48,10 +48,14 @@ inline void cpu_pause() noexcept {
 
 /* Use hardware_destructive_interference_size if available */
 #if defined(__cpp_lib_hardware_interference_size) && (__cpp_lib_hardware_interference_size >= 201703L)
+#if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Winterference-size"
+#endif
 constexpr std::size_t kHWCLS = std::hardware_destructive_interference_size;
+#if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic pop
+#endif
 #else
 constexpr std::size_t kHWCLS = 64; // sensible fallback for most x86/ARM servers
 #endif

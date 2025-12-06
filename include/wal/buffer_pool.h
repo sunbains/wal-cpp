@@ -34,10 +34,13 @@ using Config = Buffer::Config;
 
 /**
  * Manages a pool of Buffer instances for concurrent I/O operations.
- * 
+ *
  * When a buffer becomes full, it's moved to an I/O queue for async writing,
  * and operations continue on the next available buffer from the pool.
+ *
+ * Note: Padding is intentional for cache line alignment to prevent false sharing.
  */
+// NOLINTBEGIN(clang-analyzer-optin.performance.Padding)
 struct Pool {
   struct Entry;
   
@@ -418,6 +421,7 @@ struct Pool {
   /* Flag to track if IO coroutine is running */
   alignas(kCLS) std::atomic<bool> m_io_task_running{false};
 };
+// NOLINTEND(clang-analyzer-optin.performance.Padding)
 
 } // namespace wal
 

@@ -215,13 +215,13 @@ static void test_load_balancing() {
   std::vector<int> executed_by;
 
   for (int i = 0; i < num_workers * tasks_per_worker; ++i) {
-    pool.post([&worker_counts, &mtx, &executed_by, i]() noexcept {
+    pool.post([&worker_counts, &mtx, &executed_by]() noexcept {
       // Get current thread ID to identify worker
       std::thread::id tid = std::this_thread::get_id();
       std::hash<std::thread::id> hasher;
       std::size_t worker_idx = hasher(tid) % num_workers;
       worker_counts[worker_idx].fetch_add(1, std::memory_order_relaxed);
-      
+
       std::lock_guard<std::mutex> lock(mtx);
       executed_by.push_back(static_cast<int>(worker_idx));
     });
