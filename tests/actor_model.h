@@ -348,7 +348,7 @@ private:
     }
 
     producer_pool_config.m_num_threads = std::max<std::size_t>(1, hw_threads / 2);
-    producer_pool_config.m_queue_capacity = std::min<std::size_t>(131072, std::max<std::size_t>(4096, num_producers * 4));
+    producer_pool_config.m_queue_capacity = std::min<std::size_t>(2 * 1024, std::max<std::size_t>(4096, num_producers * 4));
 
     if (!std::has_single_bit(producer_pool_config.m_queue_capacity)) {
       producer_pool_config.m_queue_capacity = std::bit_ceil(producer_pool_config.m_queue_capacity);
@@ -365,9 +365,8 @@ private:
       hw_threads = 4;
     }
 
-    /* Dedicated pool for consumer coroutine */
-    consumer_pool_config.m_num_threads = 2;
-    consumer_pool_config.m_queue_capacity = 1024;
+    consumer_pool_config.m_num_threads = 1;
+    consumer_pool_config.m_queue_capacity = 64;
 
     if (!std::has_single_bit(consumer_pool_config.m_queue_capacity)) {
       consumer_pool_config.m_queue_capacity = std::bit_ceil(consumer_pool_config.m_queue_capacity);
@@ -385,9 +384,8 @@ private:
       hw_threads = 4;
     }
 
-    /* Dedicated pool for I/O operations - match test_log_io_simple.cc configuration */
-    io_pool_config.m_num_threads = std::max<std::size_t>(1, hw_threads / 2);
-    io_pool_config.m_queue_capacity = 32768;
+    io_pool_config.m_num_threads = 1;
+    io_pool_config.m_queue_capacity = 64;
 
     if (!std::has_single_bit(io_pool_config.m_queue_capacity)) {
       io_pool_config.m_queue_capacity = std::bit_ceil(io_pool_config.m_queue_capacity);

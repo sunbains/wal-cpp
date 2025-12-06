@@ -162,9 +162,7 @@ struct Log_message_processor {
   void write_and_fdatasync() {
     /* Flush any pending buffers and trigger fdatasync */
     if (m_log && m_io_pool && m_log->m_write_callback) {
-      /* First, ensure the active buffer is flushed if it has data */
-      if (m_log->m_pool && m_log->m_pool->m_active && 
-          !m_log->m_pool->m_active->m_buffer.is_empty()) {
+      if (m_log->m_pool && m_log->m_pool->m_active && !m_log->m_pool->m_active->m_buffer.is_empty()) {
         m_log->m_pool->prepare_buffer_for_io(m_log->m_pool->m_active, *m_io_pool, m_log->m_write_callback);
       }
       

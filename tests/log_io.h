@@ -13,7 +13,6 @@
 #include "wal/wal.h"
 #include "util/logger.h"
 
-
 extern util::Logger<util::MT_logger_writer> g_logger;
 
 /**
@@ -40,13 +39,11 @@ struct Log_file {
     }
   }
 
-  // Non-copyable, non-movable
-  Log_file(const Log_file&) = delete;
-  Log_file& operator=(const Log_file&) = delete;
   Log_file(Log_file&&) = delete;
+  Log_file(const Log_file&) = delete;
   Log_file& operator=(Log_file&&) = delete;
+  Log_file& operator=(const Log_file&) = delete;
 
-  // Low-level write with physical offset
   wal::Result<std::size_t> write(std::span<struct iovec> iov_span, off_t phy_off) const noexcept {
     std::size_t iov_index{};
     std::size_t total_written{};
@@ -97,15 +94,9 @@ struct Log_file {
     return wal::Result<std::size_t>{total_written};
   }
 
-  // High-level write from WAL buffer (handles wraparound)
   wal::Result<std::size_t> write(std::span<struct iovec> span) const noexcept {
     if (m_disable_writes) {
-      // Just return success without actually writing
-      std::size_t total_len = 0;
-      for (const auto& iov : span) {
-        total_len += iov.iov_len;
-      }
-      return wal::Result<std::size_t>{total_len};
+      return wal::Result<std::size_t>{span[1].iov_len * span.size()};
     }
 
     WAL_ASSERT(!span.empty());
