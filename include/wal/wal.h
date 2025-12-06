@@ -492,13 +492,13 @@ struct [[nodiscard]] Circular_buffer {
    * @note The caller needs to check for partial copy and handle it accordingly.
    * @return { LSN , number of bytes copied into the buffer}
    */
-  [[nodiscard]] Result<Slot> copy(std::span<const std::byte> span) noexcept {
+  [[nodiscard]] Result<Slot> append(std::span<const std::byte> span) noexcept {
     WAL_ASSERT(span.size() > 0);
     WAL_ASSERT(span.size() <= std::numeric_limits<std::uint16_t>::max());
     WAL_ASSERT(m_hwm - m_lwm <= m_total_data_size);
 
-    const auto lsn = m_hwm;
-    const auto available = std::min(margin(), span.size());
+    const auto space_left = static_cast<std::size_t>(std::ptrdiff_t(m_append_ptr - m_data_array));
+    const auto available = std::min(span.size(), m_total_data_size - space_left);
 
     if (available == 0) [[unlikely]] {
       return std::unexpected(Status::Not_enough_space);
@@ -506,11 +506,14 @@ struct [[nodiscard]] Circular_buffer {
 
     WAL_ASSERT(available <= std::numeric_limits<std::uint16_t>::max());
 
-    const auto data_offset = lsn % m_total_data_size;
+    std::memcpy(m_append_ptr, span.data(), available);
 
-    std::memcpy(m_data_array + data_offset, span.data(), available);
+    const auto lsn = m_hwm;
 
     m_hwm += available;
+    m_append_ptr += available;
+
+    WAL_ASSERT(m_append_ptr <= m_data_array + m_total_data_size);
 
     return Slot { .m_lsn = lsn, .m_len = uint16_t(available) };
   }
@@ -604,6 +607,9 @@ struct [[nodiscard]] Circular_buffer {
   /** Total size of the data in the buffer. */
   const size_t m_total_data_size{};
 
+  /** From where the next write will start. */
+  std::byte *m_append_ptr{};
+
   /** Array of CRC32 values for each block. It points to an offset in m_buffer */
   crc32_t *m_crc32_array{};
 
@@ -649,7 +655,7 @@ struct [[nodiscard]] Log {
    * @param[in] span The span of the data to write.
    * @return The slot that was reserved.
    */
-  [[nodiscard]] Result<Slot> write(std::span<const std::byte> span, util::Thread_pool* thread_pool = nullptr) noexcept;
+  [[nodiscard]] Result<Slot> append(std::span<const std::byte> span, util::Thread_pool* thread_pool = nullptr) noexcept;
   
   [[nodiscard]] bool is_full() const noexcept;
   [[nodiscard]] bool is_empty() const noexcept;

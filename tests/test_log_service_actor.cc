@@ -208,23 +208,11 @@ private:
     }
 
     /* Write batched data to log */
-    auto write_result = m_log->write(std::span<const std::byte>(batched_data), m_io_pool);
+    auto write_result = m_log->append(std::span<const std::byte>(batched_data), m_io_pool);
 
     /* If write fails, retry with back-pressure (like test_log_io_simple.cc) */
     if (!write_result.has_value()) [[unlikely]] {
-      int retries = 0;
-      constexpr int max_retries = 10000;
-
-      while (retries < max_retries && !write_result.has_value()) {
-        util::cpu_pause_n(10);  /* Back off to let I/O catch up */
-        write_result = m_log->write(std::span<const std::byte>(batched_data), m_io_pool);
-        ++retries;
-      }
-
-      /* Still failed after retries - this is a real problem */
-      if (!write_result.has_value()) {
-        log_fatal("Failed to write to log after {} retries", max_retries);
-      }
+      log_fatal("Failed to appendto the log");
     }
     
     /* Track producer latency AFTER successful write to measure true end-to-end latency */
@@ -606,6 +594,7 @@ static double test_throughput_actor_model_single_run(const Test_config& config) 
 
   Log_writer log_writer = [log_file, metrics_ptr, disable_writes = config.m_disable_writes]
     (std::span<struct iovec> span, wal::Log::Sync_type sync_type) -> wal::Result<std::size_t> {
+
     auto result = log_file->write(span);
     
     if (result.has_value() && !disable_writes) {
@@ -936,7 +925,7 @@ static void print_usage(const char* program_name) noexcept {
                "  -p, --producers NUM      Number of producer actors (default: 1)\n"
                "  -c, --consumers NUM       Number of consumer actors (default: 1)\n"
                "  -d, --disable-writes     Disable actual disk writes (default: off)\n"
-               "  -w, --disable-log-writes Disable log->write() calls entirely (default: off)\n"
+               "  -w, --disable-log-writes Disable log->append() calls entirely (default: off)\n"
                "  -S, --skip-memcpy        Skip memcpy in write operation (default: off)\n"
                "  -X, --disable-metrics    Disable metrics collection entirely (default: off)\n"
                "      --no-producer-latency Disable producer latency tracking (most expensive metric)\n"

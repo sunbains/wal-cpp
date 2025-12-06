@@ -60,7 +60,7 @@ static void test_circular_buffer_basic() {
   
   /* Test copy */
   Record data(100, std::byte{'A'});
-  auto copy_result = buffer.copy(std::as_bytes(std::span{data}));
+  auto copy_result = buffer.append(std::as_bytes(std::span{data}));
   auto slot = copy_result.value();
   assert(slot.m_lsn == initial_lsn);
   assert(slot.m_len == 100);
@@ -83,7 +83,7 @@ static void test_circular_buffer_multiple_writes() {
   
   for (size_t i = 0; i < n_records; ++i) {
     Record record(record_size, std::byte{static_cast<unsigned char>('A' + (i % 26))});
-    [[maybe_unused]] auto copy_result = buffer.copy(record);
+    [[maybe_unused]] auto copy_result = buffer.append(record);
 
     WAL_ASSERT(copy_result.has_value());
   }
@@ -115,7 +115,7 @@ static void test_circular_buffer_block_boundary() {
 
   {
     /* Write exactly one data block worth of data */
-    auto result = buffer.copy(Record(data_size, std::byte{'X'}));
+    auto result = buffer.append(Record(data_size, std::byte{'X'}));
     auto slot = result.value();
     WAL_ASSERT(slot.m_lsn == initial_lsn);
     WAL_ASSERT(slot.m_len == data_size);
@@ -126,7 +126,7 @@ static void test_circular_buffer_block_boundary() {
   WAL_ASSERT(buffer.margin() == buffer.get_total_data_size() - data_size);
 
   {
-    auto result = buffer.copy(Record(data_size / 2, std::byte{'Y'}));
+    auto result = buffer.append(Record(data_size / 2, std::byte{'Y'}));
     auto slot = result.value();
     WAL_ASSERT(slot.m_lsn == initial_lsn + data_size);
     WAL_ASSERT(slot.m_len == data_size / 2);
@@ -137,7 +137,7 @@ static void test_circular_buffer_block_boundary() {
   WAL_ASSERT(buffer.margin() == buffer.get_total_data_size() - data_size - data_size / 2);
 
   {
-    auto result = buffer.copy(Record(data_size / 2, std::byte{'Z'}));
+    auto result = buffer.append(Record(data_size / 2, std::byte{'Z'}));
     auto slot = result.value();
     WAL_ASSERT(slot.m_lsn == initial_lsn + data_size + data_size / 2);
     WAL_ASSERT(slot.m_len == data_size / 2);
@@ -159,7 +159,7 @@ static void test_circular_buffer_full() {
   
   size_t written = 0;
   while (!buffer.is_full()) {
-    auto copy_result = buffer.copy(Record(100, std::byte{'F'}));
+    auto copy_result = buffer.append(Record(100, std::byte{'F'}));
     auto slot = copy_result.value();
     WAL_ASSERT(slot.m_lsn == initial_lsn + written);
     WAL_ASSERT(slot.m_len == 100 || slot.m_len == total_size - written);
@@ -189,7 +189,7 @@ static void test_circular_buffer_write_to_store() {
     auto span = std::as_bytes(std::span{record});
 
     for (;;) {
-      auto result = buffer.copy(span);
+      auto result = buffer.append(span);
 
       if (!result.has_value() || result.value().m_len < span.size()) [[unlikely]] {
         WAL_ASSERT(result.has_value() || result.error() == Status::Not_enough_space);
@@ -253,7 +253,7 @@ static void test_circular_buffer_nonzero_initial_lsn() {
   WAL_ASSERT(block_header.get_block_no() == expected_start_block);
 
   /* Write some data */
-  auto reserve_result = buffer.copy(Record(500, std::byte{'Z'}));
+  auto reserve_result = buffer.append(Record(500, std::byte{'Z'}));
   auto slot = reserve_result.value();
   WAL_ASSERT(slot.m_lsn == initial_lsn);
   WAL_ASSERT(slot.m_len == 500);
@@ -298,7 +298,7 @@ static void test_log_write() {
   auto null_writer = [](std::span<struct iovec>, wal::Log::Sync_type) -> wal::Result<size_t> {
     return wal::Result<size_t>(0);
   };
-  auto write_result = log.write(std::as_bytes(std::span{data}));
+  auto write_result = log.append(std::as_bytes(std::span{data}));
   WAL_ASSERT(write_result.has_value());
   auto slot = write_result.value();
   WAL_ASSERT(slot.m_len == 100);
@@ -330,7 +330,7 @@ static void test_log_multiple_writes() {
   constexpr int num_writes = 10;
   for (int i = 0; i < num_writes; ++i) {
     Record data(record_size, std::byte{static_cast<unsigned char>('A' + i)});
-    auto write_result = log.write(data);
+    auto write_result = log.append(data);
     WAL_ASSERT(write_result.has_value());
   }
   
@@ -355,7 +355,7 @@ static void test_circular_buffer_margin_edge_cases() {
 
   {
   /* Test 2: Single byte write */
-    auto result = buffer.copy(Record(1, std::byte{'X'}));
+    auto result = buffer.append(Record(1, std::byte{'X'}));
     auto slot = result.value();
     WAL_ASSERT(slot.m_len == 1);
     WAL_ASSERT(buffer.margin() == total_size - slot.m_len);
@@ -363,14 +363,14 @@ static void test_circular_buffer_margin_edge_cases() {
 
   {
     const auto len = buffer.margin() - 1;
-    auto result = buffer.copy(Record(len, std::byte{'Y'}));
+    auto result = buffer.append(Record(len, std::byte{'Y'}));
     auto slot = result.value();
     WAL_ASSERT(slot.m_len == len);
     WAL_ASSERT(buffer.margin() == 1);
   }
 
   {
-    auto result = buffer.copy(Record(buffer.margin(), std::byte{'Z'}));
+    auto result = buffer.append(Record(buffer.margin(), std::byte{'Z'}));
     auto slot= result.value();
     WAL_ASSERT(slot.m_len == 1);
     WAL_ASSERT(buffer.is_full());
@@ -404,7 +404,7 @@ static void test_circular_buffer_write_performance() {
   auto start = std::chrono::steady_clock::now();
 
   for (std::size_t i = 0; i < num_messages; ++i) {
-    auto result = buffer.copy(Record(message_size, std::byte{'A'}));
+    auto result = buffer.append(Record(message_size, std::byte{'A'}));
     WAL_ASSERT(result.has_value());
     WAL_ASSERT(result.value().m_len == message_size);
   }
@@ -448,7 +448,7 @@ static void test_log_write_performance() {
   std::chrono::nanoseconds total_flush_time{};
 
   for (std::size_t i = 0; i < num_messages; ++i) {
-    auto result = log.write(span);
+    auto result = log.append(span);
 
     if (result.has_value()) {
       ++successful_writes;
@@ -467,7 +467,7 @@ static void test_log_write_performance() {
         assert(false);
       }
 
-      result = log.write(span);
+      result = log.append(span);
 
       if (!result.has_value()) {
         std::println("Write failed after flush at message {}", i);

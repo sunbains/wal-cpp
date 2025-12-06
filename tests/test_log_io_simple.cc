@@ -53,26 +53,10 @@ void producer(
   for (std::size_t i = 0; i < num_messages; ++i) {
     /* Write directly to log - I/O coroutine handles buffer processing in background */
     /* For raw Log/IO performance test, we don't use the lambda - let I/O coroutine handle it */
-    auto write_result = log->write(msg.get_span(), pool);
+    auto write_result = log->append(msg.get_span(), pool);
 
-    if (!write_result.has_value()) [[unlikely]] {
-      /* Write failed - buffer full, I/O coroutine should free buffers but might not be fast enough */
-      /* Retry with a brief pause to let I/O catch up */
-      constexpr int max_retries = 10000;
-      int retries = 0;
-      while (retries < max_retries && !write_result.has_value()) {
-        util::cpu_pause_n(10);
-        write_result = log->write(msg.get_span(), pool);
-        ++retries;
-      }
-      
-      if (!write_result.has_value()) {
-        /* Still failed after retries - I/O is not keeping up */
-        break;
-      }
-    }
+    WAL_ASSERT(write_result.has_value());
   }
-
   /* Signal producer completion */
   producer_done.store(true, std::memory_order_release);
 }
