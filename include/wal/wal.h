@@ -326,7 +326,7 @@ public:
   }
 };
 
-struct [[nodiscard]] Circular_buffer {
+struct [[nodiscard]] Buffer {
   using IO_vecs = std::vector<struct iovec>;
 
   struct [[nodiscard]] Config {
@@ -382,12 +382,12 @@ struct [[nodiscard]] Circular_buffer {
 
   using Block = std::tuple<Block_header*, std::span<const std::byte>, crc32_t*>;
 
-  explicit Circular_buffer(const Config& config) noexcept;
+  explicit Buffer(const Config& config) noexcept;
 
-  Circular_buffer(lsn_t hwm, const Config& config) noexcept;
+  Buffer(lsn_t hwm, const Config& config) noexcept;
 
   /* Move constructor - recalculates pointers after moving m_buffer */
-  Circular_buffer(Circular_buffer&& other) noexcept
+  Buffer(Buffer&& other) noexcept
     : m_lwm(other.m_lwm),
       m_hwm(other.m_hwm),
       m_config(other.m_config),
@@ -412,9 +412,9 @@ struct [[nodiscard]] Circular_buffer {
   }
 
   /* Move assignment is deleted because m_config and m_total_data_size are const */
-  Circular_buffer& operator=(Circular_buffer&&) = delete;
+  Buffer& operator=(Buffer&&) = delete;
 
-  ~Circular_buffer() noexcept;
+  ~Buffer() noexcept;
 
   /**
    * Initialize the circular buffer.
@@ -458,7 +458,7 @@ struct [[nodiscard]] Circular_buffer {
   }
 
   [[nodiscard]] crc32_t &get_crc32(std::size_t block_index) noexcept {
-    return const_cast<crc32_t&>(const_cast<const Circular_buffer*>(this)->get_crc32(block_index));
+    return const_cast<crc32_t&>(const_cast<const Buffer*>(this)->get_crc32(block_index));
   }
 
   [[nodiscard]] Block get_block(std::size_t block_index) noexcept {
@@ -635,19 +635,19 @@ struct [[nodiscard]] Circular_buffer {
 struct [[nodiscard]] Log {
   using Sync_type = wal::Sync_type;  /* Alias to namespace-level Sync_type */
 
-  using Config = Circular_buffer::Config;
-  using Slot = Circular_buffer::Slot;
-  using IO_vecs = Circular_buffer::IO_vecs;
-  using Write_callback = Circular_buffer::Write_callback;
+  using Config = Buffer::Config;
+  using Slot = Buffer::Slot;
+  using IO_vecs = Buffer::IO_vecs;
+  using Write_callback = Buffer::Write_callback;
 
   /**
    * Constructor.
    *
    * @param[in]  lsn The LSN to start the log from.
-   * @param[in]  pool_size The size of the pool to use for the Circular_buffers.
+   * @param[in]  pool_size The size of the pool to use for the Buffers.
    * @param[in]  config The configuration for the circular buffer.
    */
-  Log(lsn_t lsn, size_t pool_size, const Circular_buffer::Config &config);
+  Log(lsn_t lsn, size_t pool_size, const Buffer::Config &config);
 
   ~Log() noexcept;
 
@@ -719,7 +719,7 @@ struct [[nodiscard]] Log {
   Write_callback m_write_callback{};
   
   /** I/O adapter callback - orchestrates buffer writes with sync handling. */
-  std::function<Result<lsn_t>(Circular_buffer&)> m_io_callback{};
+  std::function<Result<lsn_t>(Buffer&)> m_io_callback{};
 
   /** We have synced up to this LSN. */
   std::atomic<lsn_t> m_flushed_lsn{0};

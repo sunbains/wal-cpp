@@ -14,7 +14,7 @@
 
 namespace wal {
 
- Circular_buffer::Circular_buffer(lsn_t hwm, const Config& config) noexcept
+ Buffer::Buffer(lsn_t hwm, const Config& config) noexcept
   : m_config(config),
     m_total_data_size(m_config.get_data_size_in_block() * m_config.m_n_blocks),
     m_checksum(m_config.m_checksum_algorithm) {
@@ -40,9 +40,9 @@ namespace wal {
   initialize(hwm);
 }
 
- Circular_buffer::~Circular_buffer() noexcept {}
+ Buffer::~Buffer() noexcept {}
 
-void Circular_buffer::initialize(lsn_t hwm) noexcept {
+void Buffer::initialize(lsn_t hwm) noexcept {
   m_hwm = hwm;
   m_lwm = hwm;
 
@@ -68,16 +68,16 @@ void Circular_buffer::initialize(lsn_t hwm) noexcept {
 
 /* write_to_store implementation is now in the header file as an inline function */
 
-Circular_buffer::Circular_buffer(const Config& config) noexcept
-  : Circular_buffer(0, config) {}
+Buffer::Buffer(const Config& config) noexcept
+  : Buffer(0, config) {}
 
-std::string Circular_buffer::to_string() const noexcept {
+std::string Buffer::to_string() const noexcept {
   return std::format(
-    "Circular_buffer: lwm={}, hwm={}, margin={}, total_size={}",
+    "Buffer: lwm={}, hwm={}, margin={}, total_size={}",
     m_lwm, m_hwm, margin(), get_total_data_size());
 }
 
-void Circular_buffer::clear(lsn_t start_lsn, lsn_t end_lsn) noexcept {
+void Buffer::clear(lsn_t start_lsn, lsn_t end_lsn) noexcept {
   WAL_ASSERT(start_lsn <= end_lsn);
   WAL_ASSERT(end_lsn <= m_hwm);
 
@@ -120,7 +120,7 @@ void Circular_buffer::clear(lsn_t start_lsn, lsn_t end_lsn) noexcept {
 
 namespace {
 
-std::size_t prepare_batch(Circular_buffer& buffer, block_no_t start, block_no_t end, std::size_t batch_size) noexcept {
+std::size_t prepare_batch(Buffer& buffer, block_no_t start, block_no_t end, std::size_t batch_size) noexcept {
   const auto n_slots = batch_size * 3;
   const auto data_size = buffer.m_config.get_data_size_in_block();
 
@@ -176,7 +176,7 @@ std::size_t prepare_batch(Circular_buffer& buffer, block_no_t start, block_no_t 
 
 } // anonymous namespace
 
-Result<lsn_t> Circular_buffer::write_to_store(Write_callback callback, lsn_t max_write_lsn) noexcept {
+Result<lsn_t> Buffer::write_to_store(Write_callback callback, lsn_t max_write_lsn) noexcept {
   WAL_ASSERT(!is_empty());
   WAL_ASSERT(is_write_pending());
 
@@ -315,7 +315,7 @@ Result<lsn_t> Circular_buffer::write_to_store(Write_callback callback, lsn_t max
   return Result<lsn_t>(m_lwm);
 }
 
-Result<lsn_t> Circular_buffer::read_from_store(lsn_t, Read_callback) noexcept {
+Result<lsn_t> Buffer::read_from_store(lsn_t, Read_callback) noexcept {
   // TODO: Implement this
   assert(false);
 
@@ -329,7 +329,7 @@ Result<lsn_t> Circular_buffer::read_from_store(lsn_t, Read_callback) noexcept {
   return Result<lsn_t>(0);
  }
 
- Log::Log(lsn_t lsn, size_t pool_size, const Circular_buffer::Config &config)
+ Log::Log(lsn_t lsn, size_t pool_size, const Buffer::Config &config)
   : m_pool(std::make_unique<Pool>(pool_size, config, lsn)) {}
 
  Log::~Log() noexcept {
@@ -348,7 +348,7 @@ Result<bool> Log::shutdown(Write_callback callback) noexcept {
   m_pool->stop_io_coroutine();
 
   /* Process any remaining buffers synchronously */
-  auto adapter = [callback](Circular_buffer& buffer) -> Result<bool> {
+  auto adapter = [callback](Buffer& buffer) -> Result<bool> {
    return  buffer.write_to_store(callback);
   };
 
@@ -388,10 +388,10 @@ void Log::start_io(Write_callback callback, util::Thread_pool* thread_pool) noex
   m_pool->m_sync_write_callback = callback;
 
   /* Create an adapter that converts Write_callback (takes span<iovec> and sync_type)
-   * to a function that takes Circular_buffer& and returns Task<Result<lsn_t>>.
+   * to a function that takes Buffer& and returns Task<Result<lsn_t>>.
    * Tasks are posted directly by consumer, no background coroutine needed.
    * The adapter checks for pending sync requests and passes them to the callback */
-  auto adapter = [this](Circular_buffer& buffer) -> Result<lsn_t> {
+  auto adapter = [this](Buffer& buffer) -> Result<lsn_t> {
 
     /* Create a wrapper callback that passes the sync type */
     auto wrapped_callback = [this](std::span<struct iovec> span, Sync_type) -> Result<lsn_t> {
@@ -411,8 +411,8 @@ void Log::start_io(Write_callback callback, util::Thread_pool* thread_pool) noex
 Result<bool> Log::write_to_store(Write_callback callback) noexcept {
   
   /* Create an adapter that converts Write_callback (takes span<iovec> and sync_type)
-   * to a function that takes Circular_buffer& and Thread_pool* and returns Task<Result<bool>> */
-  auto adapter = [callback](Circular_buffer& buffer) -> Result<bool> {
+   * to a function that takes Buffer& and Thread_pool* and returns Task<Result<bool>> */
+  auto adapter = [callback](Buffer& buffer) -> Result<bool> {
     /* Create a wrapper callback that passes the sync type */
     auto wrapped_callback = [callback](std::span<struct iovec> span, Log::Sync_type) -> Result<lsn_t> {
       return callback(span, Sync_type::None);

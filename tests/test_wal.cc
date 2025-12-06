@@ -17,14 +17,14 @@ using wal::lsn_t;
 using wal::Log;
 using wal::Status;
 using wal::block_no_t;
-using wal::Circular_buffer;
-using Slot = Circular_buffer::Slot;
+using wal::Buffer;
+using Slot = Buffer::Slot;
 using Record = std::vector<std::byte>;
 
 util::Logger<util::MT_logger_writer> g_logger(util::MT_logger_writer{std::cerr}, util::Log_level::Trace);
 
 /* Physical write function that simulates writing to storage without actually doing I/O.
- * This is called by Circular_buffer::write_to_store as the Write_callback.
+ * This is called by Buffer::write_to_store as the Write_callback.
  * Returns the number of bytes that would have been written. */
 static wal::Result<std::size_t> null_writer(std::span<struct iovec> span, wal::Log::Sync_type) {
   WAL_ASSERT(span.size() > 0);
@@ -35,14 +35,14 @@ static wal::Result<std::size_t> null_writer(std::span<struct iovec> span, wal::L
 
 /* Helper to call write_to_store synchronously in tests */
 /* Pass nullptr to pool to execute I/O synchronously on the same thread */
-static wal::Result<wal::lsn_t> write_to_store(Circular_buffer& buffer, lsn_t max_write_lsn = 0) {
+static wal::Result<wal::lsn_t> write_to_store(Buffer& buffer, lsn_t max_write_lsn = 0) {
   return buffer.write_to_store([](std::span<struct iovec> span, wal::Log::Sync_type) -> wal::Result<wal::lsn_t> {
     return null_writer(span, wal::Log::Sync_type::None);
   }, max_write_lsn);
 }
 
 /* Helper to call shutdown synchronously in tests - unused but kept for API compatibility */
-[[maybe_unused]] static wal::Result<bool> shutdown(Log& log, Circular_buffer::Write_callback callback) {
+[[maybe_unused]] static wal::Result<bool> shutdown(Log& log, Buffer::Write_callback callback) {
   return log.shutdown(callback);
 }
 
@@ -50,8 +50,8 @@ static void test_circular_buffer_basic() {
   std::println("[test_circular_buffer_basic] start");
   
   constexpr lsn_t initial_lsn = 0;
-  Circular_buffer::Config config(2, 512);
-  Circular_buffer buffer(initial_lsn, config);
+  Buffer::Config config(2, 512);
+  Buffer buffer(initial_lsn, config);
   
   /* Verify initial state */
   assert(buffer.is_empty());
@@ -77,8 +77,8 @@ static void test_circular_buffer_multiple_writes() {
   
   constexpr lsn_t initial_lsn = 0;
   constexpr size_t record_size = 64;  
-  Circular_buffer::Config config(2, 512);
-  Circular_buffer buffer(initial_lsn, config);
+  Buffer::Config config(2, 512);
+  Buffer buffer(initial_lsn, config);
   const size_t n_records = (buffer.get_total_data_size() / record_size) + 1;
   
   for (size_t i = 0; i < n_records; ++i) {
@@ -109,8 +109,8 @@ static void test_circular_buffer_block_boundary() {
   std::println("[test_circular_buffer_block_boundary] start");
   
   constexpr lsn_t initial_lsn = 0;
-  Circular_buffer::Config config(2, 512);
-  Circular_buffer buffer(initial_lsn, config);
+  Buffer::Config config(2, 512);
+  Buffer buffer(initial_lsn, config);
   const auto data_size = buffer.get_data_size_in_block();
 
   {
@@ -153,8 +153,8 @@ static void test_circular_buffer_full() {
   std::println("[test_circular_buffer_full] start");
   
   constexpr lsn_t initial_lsn = 0;
-  Circular_buffer::Config config(2, 512);
-  Circular_buffer buffer(initial_lsn, config);
+  Buffer::Config config(2, 512);
+  Buffer buffer(initial_lsn, config);
   const auto total_size = buffer.get_total_data_size();
   
   size_t written = 0;
@@ -180,8 +180,8 @@ static void test_circular_buffer_write_to_store() {
   std::println("[test_circular_buffer_write_to_store] start");
   
   const lsn_t initial_lsn = 0;
-  Circular_buffer::Config config(2, 512);
-  Circular_buffer buffer(initial_lsn, config);
+  Buffer::Config config(2, 512);
+  Buffer buffer(initial_lsn, config);
   Record record(config.m_block_size, std::byte{'F'});
 
   std::size_t n_bytes_copied = 0;
@@ -243,9 +243,9 @@ static void test_circular_buffer_nonzero_initial_lsn() {
   std::println("[test_circular_buffer_nonzero_initial_lsn] start");
 
   constexpr lsn_t initial_lsn = 1000000;
-  Circular_buffer::Config config(4, 512);
+  Buffer::Config config(4, 512);
   using Record = std::vector<std::byte>;
-  Circular_buffer buffer(initial_lsn, config);
+  Buffer buffer(initial_lsn, config);
   const auto data_size = buffer.get_data_size_in_block();
   const auto expected_start_block = initial_lsn / data_size;
   auto block_header = buffer.get_block_header(expected_start_block % config.m_n_blocks);
@@ -347,8 +347,8 @@ static void test_circular_buffer_margin_edge_cases() {
   std::println("[test_circular_buffer_margin_edge_cases] start");
 
   constexpr lsn_t initial_lsn = 0;
-  Circular_buffer::Config config(4, 512);
-  Circular_buffer buffer(initial_lsn, config);
+  Buffer::Config config(4, 512);
+  Buffer buffer(initial_lsn, config);
   const auto total_size = buffer.get_total_data_size();
 
   WAL_ASSERT(buffer.margin() == total_size);
@@ -393,12 +393,12 @@ static void test_circular_buffer_write_performance() {
   constexpr std::size_t block_size = 4096;
   constexpr std::size_t buffer_blocks = 16384;
 
-  Circular_buffer::Config config(buffer_blocks, block_size);
+  Buffer::Config config(buffer_blocks, block_size);
 
   const auto data_size = config.get_data_size_in_block();
   const std::size_t num_messages = ((data_size * buffer_blocks) / (100'000 * message_size)) * 100'000;
 
-  Circular_buffer buffer(0, config);
+  Buffer buffer(0, config);
 
   std::vector<std::byte> msg(message_size, std::byte{0x42});
   auto start = std::chrono::steady_clock::now();

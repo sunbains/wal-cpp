@@ -17,10 +17,10 @@ extern util::Logger<util::MT_logger_writer> g_logger;
 
 namespace wal {
 
-using Config = Circular_buffer::Config;
+using Config = Buffer::Config;
 
 /**
- * Manages a pool of Circular_buffer instances for concurrent I/O operations.
+ * Manages a pool of Buffer instances for concurrent I/O operations.
  * 
  * When a buffer becomes full, it's moved to an I/O queue for async writing,
  * and operations continue on the next available buffer from the pool.
@@ -38,7 +38,7 @@ struct Pool {
      * 
      * @param[in] buffer The buffer to store the data.
      */
-    explicit Entry(Circular_buffer &&buffer, State state)
+    explicit Entry(Buffer &&buffer, State state)
       : m_buffer(std::move(buffer)),
         m_state(state) {}
     
@@ -64,7 +64,7 @@ struct Pool {
       return std::format("Entry: buffer: {}, state: {}", m_buffer.to_string(), get_state(m_state));
     }
 
-    Circular_buffer m_buffer;
+    Buffer m_buffer;
 
     /** For debugging purposes. */
     std::atomic<State> m_state{State::Free};
@@ -93,7 +93,7 @@ struct Pool {
     m_buffers.reserve(pool_size);
 
     for (std::size_t i = 0; i < pool_size; ++i) {
-      m_buffers.emplace_back(std::make_unique<Entry>(Circular_buffer(config), Entry::State::Free));
+      m_buffers.emplace_back(std::make_unique<Entry>(Buffer(config), Entry::State::Free));
       if (!m_free_buffers.enqueue(m_buffers.back().get())) {
         std::terminate();
       }
@@ -233,7 +233,7 @@ struct Pool {
   /**
    * Write data to storage using Tasks.
    *
-   * @param[in] callback The callback function to write the data. Takes Circular_buffer& and Thread_pool* and returns Task<Result<bool>>.
+   * @param[in] callback The callback function to write the data. Takes Buffer& and Thread_pool* and returns Task<Result<bool>>.
    * @param[in] pool Thread pool for executing I/O operations.
    * @return result of the write operation.
    */
