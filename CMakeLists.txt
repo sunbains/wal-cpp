@@ -47,17 +47,9 @@ if(NOT MSVC)
 endif()
 
 # ----------------------------- Platform feature checks -----------------------
-# Check for pthread functions used in performance tests
+# Check for __atomic builtin support (GCC/Clang)
 include(CheckCXXSourceCompiles)
 if(NOT MSVC)
-  # Save original required libraries
-  set(CMAKE_REQUIRED_LIBRARIES_SAVE ${CMAKE_REQUIRED_LIBRARIES})
-  
-  # Restore original required libraries
-  set(CMAKE_REQUIRED_LIBRARIES ${CMAKE_REQUIRED_LIBRARIES_SAVE})
-  unset(CMAKE_REQUIRED_LIBRARIES_SAVE)
-  
-  # Check for __atomic builtin support (GCC/Clang)
   check_cxx_source_compiles("
     #include <cstddef>
     int main() {
@@ -124,17 +116,23 @@ if(WAL_BUILD_LIB OR WAL_BUILD_TESTS)
     )
     set(WAL_COMPILE_OPTIONS_MSVC
       ${WAL_COMPILE_OPTIONS_BASE_MSVC}
+      # Debug: no optimization
+      $<$<CONFIG:Debug>:/Zi /Od>
       # Maximum safe optimization for Release builds
       $<$<CONFIG:Release>:/O2 /Ob2 /Oi /Ot /GL>
       $<$<CONFIG:RelWithDebInfo>:/O2 /Ob1 /Oi /Ot>
     )
     target_compile_options(wal PRIVATE ${WAL_COMPILE_OPTIONS_MSVC})
-    # Test-specific flags for MSVC
+    # Test-specific flags for MSVC (respect build type)
     set(WAL_TEST_COMPILE_OPTIONS_DEBUG_MSVC
-      ${WAL_COMPILE_OPTIONS_BASE_MSVC} /Zi /Od
+      ${WAL_COMPILE_OPTIONS_BASE_MSVC} /Zi
+      $<$<CONFIG:Debug>:/Od>
+      $<$<NOT:$<CONFIG:Debug>>:/O2>
     )
     set(WAL_TEST_COMPILE_OPTIONS_PERF_MSVC
-      ${WAL_COMPILE_OPTIONS_BASE_MSVC} /Zi /O2
+      ${WAL_COMPILE_OPTIONS_BASE_MSVC} /Zi
+      $<$<CONFIG:Debug>:/Od>
+      $<$<NOT:$<CONFIG:Debug>>:/O2>
     )
   else()
     set(WAL_COMPILE_OPTIONS_BASE_GCC_CLANG
@@ -152,18 +150,21 @@ if(WAL_BUILD_LIB OR WAL_BUILD_TESTS)
     )
     target_compile_options(wal PRIVATE ${WAL_COMPILE_OPTIONS_GCC_CLANG})
 
-    # Test-specific flags for GCC/Clang
+    # Test-specific flags for GCC/Clang (respect build type: -O0 for Debug, -O3 for others)
     set(WAL_TEST_COMPILE_OPTIONS_DEBUG_GCC_CLANG
-      ${WAL_COMPILE_OPTIONS_BASE_GCC_CLANG} -ggdb3 -O0 -fno-omit-frame-pointer
-    )
-    set(WAL_TEST_COMPILE_OPTIONS_PERF_GCC_CLANG
-      ${WAL_COMPILE_OPTIONS_BASE_GCC_CLANG} -O0 -ggdb3 -fno-omit-frame-pointer
+      ${WAL_COMPILE_OPTIONS_BASE_GCC_CLANG} -ggdb3 -fno-omit-frame-pointer
+      $<$<CONFIG:Debug>:-O0>
+      $<$<NOT:$<CONFIG:Debug>>:-O3>
     )
     set(WAL_TEST_COMPILE_OPTIONS_PERF_LTO_GCC_CLANG
-      ${WAL_COMPILE_OPTIONS_BASE_GCC_CLANG} -O0 -ggdb3 -flto -march=native -mtune=native -fno-omit-frame-pointer
+      ${WAL_COMPILE_OPTIONS_BASE_GCC_CLANG} -ggdb3 -fno-omit-frame-pointer
+      $<$<CONFIG:Debug>:-O0>
+      $<$<NOT:$<CONFIG:Debug>>:-O3 -flto -march=native -mtune=native>
     )
     set(WAL_TEST_COMPILE_OPTIONS_CORO_GCC_CLANG
-      ${WAL_COMPILE_OPTIONS_BASE_GCC_CLANG} -O0 -ggdb3 -fno-omit-frame-pointer
+      ${WAL_COMPILE_OPTIONS_BASE_GCC_CLANG} -ggdb3 -fno-omit-frame-pointer
+      $<$<CONFIG:Debug>:-O0>
+      $<$<NOT:$<CONFIG:Debug>>:-O3>
     )
   endif()
 
