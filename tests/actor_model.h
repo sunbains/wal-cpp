@@ -93,10 +93,16 @@ template<typename PayloadType>
 struct Thread_mailbox {
   explicit Thread_mailbox(std::size_t capacity)
     : m_queue(capacity), m_has_messages(false) {}
+  using Queue_type = util::Spsc_bounded_queue<Process<PayloadType>*>;
 
-  util::Bounded_queue<Process<PayloadType>*> m_queue;
+  Queue_type m_queue;
   /* Atomic flag to indicate if this mailbox has messages (reduces scanning overhead) */
   alignas(64) std::atomic<bool> m_has_messages{false};
+
+  Queue_type& queue() { return m_queue; }
+  const Queue_type& queue() const { return m_queue; }
+  bool has_messages() const { return m_has_messages.load(std::memory_order_acquire); }
+  void set_has_messages(bool value) { m_has_messages.store(value, std::memory_order_release); }
 };
 
 /**

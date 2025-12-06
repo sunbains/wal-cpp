@@ -160,15 +160,12 @@ struct Log_message_processor {
   }
 
   void write_and_fdatasync() {
-    /* Flush any pending buffers and trigger fdatasync */
     if (m_log && m_io_pool && m_log->m_write_callback) {
       if (m_log->m_pool && m_log->m_pool->m_active && !m_log->m_pool->m_active->m_buffer.is_empty()) {
         m_log->m_pool->prepare_buffer_for_io(m_log->m_pool->m_active, *m_io_pool, m_log->m_write_callback);
       }
       
-      /* Process any ready-for-io buffers with fdatasync */
       auto sync_callback = [this](std::span<struct iovec> span, wal::Log::Sync_type) -> wal::Result<std::size_t> {
-        /* Always call with Fdatasync sync type */
         return m_log->m_write_callback(span, wal::Log::Sync_type::Fdatasync);
       };
 
