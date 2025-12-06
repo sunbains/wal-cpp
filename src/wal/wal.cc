@@ -118,6 +118,7 @@ void Buffer::clear(lsn_t start_lsn, lsn_t end_lsn) noexcept {
   }
 
   WAL_ASSERT(n_bytes_to_clear == 0);
+  (void)n_bytes_to_clear;  // Silence clang-tidy warning in release builds where assert is disabled
 }
 
 namespace {

@@ -175,10 +175,7 @@ struct Log_message_processor {
       [[maybe_unused]] auto result = m_log->write_to_store(sync_callback);
       WAL_ASSERT(result.has_value());
       
-      /* Also write the active buffer directly with fdatasync if it has data */
-      if (m_log->m_pool && m_log->m_pool->m_active && 
-          !m_log->m_pool->m_active->m_buffer.is_empty() &&
-          m_log->m_pool->m_active->m_buffer.is_write_pending()) {
+      if (m_log->m_pool && m_log->m_pool->m_active && !m_log->m_pool->m_active->m_buffer.is_empty() && m_log->m_pool->m_active->m_buffer.is_write_pending()) {
         auto active_sync_callback = [this](std::span<struct iovec> span, wal::Log::Sync_type) -> wal::Result<std::size_t> {
           return m_log->m_write_callback(span, wal::Log::Sync_type::Fdatasync);
         };
@@ -187,7 +184,6 @@ struct Log_message_processor {
         WAL_ASSERT(active_result.has_value());
       }
       
-      /* If no data was written but we still need to sync, call fdatasync directly */
       if (m_log_file && m_log_file->m_fd != -1 && m_metrics) {
         auto sync_start = Clock::now();
         if (::fdatasync(m_log_file->m_fd) == 0) {
@@ -201,27 +197,19 @@ struct Log_message_processor {
   }
 
   void write_and_fsync() {
-    /* Flush any pending buffers and trigger fsync */
     if (m_log && m_io_pool && m_log->m_write_callback) {
-      /* First, ensure the active buffer is flushed if it has data */
-      if (m_log->m_pool && m_log->m_pool->m_active && 
-          !m_log->m_pool->m_active->m_buffer.is_empty()) {
+      if (m_log->m_pool && m_log->m_pool->m_active && !m_log->m_pool->m_active->m_buffer.is_empty()) {
         m_log->m_pool->prepare_buffer_for_io(m_log->m_pool->m_active, *m_io_pool, m_log->m_write_callback);
       }
       
-      /* Process any ready-for-io buffers with fsync */
       auto sync_callback = [this](std::span<struct iovec> span, wal::Log::Sync_type) -> wal::Result<std::size_t> {
-        /* Always call with Fsync sync type */
         return m_log->m_write_callback(span, wal::Log::Sync_type::Fsync);
       };
 
       [[maybe_unused]] auto result = m_log->write_to_store(sync_callback);
       WAL_ASSERT(result.has_value());
       
-      /* Also write the active buffer directly with fsync if it has data */
-      if (m_log->m_pool && m_log->m_pool->m_active && 
-          !m_log->m_pool->m_active->m_buffer.is_empty() &&
-          m_log->m_pool->m_active->m_buffer.is_write_pending()) {
+      if (m_log->m_pool && m_log->m_pool->m_active && !m_log->m_pool->m_active->m_buffer.is_empty() && m_log->m_pool->m_active->m_buffer.is_write_pending()) {
         auto active_sync_callback = [this](std::span<struct iovec> span, wal::Log::Sync_type) -> wal::Result<std::size_t> {
           return m_log->m_write_callback(span, wal::Log::Sync_type::Fsync);
         };
@@ -230,7 +218,6 @@ struct Log_message_processor {
         WAL_ASSERT(active_result.has_value());
       }
       
-      /* If no data was written but we still need to sync, call fsync directly */
       if (m_log_file && m_log_file->m_fd != -1 && m_metrics) {
         auto sync_start = Clock::now();
         if (::fsync(m_log_file->m_fd) == 0) {
@@ -341,14 +328,7 @@ Task<void> consumer_actor(
   constexpr std::size_t bulk_read_size = 64;
   std::array<std::size_t, bulk_read_size> notification_buffer;
  
-  /* Timer for batch flushing */
-  auto last_flush_time = std::chrono::steady_clock::now();
- 
   while (completed_producers < ctx.m_num_producers) {
-    /* Check timer and flush batch if expired */
-    auto now = std::chrono::steady_clock::now();
-    auto time_since_flush = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_flush_time);
-    /* Timer-based flushing removed - we write directly now, no batching */
  
     /* Check for poison pills in consumer mailbox (if provided) */
     if (ctx.m_consumer_process != nullptr) {
@@ -736,8 +716,7 @@ static double test_throughput_actor_model_single_run(const Test_config& config) 
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
   if (!config.m_disable_log_writes) {
-    auto shutdown_result = log->shutdown(log_writer);
-    WAL_ASSERT(shutdown_result.has_value());
+    WAL_ASSERT(log->shutdown(log_writer).has_value());
     
     /* Clear the I/O callback to break circular reference before log goes out of scope */
     /* The callback lambda captures metrics_ptr, but Log also stores it, creating a cycle */
