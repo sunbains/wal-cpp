@@ -256,16 +256,19 @@ Result<lsn_t> Buffer::write_to_store(Write_callback callback, lsn_t max_write_ls
       const auto io_duration = std::chrono::duration_cast<std::chrono::nanoseconds>(io_end - io_start);
 
       m_metrics->add_timing(util::MetricType::WriteToStoreIoCallback, io_duration);
-      m_metrics->add_io_size(data_len);
+      /* Record only payload bytes for I/O size metrics (exclude header + CRC). */
+      m_metrics->add_io_size(data_len - old_data_len);
     }
 
     if (!io_result.has_value()) {
       return std::unexpected(io_result.error());
     }
 
+    /* Metrics should reflect payload bytes, not physical bytes (headers + CRC). */
     data_len -= old_data_len;
     old_data_len = 0;
-    total_bytes_written += data_len;
+    const auto payload_bytes_written = data_len;
+    total_bytes_written += payload_bytes_written;
 
     WAL_ASSERT(io_result.value() % data_size == 0);
 

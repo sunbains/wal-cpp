@@ -716,6 +716,18 @@ static double test_throughput_actor_model_single_run(const Test_config& config) 
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
   if (!config.m_disable_log_writes) {
+    /* Flush any remaining data in the active buffer before shutdown.
+     * The actor test typically issues fdatasync/fsync operations to drive writes,
+     * but when no sync messages are sent we may finish with a partially filled
+     * buffer that never got submitted to the I/O queue. Preparing it here ensures
+     * write_to_store processes the final partial buffer and metrics reflect all
+     * bytes produced. */
+    if (log->m_pool != nullptr &&
+        log->m_pool->m_active != nullptr &&
+        !log->m_pool->m_active->m_buffer.is_empty()) {
+      log->m_pool->prepare_buffer_for_io(log->m_pool->m_active, service_setup.m_io_pool, log->m_write_callback);
+    }
+
     WAL_ASSERT(log->shutdown(log_writer).has_value());
     
     /* Clear the I/O callback to break circular reference before log goes out of scope */
@@ -995,4 +1007,3 @@ int main(int argc, char** argv) {
   test_throughput_actor_model(config);
   return EXIT_SUCCESS;
 }
-
