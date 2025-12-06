@@ -50,9 +50,9 @@ struct Capturing_writer {
 };
 
 static void test_all_levels() {
-  std::println(stderr, "[test_all_levels] start");
   Capturing_writer writer;
   auto g_logger = util::make_logger(std::ref(writer), Log_level::Trace);
+  log_info("[test_all_levels] start");
 
   log_trace("trace message {}", 1);
   log_debug("debug message {}", 2);
@@ -77,13 +77,13 @@ static void test_all_levels() {
   assert(writer.contains("warn message 4"));
   assert(writer.contains("error message 5"));
 
-  std::println(stderr, "[test_all_levels] done");
+  log_info( "[test_all_levels] done");
 }
 
 static void test_level_filtering() {
-  std::println(stderr, "[test_level_filtering] start");
   Capturing_writer writer;
   auto g_logger = util::make_logger(std::ref(writer), Log_level::Warn);
+  log_info("[test_level_filtering] start");
 
   /* These should be filtered out */
   log_trace("trace message");
@@ -114,13 +114,13 @@ static void test_level_filtering() {
   assert(writer.contains("ERRR"));
   assert(!writer.contains("WRN"));
 
-  std::println(stderr, "[test_level_filtering] done");
+  log_info( "[test_level_filtering] done");
 }
 
 static void test_message_format() {
-  std::println(stderr, "[test_message_format] start");
   Capturing_writer writer;
   auto g_logger = util::make_logger(std::ref(writer), Log_level::Info);
+  log_info("[test_message_format] start");
 
   log_info("test message {}", 42);
 
@@ -137,13 +137,13 @@ static void test_message_format() {
   assert(msg.find("test message 42") != std::string::npos);
   assert(msg.back() == '\n');
 
-  std::println(stderr, "[test_message_format] done");
+  log_info( "[test_message_format] done");
 }
 
 static void test_multi_threaded_writes() {
-  std::println(stderr, "[test_multi_threaded_writes] start");
   Capturing_writer writer;
   auto g_logger = util::make_logger(std::ref(writer), Log_level::Debug);
+  log_info("[test_multi_threaded_writes] start");
 
   constexpr int num_threads = 8;
   constexpr int messages_per_thread = 100;
@@ -198,13 +198,13 @@ static void test_multi_threaded_writes() {
     assert(writer.contains(std::format("message {}", i)));
   }
 
-  std::println(stderr, "[test_multi_threaded_writes] done (captured {} messages)", actual_messages);
+  log_info( "[test_multi_threaded_writes] done (captured {} messages)", actual_messages);
 }
 
 static void test_concurrent_level_changes() {
-  std::println(stderr, "[test_concurrent_level_changes] start");
   Capturing_writer writer;
   auto g_logger = util::make_logger(std::ref(writer), Log_level::Info);
+  log_info("[test_concurrent_level_changes] start");
 
   constexpr int num_threads = 4;
   std::atomic<bool> done{false};
@@ -245,7 +245,7 @@ static void test_concurrent_level_changes() {
   assert(writer.count() > 0);
   assert(messages_logged.load() > 0);
 
-  std::println(stderr, "[test_concurrent_level_changes] done ({} messages)", 
+  log_info( "[test_concurrent_level_changes] done ({} messages)", 
                messages_logged.load());
 }
 

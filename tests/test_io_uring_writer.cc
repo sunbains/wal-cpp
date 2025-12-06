@@ -10,7 +10,6 @@
 #include <sys/uio.h>
 #include <fcntl.h>
 #include <span>
-#include <print>
 #include <memory>
 #include <bit>
 #include <algorithm>
@@ -44,19 +43,19 @@ struct Test_config {
  * Test basic write functionality
  */
 static void test_basic_write(const Test_config& config) {
-  std::println("[test_basic_write] Testing basic io_uring write operations");
+  log_info("[test_basic_write] Testing basic io_uring write operations");
 
   std::string path = config.m_disable_writes ? "/dev/null" : "/tmp/test_io_uring_basic.log";
   int fd = ::open(path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
   if (fd < 0) {
-    std::println(stderr, "Failed to open test file: {}", std::strerror(errno));
+    log_info( "Failed to open test file: {}", std::strerror(errno));
     std::abort();
   }
 
   if (!config.m_disable_writes) {
     auto ret = ::posix_fallocate(fd, 0, 100 * 1024 * 1024);  /* 100MB */
     if (ret != 0) {
-      std::println(stderr, "Failed to preallocate file: {}", std::strerror(errno));
+      log_info( "Failed to preallocate file: {}", std::strerror(errno));
     }
   }
 
@@ -90,12 +89,12 @@ static void test_basic_write(const Test_config& config) {
     auto result = task.get();  /* Block until completion */
     
     if (!result.has_value()) {
-      std::println(stderr, "Write {} failed", i);
+      log_info( "Write {} failed", i);
       std::abort();
     }
     
     if (result.value() != static_cast<wal::lsn_t>(data_size)) {
-      std::println(stderr, "Write {} returned wrong size: expected {}, got {}", 
+      log_info( "Write {} returned wrong size: expected {}, got {}", 
                    i, data_size, result.value());
       std::abort();
     }
@@ -103,7 +102,7 @@ static void test_basic_write(const Test_config& config) {
   auto end = std::chrono::steady_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
 
-  std::println("[test_basic_write] Completed {} writes of {} bytes in {} ms ({:.2f} MB/s)",
+  log_info("[test_basic_write] Completed {} writes of {} bytes in {} ms ({:.2f} MB/s)",
                num_writes, data_size, duration.count(),
                static_cast<double>(num_writes * data_size) / (1024.0 * 1024.0) / (static_cast<double>(duration.count()) / 1000.0));
 
@@ -117,19 +116,19 @@ static void test_basic_write(const Test_config& config) {
  * Test linked sync operations (write + fdatasync/fsync)
  */
 static void test_linked_sync(const Test_config& config) {
-  std::println("[test_linked_sync] Testing linked write+sync operations");
+  log_info("[test_linked_sync] Testing linked write+sync operations");
 
   std::string path = config.m_disable_writes ? "/dev/null" : "/tmp/test_io_uring_sync.log";
   int fd = ::open(path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
   if (fd < 0) {
-    std::println(stderr, "Failed to open test file: {}", std::strerror(errno));
+    log_info( "Failed to open test file: {}", std::strerror(errno));
     std::abort();
   }
 
   if (!config.m_disable_writes) {
     auto ret = ::posix_fallocate(fd, 0, 100 * 1024 * 1024);
     if (ret != 0) {
-      std::println(stderr, "Failed to preallocate file: {}", std::strerror(errno));
+      log_info( "Failed to preallocate file: {}", std::strerror(errno));
     }
   }
 
@@ -153,37 +152,37 @@ static void test_linked_sync(const Test_config& config) {
   std::span<const struct iovec> iovecs(&iov, 1);
 
   /* Test fdatasync */
-  std::println("[test_linked_sync] Testing fdatasync...");
+  log_info("[test_linked_sync] Testing fdatasync...");
   auto start = std::chrono::steady_clock::now();
   for (std::size_t i = 0; i < num_writes; ++i) {
     auto task = writer.write_async(iovecs, wal::Log::Sync_type::Fdatasync);
     auto result = task.get();
     
     if (!result.has_value()) {
-      std::println(stderr, "Write+sync {} failed", i);
+      log_info( "Write+sync {} failed", i);
       std::abort();
     }
   }
   auto end = std::chrono::steady_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-  std::println("[test_linked_sync] Completed {} write+fdatasync operations in {} ms",
+  log_info("[test_linked_sync] Completed {} write+fdatasync operations in {} ms",
                num_writes, duration.count());
 
   /* Test fsync */
-  std::println("[test_linked_sync] Testing fsync...");
+  log_info("[test_linked_sync] Testing fsync...");
   start = std::chrono::steady_clock::now();
   for (std::size_t i = 0; i < num_writes; ++i) {
     auto task = writer.write_async(iovecs, wal::Log::Sync_type::Fsync);
     auto result = task.get();
     
     if (!result.has_value()) {
-      std::println(stderr, "Write+sync {} failed", i);
+      log_info( "Write+sync {} failed", i);
       std::abort();
     }
   }
   end = std::chrono::steady_clock::now();
   duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-  std::println("[test_linked_sync] Completed {} write+fsync operations in {} ms",
+  log_info("[test_linked_sync] Completed {} write+fsync operations in {} ms",
                num_writes, duration.count());
 
   ::close(fd);
@@ -210,7 +209,7 @@ static Task<void> concurrent_writer(
     auto result = co_await task;
     
     if (!result.has_value()) {
-      std::println(stderr, "Concurrent write failed");
+      log_info( "Concurrent write failed");
       std::abort();
     }
     
@@ -221,20 +220,20 @@ static Task<void> concurrent_writer(
 }
 
 static void test_concurrent_writes(const Test_config& config) {
-  std::println("[test_concurrent_writes] Testing concurrent writes from {} coroutines",
+  log_info("[test_concurrent_writes] Testing concurrent writes from {} coroutines",
                config.m_num_writers);
 
   std::string path = config.m_disable_writes ? "/dev/null" : "/tmp/test_io_uring_concurrent.log";
   int fd = ::open(path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
   if (fd < 0) {
-    std::println(stderr, "Failed to open test file: {}", std::strerror(errno));
+    log_info( "Failed to open test file: {}", std::strerror(errno));
     std::abort();
   }
 
   if (!config.m_disable_writes) {
     auto ret = ::posix_fallocate(fd, 0, 500 * 1024 * 1024);
     if (ret != 0) {
-      std::println(stderr, "Failed to preallocate file: {}", std::strerror(errno));
+      log_info( "Failed to preallocate file: {}", std::strerror(errno));
     }
   }
 
@@ -283,7 +282,7 @@ static void test_concurrent_writes(const Test_config& config) {
   auto end = std::chrono::steady_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
 
-  std::println("[test_concurrent_writes] Completed {} writes from {} writers in {} ms ({:.2f} MB/s)",
+  log_info("[test_concurrent_writes] Completed {} writes from {} writers in {} ms ({:.2f} MB/s)",
                completed.load(), config.m_num_writers, duration.count(),
                static_cast<double>(completed.load() * data_size) / (1024.0 * 1024.0) / (static_cast<double>(duration.count()) / 1000.0));
 
@@ -321,7 +320,7 @@ static Task<void> write_coroutine(
     auto result = co_await task;
     
     if (!result.has_value()) {
-      std::println(stderr, "Write {} failed", i);
+      log_info( "Write {} failed", i);
       std::abort();
     }
     
@@ -332,21 +331,21 @@ static Task<void> write_coroutine(
 }
 
 static void test_performance_log_service(const Test_config& config) {
-  std::println("[test_performance_log_service] Simulating Log service workload");
-  std::println("  messages: {}, sync_probability: {:.2f}, message_size: {}",
+  log_info("[test_performance_log_service] Simulating Log service workload");
+  log_info("  messages: {}, sync_probability: {:.2f}, message_size: {}",
                config.m_num_messages, config.m_sync_probability * 100.0, config.m_message_size);
 
   std::string path = config.m_disable_writes ? "/dev/null" : "/tmp/test_io_uring_perf.log";
   int fd = ::open(path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
   if (fd < 0) {
-    std::println(stderr, "Failed to open test file: {}", std::strerror(errno));
+    log_info( "Failed to open test file: {}", std::strerror(errno));
     std::abort();
   }
 
   if (!config.m_disable_writes) {
     auto ret = ::posix_fallocate(fd, 0, 1024 * 1024 * 1024);  /* 1GB */
     if (ret != 0) {
-      std::println(stderr, "Failed to preallocate file: {}", std::strerror(errno));
+      log_info( "Failed to preallocate file: {}", std::strerror(errno));
     }
   }
 
@@ -392,13 +391,13 @@ static void test_performance_log_service(const Test_config& config) {
   auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
 
   /* Print results */
-  std::println("[test_performance_log_service] Results:");
-  std::println("  Total writes: {}", write_count.load());
-  std::println("  Sync operations: {}", sync_count.load());
-  std::println("  Duration: {} ms", duration.count());
-  std::println("  Throughput: {:.2f} MB/s",
+  log_info("[test_performance_log_service] Results:");
+  log_info("  Total writes: {}", write_count.load());
+  log_info("  Sync operations: {}", sync_count.load());
+  log_info("  Duration: {} ms", duration.count());
+  log_info("  Throughput: {:.2f} MB/s",
                static_cast<double>(config.m_num_messages * data_size) / (1024.0 * 1024.0) / (static_cast<double>(duration.count()) / 1000.0));
-  std::println("  Writes/sec: {:.0f}",
+  log_info("  Writes/sec: {:.0f}",
                static_cast<double>(config.m_num_messages) / (static_cast<double>(duration.count()) / 1000.0));
 
   ::close(fd);
@@ -411,32 +410,32 @@ static void test_performance_log_service(const Test_config& config) {
  * Test error handling
  */
 static void test_error_handling(const Test_config& /*config*/) {
-  std::println("[test_error_handling] Testing error handling");
+  log_info("[test_error_handling] Testing error handling");
 
   /* Test with invalid file descriptor */
   try {
     wal::Io_uring_writer::Config uring_config(-1, 64);
     wal::Io_uring_writer writer(uring_config);
-    std::println(stderr, "Should have thrown exception for invalid FD");
+    log_info( "Should have thrown exception for invalid FD");
     std::abort();
   } catch (const std::exception& e) {
-    std::println("[test_error_handling] Correctly caught exception for invalid FD: {}", e.what());
+    log_info("[test_error_handling] Correctly caught exception for invalid FD: {}", e.what());
   }
 
   /* Test with non-power-of-2 queue depth */
   int fd = ::open("/dev/null", O_WRONLY);
   if (fd < 0) {
-    std::println(stderr, "Failed to open /dev/null");
+    log_info( "Failed to open /dev/null");
     std::abort();
   }
 
   try {
     wal::Io_uring_writer::Config uring_config(fd, 63);  /* Not a power of 2 */
     wal::Io_uring_writer writer(uring_config);
-    std::println(stderr, "Should have thrown exception for non-power-of-2 queue depth");
+    log_info( "Should have thrown exception for non-power-of-2 queue depth");
     std::abort();
   } catch (const std::exception& e) {
-    std::println("[test_error_handling] Correctly caught exception for invalid queue depth: {}", e.what());
+    log_info("[test_error_handling] Correctly caught exception for invalid queue depth: {}", e.what());
   }
 
   ::close(fd);
@@ -446,12 +445,12 @@ static void test_error_handling(const Test_config& /*config*/) {
  * Test with multiple iovecs (scatter-gather)
  */
 static void test_multiple_iovecs(const Test_config& config) {
-  std::println("[test_multiple_iovecs] Testing multiple iovec scatter-gather writes");
+  log_info("[test_multiple_iovecs] Testing multiple iovec scatter-gather writes");
 
   std::string path = config.m_disable_writes ? "/dev/null" : "/tmp/test_io_uring_iovecs.log";
   int fd = ::open(path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
   if (fd < 0) {
-    std::println(stderr, "Failed to open test file: {}", std::strerror(errno));
+    log_info( "Failed to open test file: {}", std::strerror(errno));
     std::abort();
   }
 
@@ -483,18 +482,18 @@ static void test_multiple_iovecs(const Test_config& config) {
   auto result = task.get();
 
   if (!result.has_value()) {
-    std::println(stderr, "Scatter-gather write failed");
+    log_info( "Scatter-gather write failed");
     std::abort();
   }
 
   std::size_t expected_size = num_buffers * buffer_size;
   if (result.value() != static_cast<wal::lsn_t>(expected_size)) {
-    std::println(stderr, "Scatter-gather write returned wrong size: expected {}, got {}",
+    log_info( "Scatter-gather write returned wrong size: expected {}, got {}",
                  expected_size, result.value());
     std::abort();
   }
 
-  std::println("[test_multiple_iovecs] Successfully wrote {} buffers of {} bytes each ({} total)",
+  log_info("[test_multiple_iovecs] Successfully wrote {} buffers of {} bytes each ({} total)",
                num_buffers, buffer_size, expected_size);
 
   ::close(fd);
@@ -548,17 +547,17 @@ int main(int argc, char* argv[]) {
         config.m_message_size = std::stoull(optarg);
         break;
       case 'h':
-        std::println("Usage: {} [options]", argv[0]);
-        std::println("Options:");
-        std::println("  -m, --num-messages NUM    Number of messages to write (default: 1000000)");
-        std::println("  -b, --block-size NUM      Block size in bytes (default: 4096)");
-        std::println("  -w, --num-writers NUM     Number of concurrent writers (default: 1)");
-        std::println("  -q, --queue-depth NUM     io_uring queue depth, must be power of 2 (default: 64)");
-        std::println("  -d, --disable-writes      Disable actual disk writes (use /dev/null)");
-        std::println("  -n, --no-linked-sync      Disable testing linked sync operations");
-        std::println("  -p, --sync-probability NUM Sync probability 0.0-1.0 (default: 0.01)");
-        std::println("  -s, --message-size NUM    Size of each message in bytes (default: 512)");
-        std::println("  -h, --help                Show this help message");
+        log_info("Usage: {} [options]", argv[0]);
+        log_info("Options:");
+        log_info("  -m, --num-messages NUM    Number of messages to write (default: 1000000)");
+        log_info("  -b, --block-size NUM      Block size in bytes (default: 4096)");
+        log_info("  -w, --num-writers NUM     Number of concurrent writers (default: 1)");
+        log_info("  -q, --queue-depth NUM     io_uring queue depth, must be power of 2 (default: 64)");
+        log_info("  -d, --disable-writes      Disable actual disk writes (use /dev/null)");
+        log_info("  -n, --no-linked-sync      Disable testing linked sync operations");
+        log_info("  -p, --sync-probability NUM Sync probability 0.0-1.0 (default: 0.01)");
+        log_info("  -s, --message-size NUM    Size of each message in bytes (default: 512)");
+        log_info("  -h, --help                Show this help message");
         return EXIT_SUCCESS;
       default:
         return EXIT_FAILURE;
@@ -567,48 +566,48 @@ int main(int argc, char* argv[]) {
 
   /* Ensure queue depth is power of 2 */
   if (!std::has_single_bit(config.m_queue_depth)) {
-    std::println(stderr, "Error: queue-depth must be a power of 2 (got {})", config.m_queue_depth);
+    log_info( "Error: queue-depth must be a power of 2 (got {})", config.m_queue_depth);
     return EXIT_FAILURE;
   }
 
-  std::println("=== io_uring Writer Test Suite ===");
-  std::println("Configuration:");
-  std::println("  num_messages: {}", config.m_num_messages);
-  std::println("  block_size: {}", config.m_log_block_size);
-  std::println("  num_writers: {}", config.m_num_writers);
-  std::println("  queue_depth: {}", config.m_queue_depth);
-  std::println("  disable_writes: {}", config.m_disable_writes);
-  std::println("  test_linked_sync: {}", config.m_test_linked_sync);
-  std::println("  sync_probability: {:.2f}%", config.m_sync_probability * 100.0);
-  std::println("  message_size: {}", config.m_message_size);
-  std::println("");
+  log_info("=== io_uring Writer Test Suite ===");
+  log_info("Configuration:");
+  log_info("  num_messages: {}", config.m_num_messages);
+  log_info("  block_size: {}", config.m_log_block_size);
+  log_info("  num_writers: {}", config.m_num_writers);
+  log_info("  queue_depth: {}", config.m_queue_depth);
+  log_info("  disable_writes: {}", config.m_disable_writes);
+  log_info("  test_linked_sync: {}", config.m_test_linked_sync);
+  log_info("  sync_probability: {:.2f}%", config.m_sync_probability * 100.0);
+  log_info("  message_size: {}", config.m_message_size);
+  log_info("");
 
   try {
     /* Run test suite */
     test_basic_write(config);
-    std::println("");
+    log_info("");
 
     if (config.m_test_linked_sync) {
       test_linked_sync(config);
-      std::println("");
+      log_info("");
     }
 
     test_multiple_iovecs(config);
-    std::println("");
+    log_info("");
 
     test_concurrent_writes(config);
-    std::println("");
+    log_info("");
 
     test_performance_log_service(config);
-    std::println("");
+    log_info("");
 
     test_error_handling(config);
-    std::println("");
+    log_info("");
 
-    std::println("=== All tests passed ===");
+    log_info("=== All tests passed ===");
     return EXIT_SUCCESS;
   } catch (const std::exception& e) {
-    std::println(stderr, "Test failed with exception: {}", e.what());
+    log_info( "Test failed with exception: {}", e.what());
     return EXIT_FAILURE;
   }
 }

@@ -23,7 +23,7 @@ using Queue = Segmented_queue<std::size_t>;
 using Channel = Bounded_queue_coro<Queue>;
 
 static void test_basic_single_thread() {
-  std::println("[test_basic_single_thread] start");
+  log_info("[test_basic_single_thread] start");
 
   Queue::Config config{.m_slots_per_segment = 8, .m_num_segments = 4, .m_num_stripes = 4};
   Channel ch(config);
@@ -37,7 +37,7 @@ static void test_basic_single_thread() {
 
   for (std::size_t i = 0; i < total_items; ++i) {
     if (!ch.try_enqueue(handle, i)) {
-      std::println("try_enqueue fail at i={}", i);
+      log_info("try_enqueue fail at i={}", i);
       std::abort();
     }
   }
@@ -50,12 +50,12 @@ static void test_basic_single_thread() {
     std::size_t v = ~0UL;
 
     if (!ch.try_dequeue(handle, v)) {
-      std::println("try_dequeue fail at i={}", i);
+      log_info("try_dequeue fail at i={}", i);
       std::abort();
     }
 
     assert(v != ~0UL);
-    // std::println("dequeued={}", v);
+    // log_info("dequeued={}", v);
     out.push_back(v);
   }
   assert(ch.empty());
@@ -64,24 +64,24 @@ static void test_basic_single_thread() {
 
   for (std::size_t i = 0; i < total_items; ++i) {
     if (out[i] != i) {
-      std::println("order mismatch got={} expect={}", out[i], i);
+      log_info("order mismatch got={} expect={}", out[i], i);
       std::abort();
     }
   }
 
-  std::println("[test_basic_single_thread] done");
+  log_info("[test_basic_single_thread] done");
 }
 
 static void test_wraparound() {
   using Channel = Bounded_queue_coro<Segmented_queue<int>>;
 
-  std::println("[test_wraparound] start");
+  log_info("[test_wraparound] start");
   Channel::Handle handle{};
   Channel ch({.m_slots_per_segment = 8, .m_num_segments = 4, .m_num_stripes = 4});
 
   for (int i = 0; i < 8; ++i) {
     if (!ch.try_enqueue(handle, i)) {
-      std::println("initial enqueue fail i={}", i);
+      log_info("initial enqueue fail i={}", i);
       std::abort();
     }
   }
@@ -89,18 +89,18 @@ static void test_wraparound() {
   for (int i = 0; i < 4; ++i) {
     int v{};
     if (!ch.try_dequeue(handle, v)) {
-      std::println("dequeue(phase1) fail i={}", i);
+      log_info("dequeue(phase1) fail i={}", i);
       std::abort();
     }
     if (v != i) {
-      std::println("order(phase1) mismatch got={} expect={}", v, i);
+      log_info("order(phase1) mismatch got={} expect={}", v, i);
       std::abort();
     }
   }
 
   for (int i = 8; i < 12; ++i) {
     if (!ch.try_enqueue(handle, i)) {
-      std::println("enqueue(phase2) fail i={}", i);
+      log_info("enqueue(phase2) fail i={}", i);
       std::abort();
     }
   }
@@ -116,23 +116,23 @@ static void test_wraparound() {
   std::vector<int> expect{4,5,6,7,8,9,10,11};
 
   if (out != expect) {
-    std::println(stderr, "wrap result mismatch");
-    std::println(stderr, "got: {}", out);
+    log_info(stderr, "wrap result mismatch");
+    log_info(stderr, "got: {}", out);
     for (auto x: out) {
       std::print("{} ", x);
     }
-    std::println("");
-    std::println("exp: {}", expect);
+    log_info("");
+    log_info("exp: {}", expect);
 
     for (auto x: expect) {
       std::print("{} ", x);
     }
 
-    std::println("");
+    log_info("");
     std::abort();
   }
   assert(ch.empty());
-  std::println("[test_wraparound] done");
+  log_info("[test_wraparound] done");
 }
 
 [[maybe_unused]] Task<void> producer_coro(Channel& ch, util::Thread_pool& pool, std::size_t start, std::size_t count, std::atomic<std::size_t>& produced) {
@@ -174,7 +174,7 @@ static void test_wraparound() {
 }
 
 [[maybe_unused]] static void test_coro_mpmc_correctness() {
-  std::println("[test_coro_mpmc_correctness] start");
+  log_info("[test_coro_mpmc_correctness] start");
 
   constexpr std::size_t num_producers = 1;
   constexpr std::size_t num_consumers = 1;
@@ -205,19 +205,19 @@ static void test_wraparound() {
   while (produced.load(std::memory_order_acquire) < total_items) {
     std::this_thread::yield();
     if (++iterations % 1000000 == 0) {
-      std::println("[test_coro_mpmc_correctness] waiting for produced: {}/{}", produced.load(), total_items);
+      log_info("[test_coro_mpmc_correctness] waiting for produced: {}/{}", produced.load(), total_items);
     }
   }
-  std::println("[test_coro_mpmc_correctness] produced complete: {}", produced.load());
+  log_info("[test_coro_mpmc_correctness] produced complete: {}", produced.load());
 
   iterations = 0;
   while (consumed.load(std::memory_order_acquire) < total_items) {
     std::this_thread::yield();
     if (++iterations % 1000000 == 0) {
-      std::println("[test_coro_mpmc_correctness] waiting for consumed: {}/{}", consumed.load(), total_items);
+      log_info("[test_coro_mpmc_correctness] waiting for consumed: {}/{}", consumed.load(), total_items);
     }
   }
-  std::println("[test_coro_mpmc_correctness] consumed complete: {}", consumed.load());
+  log_info("[test_coro_mpmc_correctness] consumed complete: {}", consumed.load());
 
   consumed_values[0].reserve(consumed.load(std::memory_order_acquire));
 
@@ -233,11 +233,11 @@ static void test_wraparound() {
 
   for (std::size_t i = 0; i < total_items; ++i) {
     if (consumed_values[0][i] != i) {
-      std::println("Missing or duplicate item at index {}, got {}", i, consumed_values[0][i]);
+      log_info("Missing or duplicate item at index {}, got {}", i, consumed_values[0][i]);
       for (auto x: consumed_values[0]) {
         std::print("{} ", x);
       }
-      std::println("");
+      log_info("");
       std::abort();
     }
   }
@@ -271,7 +271,7 @@ static void test_wraparound() {
 }
 
 [[maybe_unused]] static void test_coro_mpmc_correctness_st() noexcept {
-  std::println("[test_coro_mpmc_correctness_st] start (single-threaded)");
+  log_info("[test_coro_mpmc_correctness_st] start (single-threaded)");
 
   constexpr std::size_t n_producers = 2;
   constexpr std::size_t n_consumers = 2;
@@ -308,12 +308,12 @@ static void test_wraparound() {
 
   for (std::size_t i = 0; i < total_items; ++i) {
     if (consumed[i] != i) {
-      std::println("Missing or duplicate item at index {}, got {}", i, consumed[i]);
+      log_info("Missing or duplicate item at index {}, got {}", i, consumed[i]);
       std::abort();
     }
   }
 
-  std::println("[test_coro_mpmc_correctness_st] done");
+  log_info("[test_coro_mpmc_correctness_st] done");
 }
 
 struct Perf_config {
@@ -369,13 +369,13 @@ struct Perf_config {
     consumed.fetch_add(1, std::memory_order_relaxed);
   }
 
-  std::println("consumer {} : done", consumed.load(std::memory_order_acquire));
+  log_info("consumer {} : done", consumed.load(std::memory_order_acquire));
 
   co_return;
 }
 
 [[maybe_unused]] static void test_coro_performance(const Perf_config& config) {
-  std::println("[test_coro_performance] producers={}, consumers={}, items_per_producer={}, channel_size={}, pool_threads={}",
+  log_info("[test_coro_performance] producers={}, consumers={}, items_per_producer={}, channel_size={}, pool_threads={}",
                config.m_num_producers, config.m_num_consumers, config.m_items_per_producer, config.m_channel_size, config.m_pool_threads);
 
   const std::size_t total_items = config.m_num_producers * config.m_items_per_producer;
@@ -441,7 +441,7 @@ struct Perf_config {
     throughput_unit = "K ops/s";
   }
 
-  std::println("[test_coro_performance] produced={}, consumed={}, elapsed={:.3f}s, throughput={:.2f} {}, latency={:.1f} ns/op",
+  log_info("[test_coro_performance] produced={}, consumed={}, elapsed={:.3f}s, throughput={:.2f} {}, latency={:.1f} ns/op",
                produced.load(), consumed.load(), elapsed_s, throughput_value, throughput_unit, ns_per_op);
 
   assert(produced.load() == total_items);
@@ -450,14 +450,14 @@ struct Perf_config {
 
 
 int main() {
-  std::println("[main] Starting tests...");
-  std::println("[main] test_basic_single_thread");
+  log_info("[main] Starting tests...");
+  log_info("[main] test_basic_single_thread");
   test_basic_single_thread();
-  std::println("[main] test_wraparound");
+  log_info("[main] test_wraparound");
   test_wraparound();
-  std::println("[main] test_coro_mpmc_correctness_st");
+  log_info("[main] test_coro_mpmc_correctness_st");
   test_coro_mpmc_correctness_st();
-  std::println("[main] test_coro_mpmc_correctness");
+  log_info("[main] test_coro_mpmc_correctness");
   test_coro_mpmc_correctness();
 
   Perf_config config{
@@ -468,10 +468,10 @@ int main() {
     .m_pool_threads = 1
   };
 
-  std::println("[main] test_coro_performance");
+  log_info("[main] test_coro_performance");
   test_coro_performance(config);
 
-  std::println("\n=== All tests passed ===");
+  log_info("\n=== All tests passed ===");
 
   return 0;
 }

@@ -1,13 +1,14 @@
 #include <thread>
 #include <atomic>
 #include <chrono>
-#include <print>
 #include <vector>
 #include <memory>
 #include <cstdlib>
 #include <cstring>
+#include <print>
 
 #include "util/bounded_channel.h"
+#include "util/logger.h"
 #include "util/thread_pool.h"
 #include "coro/task.h"
 
@@ -21,6 +22,8 @@
  */
 
 using Item = std::size_t;
+
+util::Logger<util::MT_logger_writer> g_logger(util::MT_logger_writer{std::cerr}, util::Log_level::Info);
 
 /**
  * Benchmark configuration
@@ -248,11 +251,11 @@ void run_benchmark_suite(const Config& base_config) {
     1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192
   };
 
-  std::println("=== SPSC-per-Producer + MPMC Scheduling Benchmark Suite ===");
-  std::println("Items: {}, Producer Queue: {}, Drain Batch: {}\n",
+  log_info("=== SPSC-per-Producer + MPMC Scheduling Benchmark Suite ===");
+  log_info("Items: {}, Producer Queue: {}, Drain Batch: {}\n",
                base_config.m_total_items, base_config.m_producer_queue_size, base_config.m_drain_batch_size);
-  std::println("{:>5} | {:>12} {:>8}", "Prod", "Throughput", "Time(s)");
-  std::println("{}", std::string(40, '-'));
+  log_info("{:>5} | {:>12} {:>8}", "Prod", "Throughput", "Time(s)");
+  log_info("{}", std::string(40, '-'));
 
   for (std::size_t num_prod : producer_counts) {
     Config config = base_config;
@@ -260,13 +263,13 @@ void run_benchmark_suite(const Config& base_config) {
 
     auto result = test_spsc_per_producer(config);
 
-    std::println("{:5}P | {:9.2f} M/s {:8.3f}",
+    log_info("{:5}P | {:9.2f} M/s {:8.3f}",
                  num_prod,
                  result.m_spsc_ops_per_sec / 1'000'000.0,
                  result.m_spsc_time_s);
   }
 
-  std::println("\n=== Done ===");
+  log_info("\n=== Done ===");
 }
 
 void print_usage(const char* prog) {
@@ -305,7 +308,7 @@ int main(int argc, char* argv[]) {
     } else if ((arg == "-d" || arg == "--drain-batch") && i + 1 < argc) {
       config.m_drain_batch_size = std::stoull(argv[++i]);
     } else {
-      std::println(stderr, "Unknown option: {}", arg);
+      log_info( "Unknown option: {}", arg);
       print_usage(argv[0]);
       return 1;
     }
@@ -314,15 +317,15 @@ int main(int argc, char* argv[]) {
   if (config.m_run_suite) {
     run_benchmark_suite(config);
   } else {
-    std::println("=== SPSC-per-Producer + MPMC Scheduling Benchmark ===");
-    std::println("Producers: {}, Items: {}, Producer Queue: {}, Drain Batch: {}\n",
+    log_info("=== SPSC-per-Producer + MPMC Scheduling Benchmark ===");
+    log_info("Producers: {}, Items: {}, Producer Queue: {}, Drain Batch: {}\n",
                  config.m_num_producers, config.m_total_items,
                  config.m_producer_queue_size, config.m_drain_batch_size);
 
     auto result = test_spsc_per_producer(config);
 
-    std::println("Throughput: {:.2f} M/s", result.m_spsc_ops_per_sec / 1'000'000.0);
-    std::println("Time: {:.3f}s", result.m_spsc_time_s);
+    log_info("Throughput: {:.2f} M/s", result.m_spsc_ops_per_sec / 1'000'000.0);
+    log_info("Time: {:.3f}s", result.m_spsc_time_s);
   }
 
   return 0;
