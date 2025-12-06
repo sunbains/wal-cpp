@@ -24,6 +24,12 @@ struct [[nodiscard]] Log {
 
   ~Log() noexcept;
 
+  /* Log is not copyable or movable */
+  Log(const Log&) = delete;
+  Log& operator=(const Log&) = delete;
+  Log(Log&&) = delete;
+  Log& operator=(Log&&) = delete;
+
   /** Reserve and write the data in the span to the buffer.
    * @param[in] span The span of the data to write.
    * @return The slot that was reserved.
@@ -57,6 +63,15 @@ struct [[nodiscard]] Log {
    * @return A Task that yields true if the write was successful, false otherwise.
    */
   [[nodiscard]] Result<bool> shutdown(Write_callback callback) noexcept;
+
+  /**
+   * Request a sync operation (fsync/fdatasync) to be executed after all pending writes.
+   * The sync operation will be serialized with other IO operations.
+   * 
+   * @param sync_type Type of sync operation (Fdatasync or Fsync).
+   * @param sync_callback Callback that performs the sync operation (takes Sync_type, returns Result<bool>).
+   */
+  void request_sync(Sync_type sync_type, std::function<Result<bool>(Sync_type)>& sync_callback) noexcept;
 
   /**
    * Convert the log state to a string.

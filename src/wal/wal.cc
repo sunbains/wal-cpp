@@ -454,4 +454,12 @@ void Log::set_metrics(util::Metrics* metrics) noexcept {
   }
 }
 
+void Log::request_sync(Sync_type sync_type, std::function<Result<bool>(Sync_type)>& sync_callback) noexcept {
+  if (sync_type == Sync_type::None || m_thread_pool == nullptr) {
+    return;
+  }
+  
+  m_pool->enqueue_sync_operation(sync_type, sync_callback, *m_thread_pool);
+}
+
 } // namespace wal

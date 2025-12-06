@@ -1,17 +1,30 @@
 #pragma once
 
-#include <memory>
 #include <atomic>
-#include <thread>
+#include <bit>
+#include <cstdint>
+#include <cstdlib>
+#include <exception>
+#include <format>
 #include <functional>
+#include <iostream>
+#include <memory>
+#include <print>
+#include <sstream>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <variant>
 #include <vector>
 
 #include "coro/task.h"
 #include "util/bounded_channel.h"
 #include "util/logger.h"
 #include "util/thread_pool.h"
-#include "util/util.h"
 #include "wal/buffer.h"
+#include "wal/types.h"
 
 extern util::Logger<util::MT_logger_writer> g_logger;
 
@@ -27,6 +40,31 @@ using Config = Buffer::Config;
  */
 struct Pool {
   struct Entry;
+  
+  /**
+   * IO operation types that can be queued for serialized execution.
+   * All operations are serialized through a single queue since we only configure one IO thread.
+   */
+  struct Io_operation {
+    /* Write operation - buffer entry to write */
+    struct Write_op {
+      Entry* entry_ptr;
+      Buffer::Write_callback* write_callback;
+    };
+    
+    /* Sync operation - fsync or fdatasync */
+    struct Sync_op {
+      Sync_type sync_type;
+      std::function<Result<bool>(Sync_type)>* sync_callback;
+    };
+    
+    /* Read operation - placeholder for future use */
+    struct Read_op {
+      /* TODO: Add read operation parameters */
+    };
+    
+    std::variant<Write_op, Sync_op, Read_op> m_op;
+  };
 
   struct alignas(kCLS) [[nodiscard]] Entry {
     /** State transitions are :
@@ -47,6 +85,7 @@ struct Pool {
     Entry(const Entry&) = delete;
     Entry& operator=(Entry&&) = delete;
     Entry& operator=(const Entry&) = delete;
+    ~Entry() = default;
 
     [[nodiscard]] std::string to_string() const noexcept {
       auto get_state = [&](State state) -> std::string_view {
@@ -81,10 +120,10 @@ struct Pool {
   * @param[in] hwm Starting LSN for the first buffer
   */
   Pool(std::size_t pool_size, const Config& config, lsn_t hwm)
-    : m_buffers(),
-      m_free_buffers(pool_size),
+    : m_free_buffers(pool_size),
       m_ready_for_io_buffers(pool_size),
-      m_io_thread_running(false) {
+      m_io_thread_running(false),
+      m_io_operations(pool_size * 2) {
 
     if (!std::has_single_bit(pool_size)) {
       throw std::invalid_argument("Pool size must be a power of 2");
@@ -124,7 +163,7 @@ struct Pool {
   * 
   * @return Pointer to buffer entry, or nullptr if pool is shutting down
   */
-  [[nodiscard]] Entry* acquire_buffer() noexcept {
+  [[nodiscard]] Entry* acquire_buffer() const noexcept {
     WAL_ASSERT(m_active != nullptr);
     return m_active;
   }
@@ -132,7 +171,11 @@ struct Pool {
   /** Release the buffer back and signal that we want to write it to storage.
    * Synchronous version - blocks if no buffers are available.
    * 
-   * @param buffer The buffer to prepare for IO.
+   * @param[in] entry_ptr The buffer entry to prepare for IO.
+   * @param[in] thread_pool Thread pool for executing I/O operations.
+   * @param[in] write_callback Callback for writing data (should only do writes, not syncs).
+
+   @return Pointer to buffer entry, or nullptr if pool is shutting down
    */
   Entry* prepare_buffer_for_io(Entry* entry_ptr, util::Thread_pool& thread_pool, Buffer::Write_callback& write_callback) noexcept {
     WAL_ASSERT(entry_ptr == m_active);
@@ -146,7 +189,18 @@ struct Pool {
     Entry* free_entry_ptr{};
 
     if (m_free_buffers.dequeue(free_entry_ptr)) {
-      post_io_task_for_buffer(entry_ptr, thread_pool, write_callback);
+      /* Enqueue write operation to IO queue */
+      Io_operation io_op;
+      io_op.m_op = Io_operation::Write_op{.entry_ptr = entry_ptr, .write_callback = &write_callback};
+      [[maybe_unused]] auto ret = m_io_operations.enqueue(io_op);
+      WAL_ASSERT(ret);
+      
+      /* Start IO coroutine if not already running */
+      bool expected = false;
+      if (m_io_task_running.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        io_coroutine_function(this, &thread_pool).start_on_pool(thread_pool);
+      }
+      
       m_active = free_entry_ptr;
       WAL_ASSERT(m_active->m_state == Entry::State::Free);
     } else {
@@ -154,7 +208,12 @@ struct Pool {
 
       WAL_ASSERT(write_callback && "I/O callback must be set via start_io");
 
-      auto result = entry_ptr->m_buffer.write_to_store(write_callback);
+      /* For synchronous writes, use write-only callback */
+      auto write_only_callback = [&write_callback](std::span<struct iovec> span, Sync_type) -> Result<lsn_t> {
+        return write_callback(span, Sync_type::None);
+      };
+      
+      auto result = entry_ptr->m_buffer.write_to_store(write_only_callback);
 
       if (!result.has_value()) {
         log_fatal("IO task failed");
@@ -167,43 +226,90 @@ struct Pool {
     return m_active;
   }
 
-  /* I/O coroutine function - takes * and Entry* as parameters.
-   * Log is the coordinator and controls orchestration, so it provides the I/O callback.
-   * This ensures the parameters are stored in the coroutine frame, not in a closure on the stack.
+  /**
+   * Enqueue a sync operation (fsync/fdatasync) to be executed after all pending writes.
+   * The sync operation will be serialized with other IO operations through the IO queue.
+   * 
+   * @param[in] sync_type Type of sync operation (Fdatasync or Fsync).
+   * @param[in] sync_callback Callback that performs the sync operation.
+   * @param[in] thread_pool Thread pool for executing I/O operations.
    */
-  static Task<void> io_coroutine_function(Buffer::Write_callback write_callback, Pool* pool, Entry* entry_ptr) {
-    WAL_ASSERT(write_callback && "I/O callback must be set via start_io");
-    
-    auto result = entry_ptr->m_buffer.write_to_store(write_callback);
-    
-    if (!result.has_value()) {
-      log_fatal("IO task failed");
+  void enqueue_sync_operation(Sync_type sync_type, std::function<Result<bool>(Sync_type)>& sync_callback, util::Thread_pool& thread_pool) noexcept {
+    if (sync_type == Sync_type::None) {
+      return;
     }
     
-    entry_ptr->m_buffer.initialize(entry_ptr->m_buffer.m_hwm);
-    entry_ptr->m_state = Entry::State::Free;
-
-    [[maybe_unused]] auto ret = pool->m_free_buffers.enqueue(entry_ptr);
+    Io_operation io_op;
+    io_op.m_op = Io_operation::Sync_op{.sync_type = sync_type, .sync_callback = &sync_callback};
+    [[maybe_unused]] auto ret = m_io_operations.enqueue(io_op);
     WAL_ASSERT(ret);
-
-    co_return;
+    
+    /* Start IO coroutine if not already running */
+    bool expected = false;
+    if (m_io_task_running.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+      io_coroutine_function(this, &thread_pool).start_on_pool(thread_pool);
+    }
   }
 
-  void post_io_task_for_buffer(Entry* entry_ptr, util::Thread_pool& thread_pool, Buffer::Write_callback write_callback) noexcept {
-    WAL_ASSERT(!entry_ptr->m_buffer.is_empty());  /* Buffer must have data, but doesn't need to be full */
-    WAL_ASSERT(entry_ptr->m_state == Entry::State::Ready_for_io);
-    WAL_ASSERT(write_callback && "I/O callback must be set via start_io");
+  /* Delete copy and move operations - Pool is not copyable or movable */
+  Pool(const Pool&) = delete;
+  Pool& operator=(const Pool&) = delete;
+  Pool(Pool&&) = delete;
+  Pool& operator=(Pool&&) = delete;
 
-    /* Post a task to the I/O pool that will:
-     * 1. Write the buffer to storage using write_callback
-     * 2. Put the buffer back on the free list
-     * 3. Notify any waiters
-     * 
-     * Use a static function instead of lambda to avoid closure storage issues.
-     * The parameters (log, pool, entry_ptr) are passed directly and stored in the coroutine frame,
-     * not in a closure on the stack that could be overwritten.
-     */
-    io_coroutine_function(write_callback, this, entry_ptr).start_on_pool(thread_pool);
+  /* I/O coroutine function - processes all IO operations (writes, syncs, reads) from the queue.
+   * All operations are serialized through the single queue since we only configure one IO thread.
+   */
+  static Task<void> io_coroutine_function(Pool* pool, [[maybe_unused]] util::Thread_pool* thread_pool) {
+    Io_operation io_op;
+    
+    while (pool->m_io_operations.dequeue(io_op)) {
+      if (std::holds_alternative<Io_operation::Write_op>(io_op.m_op)) {
+        /* Handle write operation */
+        auto& write_op = std::get<Io_operation::Write_op>(io_op.m_op);
+        Entry* entry_ptr = write_op.entry_ptr;
+        Buffer::Write_callback* write_callback = write_op.write_callback;
+        
+        WAL_ASSERT(write_callback && "I/O callback must be set via start_io");
+        
+        /* Use write-only callback (no syncs in write path) */
+        auto write_only_callback = [write_callback](std::span<struct iovec> span, Sync_type) -> Result<lsn_t> {
+          return (*write_callback)(span, Sync_type::None);
+        };
+        
+        auto result = entry_ptr->m_buffer.write_to_store(write_only_callback);
+        
+        if (!result.has_value()) {
+          log_fatal("IO task failed");
+        }
+        
+        entry_ptr->m_buffer.initialize(entry_ptr->m_buffer.m_hwm);
+        entry_ptr->m_state = Entry::State::Free;
+
+        [[maybe_unused]] auto ret = pool->m_free_buffers.enqueue(entry_ptr);
+        WAL_ASSERT(ret);
+        
+      } else if (std::holds_alternative<Io_operation::Sync_op>(io_op.m_op)) {
+        /* Handle sync operation */
+        auto& sync_op = std::get<Io_operation::Sync_op>(io_op.m_op);
+        
+        if ((sync_op.sync_callback != nullptr) && sync_op.sync_type != Sync_type::None) {
+          auto sync_result = (*sync_op.sync_callback)(sync_op.sync_type);
+          if (!sync_result.has_value()) {
+            log_fatal("Sync operation failed");
+          }
+        }
+        
+      } else if (std::holds_alternative<Io_operation::Read_op>(io_op.m_op)) {
+        /* Handle read operation - placeholder for future use */
+        /* TODO: Implement read operation */
+      }
+    }
+    
+    /* No more operations pending - mark IO task as not running */
+    pool->m_io_task_running.store(false, std::memory_order_release);
+    
+    co_return;
   }
 
   /**
@@ -256,13 +362,13 @@ struct Pool {
       WAL_ASSERT(ret);
     }
 
-    return Result<bool>(true);
+    return Result<bool>{true};
   }
 
   void shutdown() noexcept {
     WAL_ASSERT(m_active->m_state == Entry::State::In_use);
 
-    auto active = m_active;
+    Entry* active = m_active;
 
     m_active = nullptr;
 
@@ -278,18 +384,18 @@ struct Pool {
   }
 
   [[nodiscard]] std::string to_string() const noexcept {
-    std::stringstream ss;
+    std::stringstream stream;
 
-    ss << "Pool: " << std::endl;
-    for (auto& entry : m_buffers) {
-      ss << "  " << entry->to_string() << std::endl;
+    stream << "Pool: " << std::endl;
+    for (const auto& entry : m_buffers) {
+      stream << "  " << entry->to_string() << std::endl;
     }
-    return ss.str();
+    return stream.str();
   }
 
   /* Background I/O coroutine that continuously processes buffers on the thread pool */
   /* Currently active buffer - align to cache line to avoid false sharing with I/O threads */
-  alignas(64) Entry* m_active{nullptr};
+  alignas(kCLS) Entry* m_active{nullptr};
 
   /* Storage for all buffer entries - manages lifetime */
   std::vector<std::unique_ptr<Entry>> m_buffers;
@@ -301,10 +407,16 @@ struct Pool {
   util::Bounded_queue<Entry*> m_ready_for_io_buffers;
 
   /* I/O process state - align to cache line to avoid false sharing */
-  alignas(64) std::atomic<bool> m_io_thread_running{false};
+  alignas(kCLS) std::atomic<bool> m_io_thread_running{false};
 
   /* Synchronous write callback for inline I/O when buffers exhausted */
   std::function<Result<std::size_t>(std::span<struct iovec>, wal::Sync_type)> m_sync_write_callback;
+
+  /* Unified queue for all IO operations (writes, syncs, reads) - serialized execution */
+  util::Bounded_queue<Io_operation> m_io_operations;
+
+  /* Flag to track if IO coroutine is running */
+  alignas(kCLS) std::atomic<bool> m_io_task_running{false};
 };
 
 } // namespace wal
