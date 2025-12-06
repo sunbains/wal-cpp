@@ -18,6 +18,7 @@
 #include <cmath>
 
 #include "coro/task.h"
+#include "util/actor_model.h"
 #include "util/bounded_channel.h"
 #include "util/logger.h"
 #include "util/spsc.h"
@@ -25,11 +26,10 @@
 #include "util/thread_pool.h"
 #include "util/metrics.h"
 #include "util/checksum.h"
-#include "wal/wal.h"
-
-#include "log_io.h"
-#include "actor_model.h"
 #include "wal/buffer_pool.h"
+#include "wal/io.h"
+#include "wal/service.h"
+#include "wal/wal.h"
 
 util::Logger<util::MT_logger_writer> g_logger(util::MT_logger_writer{std::cerr}, util::Log_level::Trace);
 
@@ -85,21 +85,23 @@ struct Test_config {
  */
 
 /* Specialize Message_envelope to use Poison_pill, Fdatasync, and Fsync instead of monostate */
+namespace util {
 template<>
-struct Message_envelope<Test_message> {
-  std::variant<Test_message, Poison_pill, Fdatasync, Fsync> m_payload;
+struct Message_envelope<wal::Test_message> {
+  std::variant<wal::Test_message, Poison_pill, wal::Fdatasync, wal::Fsync> m_payload;
   Pid m_sender;
   Clock::time_point m_send_time{};  /* Timestamp when message was sent (for latency tracking) */
 };
+} // namespace util
 
-using Payload_type = Test_message;
-using Message_envelope_type = Message_envelope<Payload_type>;
-using Process_type = Process<Payload_type>;
-using Thread_mailbox_type = Thread_mailbox<Payload_type>;
-using Thread_mailboxes_type = Thread_mailboxes<Payload_type>;
-using Scheduler_type = Scheduler_base<Payload_type>;
+using Payload_type = wal::Test_message;
+using Message_envelope_type = util::Message_envelope<Payload_type>;
+using Process_type = util::Process<Payload_type>;
+using Process_mailbox_type = util::Process_mailbox<Payload_type>;
+using Process_mailboxes_type = util::Process_mailboxes<Payload_type>;
+using Scheduler_type = util::Scheduler_base<Payload_type>;
 
-struct Producer_context : public Producer_context_base<Payload_type, Scheduler_type> {
+struct Producer_context : public wal::Producer_context_base<Payload_type, Scheduler_type> {
   Sync_message_type m_sync_type{Sync_message_type::Fdatasync};
   bool m_track_latency{false};
 };
@@ -131,7 +133,7 @@ struct Log_message_processor {
     bool disable_log_writes,
     util::Metrics* metrics = nullptr,
     const Metrics_config* metrics_config = nullptr,
-    std::shared_ptr<Log_file> log_file = nullptr
+    std::shared_ptr<wal::Log_file> log_file = nullptr
   ) : m_log(std::move(log)),
       m_io_pool(io_pool),
       m_disable_log_writes(disable_log_writes),
@@ -239,7 +241,7 @@ public:
   const Metrics_config* m_metrics_config{nullptr};
   
   /** Log file for direct sync operations */
-  std::shared_ptr<Log_file> m_log_file{nullptr};
+  std::shared_ptr<wal::Log_file> m_log_file{nullptr};
 };
 
 /** Producer actor - sends log messages to consumer
@@ -262,7 +264,7 @@ Task<void> producer_actor(Producer_context ctx, std::size_t num_items, std::atom
 
   /* Send messages, randomly sending sync messages if interval is set */
   for (std::size_t i = 0; i < num_items; ++i) {
-    Message_envelope<Payload_type> env;
+    util::Message_envelope<Payload_type> env;
     env.m_sender = ctx.m_self;
     /* Only record send time if latency tracking is enabled - avoids expensive clock call */
     if (ctx.m_track_latency) [[unlikely]] {
@@ -272,12 +274,12 @@ Task<void> producer_actor(Producer_context ctx, std::size_t num_items, std::atom
     /* Send sync message randomly with 1/fdatasync_interval probability if interval is set */
     if (ctx.m_fdatasync_interval > 0 && dist(rng) == 1) {
       if (ctx.m_sync_type == Sync_message_type::Fdatasync) {
-        env.m_payload = Fdatasync{};
+        env.m_payload = wal::Fdatasync{};
       } else {
-        env.m_payload = Fsync{};
+        env.m_payload = wal::Fsync{};
       }
     } else {
-      Test_message msg{};
+      wal::Test_message msg{};
       env.m_payload = msg;
     }
 
@@ -292,7 +294,7 @@ Task<void> producer_actor(Producer_context ctx, std::size_t num_items, std::atom
     }
   }
 
-  Message_envelope<Payload_type> term_env{.m_payload = Poison_pill{}, .m_sender = ctx.m_self};
+  util::Message_envelope<Payload_type> term_env{.m_payload = util::Poison_pill{}, .m_sender = ctx.m_self};
 
   if (!ctx.m_proc->m_mailbox.enqueue(std::move(term_env))) {
     while (!ctx.m_proc->m_mailbox.enqueue(std::move(term_env))) {
@@ -319,7 +321,7 @@ Task<void> consumer_actor(
   }
  
   std::size_t completed_producers = 0;
-  Message_envelope<Payload_type> msg;
+  util::Message_envelope<Payload_type> msg;
   std::size_t no_work_iterations = 0;
  
   constexpr std::size_t bulk_read_size = 64;
@@ -330,7 +332,7 @@ Task<void> consumer_actor(
     /* Check for poison pills in consumer mailbox (if provided) */
     if (ctx.m_consumer_process != nullptr) {
       while (ctx.m_consumer_process->m_mailbox.dequeue(msg)) {
-        if (std::holds_alternative<Poison_pill>(msg.m_payload)) {
+        if (std::holds_alternative<util::Poison_pill>(msg.m_payload)) {
           ++completed_producers;
           if (completed_producers >= ctx.m_num_producers) {
             break;
@@ -343,7 +345,7 @@ Task<void> consumer_actor(
       break;
     }
  
-    Process<Payload_type>* proc = nullptr;
+    util::Process<Payload_type>* proc = nullptr;
     bool found_work = false;
  
     std::size_t num_notifications = 0;
@@ -356,27 +358,27 @@ Task<void> consumer_actor(
     for (std::size_t i = 0; i < num_notifications; ++i) {
       std::size_t mailbox_idx = notification_buffer[i];
  
-      auto thread_mbox = ctx.m_sched->m_mailboxes->get_for_thread(mailbox_idx);
- 
-      if (thread_mbox == nullptr) {
+      auto process_mbox = ctx.m_sched->m_mailboxes->get_for_process(mailbox_idx);
+
+      if (process_mbox == nullptr) {
         continue;
       }
- 
-      if (!thread_mbox->m_has_messages.load(std::memory_order_acquire)) {
+
+      if (!process_mbox->m_has_messages.load(std::memory_order_acquire)) {
         continue;
       }
- 
+
       bool loop_exited_normally = true;
- 
-      while (thread_mbox->m_queue.dequeue(proc)) {
+
+      while (process_mbox->m_queue.dequeue(proc)) {
         found_work = true;
- 
+
         util::prefetch_for_read<3>(proc);
- 
-        proc->m_in_thread_mailbox.store(false, std::memory_order_release);
+
+        proc->m_in_process_mailbox.store(false, std::memory_order_release);
  
         while (proc->m_mailbox.dequeue(msg)) {
-          if (std::holds_alternative<Poison_pill>(msg.m_payload)) [[unlikely]] {
+          if (std::holds_alternative<util::Poison_pill>(msg.m_payload)) [[unlikely]] {
             ++completed_producers;
  
             if (completed_producers >= ctx.m_num_producers) {
@@ -385,7 +387,7 @@ Task<void> consumer_actor(
             }
           } else {
             /* Check for Fdatasync */
-            if (std::holds_alternative<Fdatasync>(msg.m_payload)) {
+            if (std::holds_alternative<wal::Fdatasync>(msg.m_payload)) {
               /* Flush batch and call fdatasync */
               if constexpr (requires { ctx.m_processor->write_and_fdatasync(); }) {
                 ctx.m_processor->write_and_fdatasync();
@@ -393,7 +395,7 @@ Task<void> consumer_actor(
               continue;
             }
             /* Check for Fsync */
-            if (std::holds_alternative<Fsync>(msg.m_payload)) {
+            if (std::holds_alternative<wal::Fsync>(msg.m_payload)) {
               /* Flush batch and call fsync */
               if constexpr (requires { ctx.m_processor->write_and_fsync(); }) {
                 ctx.m_processor->write_and_fsync();
@@ -414,7 +416,7 @@ Task<void> consumer_actor(
       }
  
       if (loop_exited_normally) {
-        thread_mbox->m_has_messages.store(false, std::memory_order_release);
+        process_mbox->m_has_messages.store(false, std::memory_order_release);
       }
       
       if (completed_producers >= ctx.m_num_producers) {
@@ -447,14 +449,14 @@ Task<void> consumer_actor(
         }
  
         while (p->m_mailbox.dequeue(msg)) {
-          if (std::holds_alternative<Poison_pill>(msg.m_payload)) [[unlikely]] {
+          if (std::holds_alternative<util::Poison_pill>(msg.m_payload)) [[unlikely]] {
             ++completed_producers;
             if (completed_producers >= ctx.m_num_producers) {
               break;
             }
           } else {
             /* Check for Fdatasync */
-            if (std::holds_alternative<Fdatasync>(msg.m_payload)) {
+            if (std::holds_alternative<wal::Fdatasync>(msg.m_payload)) {
               if constexpr (requires { ctx.m_processor->write_and_fdatasync(); }) {
                 ctx.m_processor->write_and_fdatasync();
               }
@@ -491,7 +493,7 @@ static double test_throughput_actor_model_single_run(const Test_config& config) 
   const std::size_t producer_remainder = producers == 0 ? 0 : total_messages % producers;
 
   std::string path = config.m_disable_writes ? "/dev/null" : ("/local/tmp/test_actor.log");
-  auto log_file = std::make_shared<Log_file>(path, 512 * 1024 * 1024, config.m_log_block_size, config.m_disable_writes);
+  auto log_file = std::make_shared<wal::Log_file>(path, 512 * 1024 * 1024, config.m_log_block_size, config.m_disable_writes);
 
   WAL_ASSERT(log_file->m_fd != -1);
 
@@ -530,7 +532,7 @@ static double test_throughput_actor_model_single_run(const Test_config& config) 
   /* Store log_file in a way that write_and_fdatasync/fsync can access it.
    * We'll pass it through the Log_message_processor context */
   struct Log_file_wrapper {
-    std::shared_ptr<Log_file> m_log_file;
+    std::shared_ptr<wal::Log_file> m_log_file;
     util::Metrics* m_metrics_ptr;
     bool m_disable_writes;
   };
@@ -599,16 +601,16 @@ static double test_throughput_actor_model_single_run(const Test_config& config) 
     return result;
   };
 
-  Actor_test_setup<Payload_type, Scheduler_type> setup(producers);
+  wal::Log_service_setup<Payload_type, Scheduler_type> service_setup(producers);
 
-  std::vector<Pid> producer_pids;
+  std::vector<util::Pid> producer_pids;
   for (std::size_t i = 0; i < producers; ++i) {
-    producer_pids.push_back(setup.m_sched.spawn(config.m_mailbox_size));
+    producer_pids.push_back(service_setup.m_sched.spawn(config.m_mailbox_size));
   }
 
   /* Create consumer process for poison pills */
-  Pid consumer_pid = setup.m_sched.spawn(config.m_mailbox_size);
-  auto consumer_process = setup.m_sched.get_process(consumer_pid);
+  util::Pid consumer_pid = service_setup.m_sched.spawn(config.m_mailbox_size);
+  auto consumer_process = service_setup.m_sched.get_process(consumer_pid);
 
   std::atomic<bool> start_flag{false};
   std::atomic<bool> consumer_done{false};
@@ -618,8 +620,8 @@ static double test_throughput_actor_model_single_run(const Test_config& config) 
     .m_log_writer = log_writer,
     .m_consumer_done = &consumer_done,
     .m_disable_log_writes = config.m_disable_log_writes,
-    .m_consumer_pool = &setup.m_consumer_pool,
-    .m_io_pool = &setup.m_io_pool,
+    .m_consumer_pool = &service_setup.m_consumer_pool,
+    .m_io_pool = &service_setup.m_io_pool,
     .m_consumer_process = consumer_process,
     .m_sched = nullptr,  /* Will be set after processor is created */
     .m_processor = nullptr,  /* Will be set after processor is created */
@@ -629,7 +631,7 @@ static double test_throughput_actor_model_single_run(const Test_config& config) 
 
   /* Start the background I/O coroutine to process buffers on dedicated I/O pool */
   if (!config.m_disable_log_writes) {
-    log->start_io(log_writer, &setup.m_io_pool);
+    log->start_io(log_writer, &service_setup.m_io_pool);
     /* Brief pause to ensure I/O coroutine is scheduled and ready */
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
@@ -655,7 +657,7 @@ static double test_throughput_actor_model_single_run(const Test_config& config) 
   );
 
   /* Set additional fields in consumer context */
-  consumer_ctx.m_sched = &setup.m_sched;
+  consumer_ctx.m_sched = &service_setup.m_sched;
   consumer_ctx.m_processor = &msg_processor;
   consumer_ctx.m_num_producers = producers;
   consumer_ctx.m_batch_timeout = std::chrono::milliseconds(10);  /* Flush batch every 10ms */
@@ -670,8 +672,8 @@ static double test_throughput_actor_model_single_run(const Test_config& config) 
 
     Producer_context producer_ctx;
     producer_ctx.m_self = producer_pids[p];
-    producer_ctx.m_proc = setup.m_sched.get_process(producer_pids[p]);
-    producer_ctx.m_sched = &setup.m_sched;
+    producer_ctx.m_proc = service_setup.m_sched.get_process(producer_pids[p]);
+    producer_ctx.m_sched = &service_setup.m_sched;
     producer_ctx.m_fdatasync_interval = config.m_fdatasync_interval;
     producer_ctx.m_sync_type = config.m_sync_type;
     /* Enable latency tracking if metrics are enabled, producer latency is enabled, and log writes are not disabled */
@@ -680,7 +682,7 @@ static double test_throughput_actor_model_single_run(const Test_config& config) 
                                     log->get_metrics() != nullptr && 
                                     !config.m_disable_log_writes);
     auto producer_task = producer_actor(producer_ctx, messages_for_this_producer, start_flag); 
-    producer_task.start_on_pool(setup.m_producer_pool);
+    producer_task.start_on_pool(service_setup.m_producer_pool);
   }
 
   /* Brief warmup to ensure all coroutines are scheduled and ready */
@@ -829,7 +831,7 @@ static void test_throughput_actor_model(const Test_config& config) {
   const double avg_ops_per_sec = total_ops_per_sec / static_cast<double>(config.m_num_iterations);
   const std::size_t total_messages = config.m_num_messages;
   const double avg_elapsed_s = static_cast<double>(total_messages) / avg_ops_per_sec;
-  const double throughput_bytes_s = avg_ops_per_sec * Test_message::SIZE;
+  const double throughput_bytes_s = avg_ops_per_sec * wal::Test_message::SIZE;
 
   /* Format throughput with appropriate units (KiB/s, MiB/s, GiB/s) */
   const char* throughput_unit = "B/s";

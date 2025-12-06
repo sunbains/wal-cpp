@@ -14,14 +14,13 @@
 #include <memory>
 #include <bit>
 
+#include "coro/task.h"
 #include "util/util.h"
-#include "wal/wal.h"
-#include "wal/buffer_pool.h"
 #include "util/logger.h"
 #include "util/thread_pool.h"
-#include "coro/task.h"
-
-#include "log_io.h"
+#include "wal/buffer_pool.h"
+#include "wal/wal.h"
+#include "wal/io.h"
 
 /* Local logger instance for this test file */
 util::Logger<util::MT_logger_writer> g_logger(util::MT_logger_writer{std::cerr}, util::Log_level::Trace);
@@ -48,7 +47,7 @@ void producer(
     util::cpu_pause();
   }
 
-  Test_message msg;
+  wal::Test_message msg;
 
   for (std::size_t i = 0; i < num_messages; ++i) {
     /* Write directly to log - I/O coroutine handles buffer processing in background */
@@ -66,7 +65,7 @@ static void test_log_io_simple(const Test_config& config) {
                config.m_num_messages, config.m_disable_writes);
 
   std::string path = config.m_disable_writes ? "/dev/null" : "/local/tmp/test_log_io_simple.log";
-  auto log_file = std::make_shared<Log_file>(path, 512 * 1024 * 1024, config.m_log_block_size, config.m_disable_writes);
+  auto log_file = std::make_shared<wal::Log_file>(path, 512 * 1024 * 1024, config.m_log_block_size, config.m_disable_writes);
 
   WAL_ASSERT(log_file->m_fd != -1);
 
@@ -165,7 +164,7 @@ static void test_log_io_simple(const Test_config& config) {
   /* All messages were processed when producer_done is true */
   const std::size_t total_written = config.m_num_messages;
   const double elapsed_sec = static_cast<double>(elapsed) / 1000.0;
-  const double throughput_mib = (static_cast<double>(total_written) * static_cast<double>(Test_message::SIZE)) / (1024.0 * 1024.0) / elapsed_sec;
+  const double throughput_mib = (static_cast<double>(total_written) * static_cast<double>(wal::Test_message::SIZE)) / (1024.0 * 1024.0) / elapsed_sec;
   const double ops_per_sec = static_cast<double>(total_written) / elapsed_sec;
 
   std::println("[test_log_io_simple] total_messages={}, elapsed={}ms, throughput={:.2f} MiB/s, ops={:.0f} ops/s",

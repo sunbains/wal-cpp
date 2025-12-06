@@ -15,6 +15,7 @@
 
 extern util::Logger<util::MT_logger_writer> g_logger;
 
+namespace wal {
 /**
  * Log file wrapper for testing WAL I/O performance
  * Handles file operations with optional write disabling and statistics tracking
@@ -73,7 +74,9 @@ struct Log_file {
 
       if (total_written < total_len_to_write) [[unlikely]] {
         m_stats.m_n_write_retries.fetch_add(1, std::memory_order_relaxed);
+
         std::size_t remaining = total_len_to_write - total_written;
+
         for (std::size_t i = iov_index; i < iov_size && remaining > 0; ++i) {
           const std::size_t len = iov_span[i].iov_len;
           if (len <= remaining) {
@@ -168,3 +171,5 @@ struct alignas(64) Test_message {
 };
 
 static_assert(sizeof(Test_message) == 64, "Test_message should be 64 bytes");
+
+} // namespace wal

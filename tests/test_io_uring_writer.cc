@@ -24,7 +24,7 @@
 #include "util/metrics.h"
 #include "wal/wal.h"
 #include "wal/io_uring_writer.h"
-#include "log_io.h"
+#include "wal/io.h"
 
 /* Local logger instance for this test file */
 util::Logger<util::MT_logger_writer> g_logger(util::MT_logger_writer{std::cerr}, util::Log_level::Trace);

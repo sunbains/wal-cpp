@@ -9,12 +9,13 @@
 #include <variant>
 #include <array>
 
+#include "util/actor_model.h"
 #include "util/bounded_channel.h"
 #include "util/spsc.h"
 #include "util/thread_pool.h"
 #include "util/util.h"
 #include "coro/task.h"
-#include "actor_model.h"
+#include "wal/service.h"
 
 /**
  * Erlang-style Actor Model (SPSC architecture)
@@ -26,17 +27,17 @@
  */
 
 using Payload_size_t = std::size_t;
-using Process_t = Process<Payload_size_t>;
-using Thread_mailbox_t = Thread_mailbox<Payload_size_t>;
-using Thread_mailboxes_t = Thread_mailboxes<Payload_size_t>;
-using Message_envelope_t = Message_envelope<Payload_size_t>;
+using Process_t = util::Process<Payload_size_t>;
+using Process_mailbox_t = util::Process_mailbox<Payload_size_t>;
+using Process_mailboxes_t = util::Process_mailboxes<Payload_size_t>;
+using Message_envelope_t = util::Message_envelope<Payload_size_t>;
 
 /**
  * Extended scheduler with consumer handle support (for test_actor_model)
  */
 template<typename PayloadType>
-struct Scheduler_with_consumer : public Scheduler_base<PayloadType> {
-  using Process_type = Process<PayloadType>;
+struct Scheduler_with_consumer : public util::Scheduler_base<PayloadType> {
+  using Process_type = util::Process<PayloadType>;
   
   void schedule_consumer() {
     if (m_consumer_handle && !m_consumer_handle.done()) {
@@ -53,11 +54,11 @@ struct Scheduler_with_consumer : public Scheduler_base<PayloadType> {
 
 using Scheduler_t = Scheduler_with_consumer<Payload_size_t>;
 
-/* Actor_context - inherits from Producer_context_base for common send() implementation */
-struct Actor_context : public Producer_context_base<Payload_size_t, Scheduler_t> {
+/* Actor_context - inherits from wal::Producer_context_base for common send() implementation */
+struct Actor_context : public wal::Producer_context_base<Payload_size_t, Scheduler_t> {
   /* Constructor to initialize base class members */
-  Actor_context(Pid self, Process_t* proc, Scheduler_t* sched, Process_t* consumer_proc = nullptr)
-    : Producer_context_base<Payload_size_t, Scheduler_t>{.m_self = self, .m_proc = proc, .m_sched = sched, .m_consumer_proc = consumer_proc} {}
+  Actor_context(util::Pid self, Process_t* proc, Scheduler_t* sched, Process_t* consumer_proc = nullptr)
+    : wal::Producer_context_base<Payload_size_t, Scheduler_t>{.m_self = self, .m_proc = proc, .m_sched = sched, .m_consumer_proc = consumer_proc} {}
 };
 
 /**
@@ -76,7 +77,7 @@ Task<void> producer_actor(Actor_context ctx, std::size_t num_items, std::atomic<
    * Optimize fast path - queue is rarely full */
   for (std::size_t i = 0; i < num_items; ++i) {
     /* Directly construct envelope with payload - identity case (PayloadType == std::size_t) */
-    Message_envelope<Payload_size_t> env{.m_sender = ctx.m_self, .m_payload = i};
+    util::Message_envelope<Payload_size_t> env{.m_sender = ctx.m_self, .m_payload = i};
 
     /* Fast path: try enqueue first without any overhead */
     if (ctx.m_proc->m_mailbox.enqueue(std::move(env))) [[likely]] {
@@ -94,7 +95,7 @@ Task<void> producer_actor(Actor_context ctx, std::size_t num_items, std::atomic<
     }
   }
 
-  Message_envelope<Payload_size_t> term_env{.m_sender = ctx.m_self, .m_payload = Poison_pill{}};
+  util::Message_envelope<Payload_size_t> term_env{.m_sender = ctx.m_self, .m_payload = util::Poison_pill{}};
 
   if (!ctx.m_proc->m_mailbox.enqueue(std::move(term_env))) {
     while (!ctx.m_proc->m_mailbox.enqueue(std::move(term_env))) {
@@ -129,7 +130,7 @@ Task<void> consumer_actor(
   }
 
   std::size_t completed_producers = 0;
-  Message_envelope<Payload_size_t> msg;
+  util::Message_envelope<Payload_size_t> msg;
   std::size_t no_work_iterations = 0;
 
   constexpr std::size_t bulk_read_size = 64;
@@ -139,7 +140,7 @@ Task<void> consumer_actor(
     /* Check for poison pills in consumer mailbox (if provided) */
     if (consumer_proc != nullptr) {
       while (consumer_proc->m_mailbox.dequeue(msg)) {
-        if (std::holds_alternative<Poison_pill>(msg.m_payload)) {
+        if (std::holds_alternative<util::Poison_pill>(msg.m_payload)) {
           ++completed_producers;
           if (completed_producers >= num_producers) {
             break;
@@ -152,7 +153,7 @@ Task<void> consumer_actor(
       break;
     }
 
-    Process<Payload_size_t>* proc = nullptr;
+    util::Process<Payload_size_t>* proc = nullptr;
     bool found_work = false;
 
     std::size_t num_notifications = 0;
@@ -165,27 +166,27 @@ Task<void> consumer_actor(
     for (std::size_t i = 0; i < num_notifications; ++i) {
       std::size_t mailbox_idx = notification_buffer[i];
 
-      auto thread_mbox = sched->m_mailboxes->get_for_thread(mailbox_idx);
+      auto process_mbox = sched->m_mailboxes->get_for_process(mailbox_idx);
 
-      if (thread_mbox == nullptr) {
+      if (process_mbox == nullptr) {
         continue;
       }
 
-      if (!thread_mbox->m_has_messages.load(std::memory_order_acquire)) {
+      if (!process_mbox->m_has_messages.load(std::memory_order_acquire)) {
         continue;
       }
 
       bool loop_exited_normally = true;
 
-      while (thread_mbox->m_queue.dequeue(proc)) {
+      while (process_mbox->m_queue.dequeue(proc)) {
         found_work = true;
 
         util::prefetch_for_read<3>(proc);
 
-        proc->m_in_thread_mailbox.store(false, std::memory_order_release);
+        proc->m_in_process_mailbox.store(false, std::memory_order_release);
 
         while (proc->m_mailbox.dequeue(msg)) {
-          if (std::holds_alternative<Poison_pill>(msg.m_payload)) [[unlikely]] {
+          if (std::holds_alternative<util::Poison_pill>(msg.m_payload)) [[unlikely]] {
             ++completed_producers;
 
             if (completed_producers >= num_producers) {
@@ -194,7 +195,7 @@ Task<void> consumer_actor(
             }
           } else {
             /* Regular payload message */
-            process_payload_message(process_msg, std::get<Payload_size_t>(msg.m_payload), msg);
+            util::process_payload_message(process_msg, std::get<Payload_size_t>(msg.m_payload), msg);
           }
         }
         
@@ -205,7 +206,7 @@ Task<void> consumer_actor(
       }
 
       if (loop_exited_normally) {
-        thread_mbox->m_has_messages.store(false, std::memory_order_release);
+        process_mbox->m_has_messages.store(false, std::memory_order_release);
       }
       
       if (completed_producers >= num_producers) {
@@ -238,14 +239,14 @@ Task<void> consumer_actor(
         }
 
         while (p->m_mailbox.dequeue(msg)) {
-          if (std::holds_alternative<Poison_pill>(msg.m_payload)) [[unlikely]] {
+          if (std::holds_alternative<util::Poison_pill>(msg.m_payload)) [[unlikely]] {
             ++completed_producers;
             if (completed_producers >= num_producers) {
               break;
             }
           } else {
             /* Regular payload message */
-            process_payload_message(process_msg, std::get<Payload_size_t>(msg.m_payload), msg);
+            util::process_payload_message(process_msg, std::get<Payload_size_t>(msg.m_payload), msg);
           }
         }
         
@@ -282,17 +283,17 @@ struct Benchmark_result {
 };
 
 Benchmark_result test_actor_model(const Config& config) {
-  Actor_test_setup<Payload_size_t, Scheduler_t> test_setup(config.m_num_producers);
+  wal::Log_service_setup<Payload_size_t, Scheduler_t> service_setup(config.m_num_producers);
 
   /* Spawn consumer process for poison pills */
-  Pid consumer_pid = test_setup.m_sched.spawn(config.m_mailbox_size);
-  Process_t* consumer_proc = test_setup.m_sched.get_process(consumer_pid);
+  util::Pid consumer_pid = service_setup.m_sched.spawn(config.m_mailbox_size);
+  util::Process<Payload_size_t>* consumer_proc = service_setup.m_sched.get_process(consumer_pid);
 
   /* Spawn producers - spawn one process per producer */
-  std::vector<Pid> producer_pids;
+  std::vector<util::Pid> producer_pids;
 
   for (std::size_t i = 0; i < config.m_num_producers; ++i) {
-    producer_pids.push_back(test_setup.m_sched.spawn(config.m_mailbox_size));
+    producer_pids.push_back(service_setup.m_sched.spawn(config.m_mailbox_size));
   }
 
   std::atomic<bool> start_flag{false};
@@ -300,7 +301,7 @@ Benchmark_result test_actor_model(const Config& config) {
   std::size_t items_per_producer = config.m_total_items / config.m_num_producers;
 
   /* Launch consumer (scans thread-local mailboxes) */
-  detach(consumer_actor(&test_setup.m_sched, consumer_proc, config.m_num_producers, start_flag, consumer_done));
+  detach(consumer_actor(&service_setup.m_sched, consumer_proc, config.m_num_producers, start_flag, consumer_done));
 
   /* Launch producers */
   for (std::size_t p = 0; p < config.m_num_producers; ++p) {
@@ -310,13 +311,13 @@ Benchmark_result test_actor_model(const Config& config) {
 
     Actor_context producer_ctx(
       producer_pids[p],
-      test_setup.m_sched.get_process(producer_pids[p]),
-      &test_setup.m_sched,
+      service_setup.m_sched.get_process(producer_pids[p]),
+      &service_setup.m_sched,
       consumer_proc
     );
 
     auto producer_task = producer_actor(producer_ctx, items, start_flag);
-    producer_task.start_on_pool(test_setup.m_producer_pool);
+    producer_task.start_on_pool(service_setup.m_producer_pool);
   }
 
   std::this_thread::sleep_for(std::chrono::milliseconds(10));
