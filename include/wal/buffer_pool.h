@@ -11,7 +11,7 @@
 #include "util/logger.h"
 #include "util/thread_pool.h"
 #include "util/util.h"
-#include "wal/wal.h"
+#include "wal/buffer.h"
 
 extern util::Logger<util::MT_logger_writer> g_logger;
 
@@ -70,7 +70,7 @@ struct Pool {
     std::atomic<State> m_state{State::Free};
     
     /** Sync type for this buffer when it's ready for I/O (used for async sync operations). */
-    Log::Sync_type m_sync_type{Log::Sync_type::None};
+    wal::Sync_type m_sync_type{wal::Sync_type::None};
   };
 
   /**
@@ -134,7 +134,7 @@ struct Pool {
    * 
    * @param buffer The buffer to prepare for IO.
    */
-  Entry* prepare_buffer_for_io(Entry* entry_ptr, util::Thread_pool& thread_pool, Log::Write_callback& write_callback) noexcept {
+  Entry* prepare_buffer_for_io(Entry* entry_ptr, util::Thread_pool& thread_pool, Buffer::Write_callback& write_callback) noexcept {
     WAL_ASSERT(entry_ptr == m_active);
     WAL_ASSERT(!entry_ptr->m_buffer.is_empty());  /* Buffer must have data, but doesn't need to be full */
     WAL_ASSERT(entry_ptr->m_state == Entry::State::In_use);
@@ -167,11 +167,11 @@ struct Pool {
     return m_active;
   }
 
-  /* I/O coroutine function - takes Log* and Entry* as parameters.
+  /* I/O coroutine function - takes * and Entry* as parameters.
    * Log is the coordinator and controls orchestration, so it provides the I/O callback.
    * This ensures the parameters are stored in the coroutine frame, not in a closure on the stack.
    */
-  static Task<void> io_coroutine_function(Log::Write_callback write_callback, Pool* pool, Entry* entry_ptr) {
+  static Task<void> io_coroutine_function(Buffer::Write_callback write_callback, Pool* pool, Entry* entry_ptr) {
     WAL_ASSERT(write_callback && "I/O callback must be set via start_io");
     
     auto result = entry_ptr->m_buffer.write_to_store(write_callback);
@@ -189,7 +189,7 @@ struct Pool {
     co_return;
   }
 
-  void post_io_task_for_buffer(Entry* entry_ptr, util::Thread_pool& thread_pool, Log::Write_callback write_callback) noexcept {
+  void post_io_task_for_buffer(Entry* entry_ptr, util::Thread_pool& thread_pool, Buffer::Write_callback write_callback) noexcept {
     WAL_ASSERT(!entry_ptr->m_buffer.is_empty());  /* Buffer must have data, but doesn't need to be full */
     WAL_ASSERT(entry_ptr->m_state == Entry::State::Ready_for_io);
     WAL_ASSERT(write_callback && "I/O callback must be set via start_io");
@@ -304,7 +304,7 @@ struct Pool {
   alignas(64) std::atomic<bool> m_io_thread_running{false};
 
   /* Synchronous write callback for inline I/O when buffers exhausted */
-  std::function<Result<std::size_t>(std::span<struct iovec>, Log::Sync_type)> m_sync_write_callback;
+  std::function<Result<std::size_t>(std::span<struct iovec>, wal::Sync_type)> m_sync_write_callback;
 };
 
 } // namespace wal
