@@ -154,16 +154,16 @@ if(WAL_BUILD_LIB OR WAL_BUILD_TESTS)
 
     # Test-specific flags for GCC/Clang
     set(WAL_TEST_COMPILE_OPTIONS_DEBUG_GCC_CLANG
-      ${WAL_COMPILE_OPTIONS_BASE_GCC_CLANG} -ggdb3 -O3 -fno-omit-frame-pointer
+      ${WAL_COMPILE_OPTIONS_BASE_GCC_CLANG} -ggdb3 -O0 -fno-omit-frame-pointer
     )
     set(WAL_TEST_COMPILE_OPTIONS_PERF_GCC_CLANG
-      ${WAL_COMPILE_OPTIONS_BASE_GCC_CLANG} -O3 -ggdb3 -fno-omit-frame-pointer
+      ${WAL_COMPILE_OPTIONS_BASE_GCC_CLANG} -O0 -ggdb3 -fno-omit-frame-pointer
     )
     set(WAL_TEST_COMPILE_OPTIONS_PERF_LTO_GCC_CLANG
-      ${WAL_COMPILE_OPTIONS_BASE_GCC_CLANG} -O3 -ggdb3 -flto -march=native -mtune=native -fno-omit-frame-pointer
+      ${WAL_COMPILE_OPTIONS_BASE_GCC_CLANG} -O0 -ggdb3 -flto -march=native -mtune=native -fno-omit-frame-pointer
     )
     set(WAL_TEST_COMPILE_OPTIONS_CORO_GCC_CLANG
-      ${WAL_COMPILE_OPTIONS_BASE_GCC_CLANG} -O3 -ggdb3 -fno-omit-frame-pointer
+      ${WAL_COMPILE_OPTIONS_BASE_GCC_CLANG} -O0 -ggdb3 -fno-omit-frame-pointer
     )
   endif()
 

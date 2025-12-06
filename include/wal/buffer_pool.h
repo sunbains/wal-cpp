@@ -137,10 +137,9 @@ struct Pool {
   Entry* prepare_buffer_for_io(Entry* entry_ptr, util::Thread_pool& thread_pool, Log::Write_callback& write_callback) noexcept {
     WAL_ASSERT(entry_ptr == m_active);
     WAL_ASSERT(!entry_ptr->m_buffer.is_empty());  /* Buffer must have data, but doesn't need to be full */
-    WAL_ASSERT(!entry_ptr->m_buffer.pending_writes());
     WAL_ASSERT(entry_ptr->m_state == Entry::State::In_use);
 
-    const auto hwm = entry_ptr->m_buffer.m_reserve_counters.m_hwm;
+    const auto hwm = entry_ptr->m_buffer.m_hwm;
 
     entry_ptr->m_state = Entry::State::Ready_for_io;
 
@@ -181,10 +180,7 @@ struct Pool {
       log_fatal("IO task failed");
     }
     
-    /* Clear the buffer before returning it to the free pool */
-    /* Use the written_lsn as the new HWM since we wrote up to that point */
-    const auto hwm = entry_ptr->m_buffer.m_lsn_counters.m_written_lsn;
-    entry_ptr->m_buffer.initialize(hwm);
+    entry_ptr->m_buffer.initialize(entry_ptr->m_buffer.m_hwm);
     entry_ptr->m_state = Entry::State::Free;
 
     [[maybe_unused]] auto ret = pool->m_free_buffers.enqueue(entry_ptr);
@@ -195,7 +191,6 @@ struct Pool {
 
   void post_io_task_for_buffer(Entry* entry_ptr, util::Thread_pool& thread_pool, Log::Write_callback write_callback) noexcept {
     WAL_ASSERT(!entry_ptr->m_buffer.is_empty());  /* Buffer must have data, but doesn't need to be full */
-    WAL_ASSERT(!entry_ptr->m_buffer.pending_writes());
     WAL_ASSERT(entry_ptr->m_state == Entry::State::Ready_for_io);
     WAL_ASSERT(write_callback && "I/O callback must be set via start_io");
 
@@ -265,7 +260,6 @@ struct Pool {
   }
 
   void shutdown() noexcept {
-    WAL_ASSERT(!m_active->m_buffer.pending_writes());
     WAL_ASSERT(m_active->m_state == Entry::State::In_use);
 
     auto active = m_active;

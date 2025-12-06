@@ -17,6 +17,7 @@
 #include <getopt.h>
 #include <sched.h>
 #include <unistd.h>
+#include <print>
 
 #if defined(HAVE_PTHREAD_SETAFFINITY_NP) || defined(HAVE_PTHREAD_SETSCHEDPARAM)
 #include <pthread.h>
@@ -93,7 +94,7 @@ inline std::uint32_t fast_rand(std::uint32_t& state) noexcept {
 }
 
 static void test_throughput(const Test_config& config) {
-  std::fprintf(stderr, "[test_throughput] start (queue_size=%zu, producers=%zu, consumers=%zu, messages=%zu, iterations=%zu)\n",
+  std::println(stderr, "[test_throughput] start (queue_size={}, producers={}, consumers={}, messages={}, iterations={})",
                config.queue_size, config.num_producers, config.num_consumers, config.num_messages, config.num_iterations);
 
   Bounded_queue<Test_message> queue(config.queue_size);
@@ -247,8 +248,8 @@ static void test_throughput(const Test_config& config) {
   const auto throughput_mib_s = (static_cast<double>(total_bytes) / elapsed_s) / (1024.0 * 1024.0);
   const auto ops_per_sec = static_cast<double>(sent) / elapsed_s;
 
-  std::fprintf(stderr,
-               "[test_throughput] done (sent=%zu, received=%zu, elapsed=%.3fs, throughput=%.2f MiB/s, ops=%.0f ops/s)\n",
+  std::println(stderr,
+               "[test_throughput] done (sent={}, received={}, elapsed={:.3f}s, throughput={:.2f} MiB/s, ops={:.0f} ops/s)",
                sent, received, elapsed_s, throughput_mib_s, ops_per_sec);
 
   assert(sent == received);
@@ -256,8 +257,8 @@ static void test_throughput(const Test_config& config) {
 }
 
 static void print_usage(const char* program_name) noexcept {
-  std::fprintf(stderr,
-               "Usage: %s [OPTIONS]\n"
+  std::println(stderr,
+               "Usage: {} [OPTIONS]\n"
                "\n"
                "Options:\n"
                "  -q, --queue-size NUM    Queue size (must be power of 2, default: 1024)\n"
@@ -269,13 +270,10 @@ static void print_usage(const char* program_name) noexcept {
                "  -h, --help              Show this help message\n"
                "\n"
                "Examples:\n"
-               "  %s -q 1024 -m 1000000 -i 10\n"
-               "  %s -t 4 -q 2048 -m 500000\n"
-               "  %s -p 4 -c 2 -q 2048 -m 500000\n",
-               program_name,
-               program_name,
-               program_name,
-               program_name);
+               "  {} -q 1024 -m 1000000 -i 10\n"
+               "  {} -t 4 -q 2048 -m 500000\n"
+               "  {} -p 4 -c 2 -q 2048 -m 500000\n",
+               program_name, program_name, program_name, program_name);
 }
 
 /* Main */
@@ -304,11 +302,11 @@ int main(int argc, char** argv) {
         const auto parsed = std::strtoull(optarg, &end, 10);
         const bool invalid = (end == optarg) || (*end != '\0') || (errno != 0);
         if (invalid || parsed == 0) {
-          std::fprintf(stderr, "[bounded_queue_perf] invalid queue size '%s'\n", optarg);
+          std::println(stderr, "[bounded_queue_perf] invalid queue size '{}'", optarg);
           return EXIT_FAILURE;
         }
         if ((parsed & (parsed - 1)) != 0) {
-          std::fprintf(stderr, "[bounded_queue_perf] queue size must be a power of 2, got '%s'\n", optarg);
+          std::println(stderr, "[bounded_queue_perf] queue size must be a power of 2, got '{}'", optarg);
           return EXIT_FAILURE;
         }
         config.queue_size = static_cast<std::size_t>(parsed);
@@ -320,7 +318,7 @@ int main(int argc, char** argv) {
         const auto parsed = std::strtoull(optarg, &end, 10);
         const bool invalid = (end == optarg) || (*end != '\0') || (errno != 0);
         if (invalid || parsed == 0) {
-          std::fprintf(stderr, "[bounded_queue_perf] invalid number of messages '%s'\n", optarg);
+          std::println(stderr, "[bounded_queue_perf] invalid number of messages '{}'", optarg);
           return EXIT_FAILURE;
         }
         config.num_messages = static_cast<std::size_t>(parsed);
@@ -332,7 +330,7 @@ int main(int argc, char** argv) {
         const auto parsed = std::strtoull(optarg, &end, 10);
         const bool invalid = (end == optarg) || (*end != '\0') || (errno != 0);
         if (invalid || parsed == 0) {
-          std::fprintf(stderr, "[bounded_queue_perf] invalid number of iterations '%s'\n", optarg);
+          std::println(stderr, "[bounded_queue_perf] invalid number of iterations '{}'", optarg);
           return EXIT_FAILURE;
         }
         config.num_iterations = static_cast<std::size_t>(parsed);
@@ -344,7 +342,7 @@ int main(int argc, char** argv) {
         const auto parsed = std::strtoull(optarg, &end, 10);
         const bool invalid = (end == optarg) || (*end != '\0') || (errno != 0);
         if (invalid || parsed == 0) {
-          std::fprintf(stderr, "[bounded_queue_perf] invalid number of threads '%s'\n", optarg);
+          std::println(stderr, "[bounded_queue_perf] invalid number of threads '{}'", optarg);
           return EXIT_FAILURE;
         }
         // num_threads not used in current implementation
@@ -357,7 +355,7 @@ int main(int argc, char** argv) {
         const auto parsed = std::strtoull(optarg, &end, 10);
         const bool invalid = (end == optarg) || (*end != '\0') || (errno != 0);
         if (invalid || parsed == 0) {
-          std::fprintf(stderr, "[bounded_queue_perf] invalid number of producers '%s'\n", optarg);
+          std::println(stderr, "[bounded_queue_perf] invalid number of producers '{}'", optarg);
           return EXIT_FAILURE;
         }
         config.num_producers = static_cast<std::size_t>(parsed);
@@ -369,7 +367,7 @@ int main(int argc, char** argv) {
         const auto parsed = std::strtoull(optarg, &end, 10);
         const bool invalid = (end == optarg) || (*end != '\0') || (errno != 0);
         if (invalid || parsed == 0) {
-          std::fprintf(stderr, "[bounded_queue_perf] invalid number of consumers '%s'\n", optarg);
+          std::println(stderr, "[bounded_queue_perf] invalid number of consumers '{}'", optarg);
           return EXIT_FAILURE;
         }
         config.num_consumers = static_cast<std::size_t>(parsed);
@@ -387,7 +385,7 @@ int main(int argc, char** argv) {
   }
 
   if (optind < argc) {
-    std::fprintf(stderr, "[bounded_queue_perf] unexpected argument: '%s'\n", argv[optind]);
+    std::println(stderr, "[bounded_queue_perf] unexpected argument: '{}'", argv[optind]);
     print_usage(argv[0]);
     return EXIT_FAILURE;
   }

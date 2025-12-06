@@ -43,16 +43,14 @@ namespace wal {
  Circular_buffer::~Circular_buffer() noexcept {}
 
 void Circular_buffer::initialize(lsn_t hwm) noexcept {
-  m_reserve_counters.m_hwm = hwm;
-  m_reserve_counters.m_n_pending_writes = 0;
-  m_lsn_counters.m_lwm = hwm;
-  m_lsn_counters.m_written_lsn = hwm;
+  m_hwm = hwm;
+  m_lwm = hwm;
 
   /* Clear all block headers to ensure clean state when buffer is reused */
   std::memset(m_block_header_array, 0, sizeof(Block_header) * m_config.m_n_blocks);
 
   const auto data_size = m_config.get_data_size_in_block();
-  [[maybe_unused]] const auto block_start_no{m_lsn_counters.m_lwm / data_size};
+  [[maybe_unused]] const auto block_start_no{m_lwm / data_size};
   WAL_ASSERT(block_start_no + m_config.m_n_blocks < std::numeric_limits<block_no_t>::max());
 
   /* Set the initial block header at the HWM position */
@@ -71,19 +69,13 @@ Circular_buffer::Circular_buffer(const Config& config) noexcept
 
 std::string Circular_buffer::to_string() const noexcept {
   return std::format(
-    "Circular_buffer: lwm={}, written_lsn={}, hwm={}, n_pending_writes={}, margin={}, total_size={}",
-    m_lsn_counters.m_lwm,
-    m_lsn_counters.m_written_lsn,
-    m_reserve_counters.m_hwm,
-    m_reserve_counters.m_n_pending_writes,
-    margin(),
-    get_total_data_size()
-  );
+    "Circular_buffer: lwm={}, hwm={}, margin={}, total_size={}",
+    m_lwm, m_hwm, margin(), get_total_data_size());
 }
 
 void Circular_buffer::clear(lsn_t start_lsn, lsn_t end_lsn) noexcept {
   WAL_ASSERT(start_lsn <= end_lsn);
-  WAL_ASSERT(end_lsn <= m_lsn_counters.m_written_lsn);
+  WAL_ASSERT(end_lsn <= m_hwm);
 
   const auto end_ptr = m_block_header_array + m_config.m_n_blocks;
   const auto data_size = m_config.get_data_size_in_block();
@@ -125,26 +117,32 @@ void Circular_buffer::clear(lsn_t start_lsn, lsn_t end_lsn) noexcept {
 namespace {
 
 std::size_t prepare_batch(Circular_buffer& buffer, block_no_t start, block_no_t end, std::size_t batch_size) noexcept {
-  std::size_t data_len{};
   const auto n_slots = batch_size * 3;
-  [[maybe_unused]] const auto data_size = buffer.m_config.get_data_size_in_block();
+  const auto data_size = buffer.m_config.get_data_size_in_block();
 
   auto block_no = start;
-  std::size_t block_index = block_no % buffer.m_config.m_n_blocks;
+  const auto total_data_len = buffer.m_hwm - buffer.m_lwm;
+
+  WAL_ASSERT(total_data_len <= buffer.get_total_data_size());
+
+  auto remaining_data_len = total_data_len;
+  auto block_index = block_no % buffer.m_config.m_n_blocks;
 
   for (std::size_t i{}; i < n_slots; i += 3,  ++block_no) {
     auto [header, span, crc32] = buffer.get_block(block_index);
 
-    WAL_ASSERT(header->get_block_no() == block_no_t(block_no));
-    WAL_ASSERT(header->get_first_rec_group() <= header->m_data.m_len);
-    WAL_ASSERT(header->m_data.m_len <= data_size);
-
-    data_len += header->m_data.m_len;
+    header->set_block_no(block_no);
+    header->set_data_len(std::uint16_t(std::min(remaining_data_len, data_size)));
 
     const auto is_last_block = header->get_block_no() == end;
 
     if (is_last_block) [[unlikely]] {
       header->set_flush_bit(true);
+      if (header->get_first_rec_group() == 0) [[unlikely]] {
+        header->set_first_rec_group(header->get_data_len());
+      }
+    } else {
+      header->set_first_rec_group(0);
     }
 
     WAL_ASSERT(header->m_data.m_len == uint16_t(data_size)
@@ -164,17 +162,19 @@ std::size_t prepare_batch(Circular_buffer& buffer, block_no_t start, block_no_t 
     buffer.m_iovecs[i + 2].iov_len = sizeof(crc32_t);
 
     block_index = (block_index + 1) % buffer.m_config.m_n_blocks;
+
+    WAL_ASSERT(remaining_data_len >= header->get_data_len());
+    remaining_data_len -= header->get_data_len();
   }
 
-  return data_len;
+  return total_data_len;
 }
 
 } // anonymous namespace
 
 Result<lsn_t> Circular_buffer::write_to_store(Write_callback callback, lsn_t max_write_lsn) noexcept {
   WAL_ASSERT(!is_empty());
-  WAL_ASSERT(m_reserve_counters.m_hwm > m_lsn_counters.m_lwm);
-  WAL_ASSERT(!is_write_pending());
+  WAL_ASSERT(is_write_pending());
 
   std::size_t total_batches = 0;
   std::size_t total_bytes_written = 0;
@@ -184,10 +184,11 @@ Result<lsn_t> Circular_buffer::write_to_store(Write_callback callback, lsn_t max
 
   /* We start writing from the LWM, which is the first block that has data
    * that has not been written to the store yet. */
-  auto block_start_no = static_cast<block_no_t>(m_lsn_counters.m_lwm / data_size);
+  auto block_start_no = static_cast<block_no_t>(m_lwm / data_size);
+
   /* Limit write to max_write_lsn if specified (for sync operations) */
-  const auto effective_written_lsn = (max_write_lsn > 0) ? std::min(m_lsn_counters.m_written_lsn, max_write_lsn) : m_lsn_counters.m_written_lsn;
-  const auto n_bytes_to_flush = effective_written_lsn - m_lsn_counters.m_lwm;
+  const auto write_limit_lsn = (max_write_lsn > 0) ? std::min(m_hwm, max_write_lsn) : m_hwm;
+  const auto n_bytes_to_flush = write_limit_lsn - m_lwm;
 
   auto n_blocks_to_flush = (n_bytes_to_flush + data_size - 1) / data_size;
   const auto last_block_no = static_cast<block_no_t>(block_start_no + n_blocks_to_flush - 1);
@@ -197,8 +198,8 @@ Result<lsn_t> Circular_buffer::write_to_store(Write_callback callback, lsn_t max
   const auto blocks_per_batch = iovecs_size / 3;
 
   std::size_t data_len{};
-  std::size_t old_data_len = m_lsn_counters.m_lwm % data_size;
-  auto start_lwm = m_lsn_counters.m_lwm;
+  auto start_lwm = m_lwm;
+  std::size_t old_data_len = m_lwm % data_size;
 
   using Clock = std::chrono::steady_clock;
 
@@ -233,26 +234,19 @@ Result<lsn_t> Circular_buffer::write_to_store(Write_callback callback, lsn_t max
     block_start_no += static_cast<block_no_t>(flush_batch_size);
     total_blocks_written += flush_batch_size;
 
-    std::span<struct iovec> iov_span(m_iovecs.data(), n_slots);
-    
-    std::size_t io_size_bytes = 0;
-    for (const auto& iov : iov_span) {
-      io_size_bytes += iov.iov_len;
-    }
-
     Clock::time_point io_start;
     if (m_metrics != nullptr) [[likely]] {
       io_start = Clock::now();
     }
 
-    auto io_result = callback(iov_span, wal::Log::Sync_type::None);
+    auto io_result = callback(std::span<struct iovec>(m_iovecs.data(), n_slots), wal::Log::Sync_type::None);
 
     if (m_metrics != nullptr) [[likely]] {
       const auto io_end = Clock::now();
       const auto io_duration = std::chrono::duration_cast<std::chrono::nanoseconds>(io_end - io_start);
 
       m_metrics->add_timing(util::MetricType::WriteToStoreIoCallback, io_duration);
-      m_metrics->add_io_size(io_size_bytes);
+      m_metrics->add_io_size(data_len);
     }
 
     if (!io_result.has_value()) {
@@ -274,13 +268,13 @@ Result<lsn_t> Circular_buffer::write_to_store(Write_callback callback, lsn_t max
 
     /* Only clear if we wrote all the data in this batch (not limited by max_write_lsn).
      * If we're limited by max_write_lsn, we can't clear because there's still data in the buffer */
-    if (start_lwm + data_len <= effective_written_lsn) {
+    if (start_lwm + data_len <= write_limit_lsn) {
       clear(start_lwm, start_lwm + data_len);
       start_lwm += data_len;
     } else {
       /* We hit the max_write_lsn limit - don't clear or update lwm, we'll write the rest later.
        * But we need to update lwm to what we actually wrote */
-      const auto actual_written = effective_written_lsn - start_lwm;
+      const auto actual_written = write_limit_lsn - start_lwm;
 
       if (actual_written > 0) {
         /* Clear only the blocks we fully wrote */
@@ -301,7 +295,7 @@ Result<lsn_t> Circular_buffer::write_to_store(Write_callback callback, lsn_t max
     }
   }
 
-  m_lsn_counters.m_lwm = start_lwm;
+  m_lwm = start_lwm;
 
   /* Record overall timing and counters */
   if (m_metrics != nullptr) [[likely]] {
@@ -314,7 +308,7 @@ Result<lsn_t> Circular_buffer::write_to_store(Write_callback callback, lsn_t max
     m_metrics->inc(util::MetricType::WriteToStoreBytesWritten, total_bytes_written);
   }
 
-  return Result<lsn_t>(m_lsn_counters.m_lwm);
+  return Result<lsn_t>(m_lwm);
 }
 
 Result<lsn_t> Circular_buffer::read_from_store(lsn_t, Read_callback) noexcept {
@@ -332,8 +326,7 @@ Result<lsn_t> Circular_buffer::read_from_store(lsn_t, Read_callback) noexcept {
  }
 
  Log::Log(lsn_t lsn, size_t pool_size, const Circular_buffer::Config &config)
-  : m_pool(std::make_unique<Pool>(pool_size, config, lsn)),
-    m_write_batch_size(std::numeric_limits<std::size_t>::max()) {}
+  : m_pool(std::make_unique<Pool>(pool_size, config, lsn)) {}
 
  Log::~Log() noexcept {
   WAL_ASSERT(m_pool->m_active == nullptr);
@@ -367,60 +360,44 @@ Result<bool> Log::shutdown(Write_callback callback) noexcept {
 }
 
 
-Result<Log::Slot> Log::write(std::span<const std::byte> span, util::Thread_pool* thread_pool) noexcept {
+Result<Log::Slot> Log::write(std::span<const std::byte> span, [[maybe_unused]] util::Thread_pool* thread_pool) noexcept {
   WAL_ASSERT(span.size() > 0);
   WAL_ASSERT(span.size() <= std::numeric_limits<std::uint16_t>::max());
   WAL_ASSERT(m_pool->m_active != nullptr);
 
-  Slot slot{};
-  lsn_t start_lsn{};
-  std::size_t remaining{span.size()};
-  const std::byte* data_ptr{span.data()};
+  auto entry_ptr = m_pool->acquire_buffer();
+  auto buffer{&entry_ptr->m_buffer};
+  auto result = buffer->copy(span);
 
-  while (remaining > 0) [[likely]] {
-    auto entry_ptr = m_pool->acquire_buffer();
-    auto &buffer{entry_ptr->m_buffer};
+  Slot slot;
 
-    if (buffer.is_full()) [[unlikely]] {
-      m_pool->prepare_buffer_for_io(entry_ptr, *thread_pool, m_write_callback);
-      continue;
-    }
-
-    /* Check how much space is available in current buffer */
-    const auto available = buffer.margin();
-
-    /* Reserve space for as much data as we can fit (up to uint16_t max) */
-    const auto reserve_len{static_cast<std::uint16_t>(std::min(remaining, available))};
-    auto slot_result{buffer.reserve(reserve_len)};
-
-    /* Reserver cannot fail and cannot wrap around, so we can assert the length. */
-    WAL_ASSERT(slot_result.has_value() && slot_result.value().m_len == reserve_len);
-    
-    /* Write the data to the reserved slot */
-    slot = slot_result.value();
-
-    if (start_lsn == 0) [[likely]] {
-      /* We only need the LSN from where the write started. */
-      start_lsn = slot.m_lsn;
-    }
-
-    buffer.write(slot, std::span<const std::byte>(data_ptr, reserve_len));
-
-    data_ptr += reserve_len;
-    remaining -= reserve_len;
-
-    /* Check if buffer became full after this write - if so, prepare it for I/O */
-    if (buffer.is_full()) [[unlikely]] {
-      m_pool->prepare_buffer_for_io(entry_ptr, *thread_pool, m_write_callback);
-    }
+  if (!result.has_value()) {
+    slot.m_len = 0;
+    slot.m_lsn = buffer->m_hwm;
+    WAL_ASSERT(result.error() == Status::Not_enough_space);
+  } else if (result.value().m_len == span.size()) {
+    return result;
+  } else {
+    slot = result.value();
   }
 
-  WAL_ASSERT(start_lsn != 0 || start_lsn == m_pool->m_active->m_buffer.m_lsn_counters.m_lwm);
+  /* Only the start LSN is required by the caller. */
+  const auto lsn = slot.m_lsn;
 
-  slot.m_lsn = start_lsn;
-  slot.m_len = static_cast<std::uint16_t>(span.size());
+  /* Span should fit in 64K a within a single buffer, it can overflow
+   * a single buffer but the  remaining bytes must fit in the next buffer. */
 
-  return Result<Log::Slot>(slot);
+  m_pool->prepare_buffer_for_io(entry_ptr, *thread_pool, m_write_callback);
+
+   /* Get the next buffer */
+  entry_ptr = m_pool->acquire_buffer();
+  buffer = &entry_ptr->m_buffer;
+  result = buffer->copy(span.subspan(slot.m_len));
+
+  WAL_ASSERT(result.has_value());
+  WAL_ASSERT(result.value().m_len == span.size() - slot.m_len);
+
+  return Slot { .m_lsn = lsn, .m_len = uint16_t(span.size()) };
 }
 
 bool Log::is_full() const noexcept {
@@ -487,7 +464,6 @@ std::string Log::to_string() const noexcept {
   WAL_ASSERT(m_pool->m_active == nullptr);
 
   ss << m_pool->to_string() << std::endl;
-  ss << "write_batch_size: " << m_write_batch_size << std::endl;
   return ss.str();
 }
 

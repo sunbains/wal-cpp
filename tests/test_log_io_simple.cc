@@ -221,7 +221,7 @@ int main(int argc, char* argv[]) {
         config.m_log_buffer_size_blocks = std::strtoull(optarg, nullptr, 10);
         break;
       default:
-        std::fprintf(stderr, "Usage: %s [-m messages] [-d] [-L block-size] [-R buffer-blocks]\n", argv[0]);
+        std::println(stderr, "Usage: {} [-m messages] [-d] [-L block-size] [-R buffer-blocks]", argv[0]);
         return 1;
     }
   }

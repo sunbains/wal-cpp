@@ -339,19 +339,16 @@ struct [[nodiscard]] Circular_buffer {
     explicit Config(
       size_t n_blocks = kDefaultBlockCount,
       size_t block_size = kDefaultBlockSize,
-      util::ChecksumAlgorithm algo = util::ChecksumAlgorithm::CRC32C,
-      size_t write_batch_size = std::numeric_limits<std::size_t>::max()) noexcept
+      util::ChecksumAlgorithm algo = util::ChecksumAlgorithm::CRC32C) noexcept
       : m_n_blocks(n_blocks),
         m_block_size(block_size),
-        m_checksum_algorithm(algo),
-        m_write_batch_size(write_batch_size) {}
+        m_checksum_algorithm(algo) {}
 
     ~Config() = default;
 
     const size_t m_n_blocks;
     const size_t m_block_size;
     const util::ChecksumAlgorithm m_checksum_algorithm;
-    const size_t m_write_batch_size{std::numeric_limits<std::size_t>::max()};
 
     std::size_t get_data_size_in_block() const noexcept {
       return m_block_size - sizeof(Block_header::Data) - sizeof(crc32_t);
@@ -391,8 +388,8 @@ struct [[nodiscard]] Circular_buffer {
 
   /* Move constructor - recalculates pointers after moving m_buffer */
   Circular_buffer(Circular_buffer&& other) noexcept
-    : m_lsn_counters(other.m_lsn_counters),
-      m_reserve_counters(other.m_reserve_counters),
+    : m_lwm(other.m_lwm),
+      m_hwm(other.m_hwm),
       m_config(other.m_config),
       m_total_data_size(other.m_total_data_size),
       m_crc32_array(nullptr),
@@ -477,98 +474,45 @@ struct [[nodiscard]] Circular_buffer {
    * @return The number of bytes left in the buffer.
    */
   [[nodiscard]] std::size_t margin() const noexcept {
-    WAL_ASSERT(m_reserve_counters.m_hwm >= m_lsn_counters.m_lwm);
+    WAL_ASSERT(m_hwm >= m_lwm);
 
      const auto data_size = m_config.get_data_size_in_block();
      const auto total_data_size = m_total_data_size;
-     const auto available_space = total_data_size - (m_reserve_counters.m_hwm - m_lsn_counters.m_lwm);
+     const auto available_space = total_data_size - (m_hwm - m_lwm);
 
      /* Now we need to compensate for the date that in the block before the LWM. */
 
-     return available_space - (m_lsn_counters.m_lwm % data_size);
+     return available_space - (m_lwm % data_size);
   }
 
-  /** Reserve len number of bytes in the buffer cache.
-   * The reserved slot (LSN) could be outside the bounds of this buffer.
+  /** Copy the data into the buffer, doesn't update the header.
+   * Copies what it can and returns the number of bytes copied in Slot.m_len.
    *
-   * @return slot that was reserved.
+   * @param[in] span The span of the data to copy into the buffer.
+   * @note The caller needs to check for partial copy and handle it accordingly.
+   * @return { LSN , number of bytes copied into the buffer}
    */
-  [[nodiscard]] Result<Slot> reserve(const std::uint16_t reserve_len) noexcept {
-    WAL_ASSERT(m_reserve_counters.m_hwm - m_lsn_counters.m_lwm <= m_total_data_size);
+  [[nodiscard]] Result<Slot> copy(std::span<const std::byte> span) noexcept {
+    WAL_ASSERT(span.size() > 0);
+    WAL_ASSERT(span.size() <= std::numeric_limits<std::uint16_t>::max());
+    WAL_ASSERT(m_hwm - m_lwm <= m_total_data_size);
 
-    const auto data_size = m_config.get_data_size_in_block();
+    const auto lsn = m_hwm;
+    const auto available = std::min(margin(), span.size());
 
-    /* Fast margin check: avoid calling margin() in common case */
-    if ((m_reserve_counters.m_hwm - m_lsn_counters.m_lwm) + reserve_len > m_total_data_size) [[unlikely]] {
-      if (reserve_len > margin()) {
-        return std::unexpected(Status::Not_enough_space);
-      }
+    if (available == 0) [[unlikely]] {
+      return std::unexpected(Status::Not_enough_space);
     }
 
-    auto copy_len = reserve_len;
-    const auto lsn = m_reserve_counters.m_hwm;
+    WAL_ASSERT(available <= std::numeric_limits<std::uint16_t>::max());
 
-    m_reserve_counters.m_hwm += copy_len;
-    ++m_reserve_counters.m_n_pending_writes;
+    const auto data_offset = lsn % m_total_data_size;
 
-    const auto start_block_no = lsn / data_size;
-    auto block_no = start_block_no;
-    const auto block_index = block_no % m_config.m_n_blocks;
-    auto block_header = &m_block_header_array[block_index];
-    const auto start_offset = lsn % data_size;
-    const auto n_blocks = ((start_offset + (copy_len - 1)) / data_size) + 1;
+    std::memcpy(m_data_array + data_offset, span.data(), available);
 
-    for (size_t i = 0; i < n_blocks; ++i) {
-      /* Calculate how much we can fit in this block */
-      /* block_header->m_data.m_len should equal start_offset for the first block */
-      const auto available_in_block = data_size - block_header->m_data.m_len;
-      auto block_len = std::min(available_in_block, size_t(copy_len));
-      
-      /* If we can't fit everything and this is the first block, something is wrong */
-      if (i == 0 && block_len == 0 && copy_len > 0) {
-        std::fprintf(stderr, "ERROR: reserve() first block has no space: start_offset=%lu, block_header->m_data.m_len=%u, data_size=%zu, copy_len=%u, lsn=%lu, hwm=%lu, lwm=%lu, block_no=%u, start_block_no=%u\n",
-                     static_cast<unsigned long>(start_offset), block_header->m_data.m_len, data_size, 
-                     static_cast<unsigned>(copy_len), static_cast<unsigned long>(lsn), 
-                     static_cast<unsigned long>(m_reserve_counters.m_hwm), static_cast<unsigned long>(m_lsn_counters.m_lwm),
-                     static_cast<unsigned>(block_no), static_cast<unsigned>(start_block_no));
-        std::fflush(stderr);
-        std::abort();
-      }
+    m_hwm += available;
 
-      block_header->set_block_no(block_no_t(block_no));
-      block_header->m_data.m_len += uint16_t(block_len);
-
-      if (copy_len == block_len && block_no > start_block_no) [[unlikely]] {
-          block_header->set_first_rec_group(uint16_t(block_len));
-      }
-
-      copy_len -= uint16_t(block_len);
-
-      block_header = &m_block_header_array[++block_no % m_config.m_n_blocks];
-
-      /* Prefetch next block header to reduce cache misses */
-      if (i + 2 < n_blocks) [[unlikely]] {
-        util::prefetch_for_write<3>(&m_block_header_array[(block_no + 1) % m_config.m_n_blocks]);
-      }
-    }
-
-    if (copy_len != 0) {
-      const auto block0_index = start_block_no % m_config.m_n_blocks;
-      std::fprintf(stderr, "ERROR: reserve() copy_len != 0 after loop: copy_len=%u, reserve_len=%u, lsn=%lu, start_offset=%lu, n_blocks=%zu, data_size=%zu, hwm=%lu, lwm=%lu, block0_index=%zu, block0_m_len=%u, start_block_no=%u\n",
-                   static_cast<unsigned>(copy_len), static_cast<unsigned>(reserve_len), 
-                   static_cast<unsigned long>(lsn), static_cast<unsigned long>(start_offset), 
-                   n_blocks, data_size, 
-                   static_cast<unsigned long>(m_reserve_counters.m_hwm), static_cast<unsigned long>(m_lsn_counters.m_lwm),
-                   block0_index, m_block_header_array[block0_index].m_data.m_len,
-                   static_cast<unsigned>(start_block_no));
-      std::fflush(stderr);
-    }
-    WAL_ASSERT(copy_len == 0);
-
-    return Slot {
-      .m_lsn = lsn,
-      .m_len = reserve_len
-    };
+    return Slot { .m_lsn = lsn, .m_len = uint16_t(available) };
   }
 
   [[nodiscard]] std::span<std::byte> data() const noexcept {
@@ -583,62 +527,22 @@ struct [[nodiscard]] Circular_buffer {
     return std::span<crc32_t>(m_crc32_array, m_config.m_n_blocks);
   }
 
-  [[nodiscard]] std::size_t is_write_pending() const noexcept {
-    return m_reserve_counters.m_n_pending_writes > 0;
-  }
-
-  void write(const Slot &slot, std::span<const std::byte> span) noexcept {
-    WAL_ASSERT(span.size() > 0);
-    WAL_ASSERT(span.size() == slot.m_len);
-
-    WAL_ASSERT(slot.m_lsn - m_lsn_counters.m_lwm <= m_total_data_size);
-
-    const auto data_size = m_config.get_data_size_in_block();
-    const auto block_index = (slot.m_lsn / data_size) % m_config.m_n_blocks;
-    const auto global_offset = block_index * data_size + (slot.m_lsn % data_size);
-
-    auto len = slot.m_len;
-    auto copy_len = std::min(span.size(), m_total_data_size - global_offset);
-    std::memcpy(m_data_array + global_offset, span.data(), copy_len);
-
-    len -= uint16_t(copy_len);
-
-    if (len > 0) {
-      /* Handle wrap around. */
-      std::memcpy(m_data_array, span.data() + copy_len, len);
-      copy_len += len;
-    }
-
-    m_lsn_counters.m_written_lsn += copy_len;
-    m_reserve_counters.m_n_pending_writes -= 1;
-
-    WAL_ASSERT(m_lsn_counters.m_written_lsn <= m_reserve_counters.m_hwm);
+  [[nodiscard]] bool is_write_pending() const noexcept {
+    WAL_ASSERT(m_hwm >= m_lwm);
+    return m_hwm > m_lwm;
   }
 
   [[nodiscard]] bool is_full() const noexcept {
-    WAL_ASSERT(m_lsn_counters.m_written_lsn >= m_lsn_counters.m_lwm);
-    WAL_ASSERT(m_lsn_counters.m_written_lsn <= m_reserve_counters.m_hwm);
-    WAL_ASSERT(m_reserve_counters.m_hwm - m_lsn_counters.m_lwm <= get_total_data_size());
-    WAL_ASSERT(m_lsn_counters.m_written_lsn - m_lsn_counters.m_lwm <= get_total_data_size());
+    WAL_ASSERT(m_hwm - m_lwm <= get_total_data_size());
     return margin() == 0;
   }
 
   /** Empty is a little bit tricky, we have to compensate for any
    * data before the LWM. We cannot overwrite that data until that
-   * block is flushed to the store. */
+   * block is flushed to the store.
+   @return true if there is room to write more data. */
   [[nodiscard]] bool is_empty() const noexcept {
-    WAL_ASSERT(m_lsn_counters.m_written_lsn >= m_lsn_counters.m_lwm);
-    WAL_ASSERT(m_lsn_counters.m_written_lsn <= m_reserve_counters.m_hwm);
-    return margin() == (get_total_data_size() - (m_lsn_counters.m_lwm % get_data_size_in_block()));
-  }
-
-  /**
-   * Check if there are any pending writes.
-   * This is to check if slots have been reserved but not yet written.
-   * @return True if there are pending writes, false otherwise.
-   */
-  [[nodiscard]] bool pending_writes() const noexcept {
-    return m_lsn_counters.m_written_lsn < m_reserve_counters.m_hwm;
+    return margin() == (get_total_data_size() - (m_lwm % get_data_size_in_block()));
   }
 
   /**
@@ -687,47 +591,13 @@ struct [[nodiscard]] Circular_buffer {
     m_metrics = metrics;
   }
 
-  /** Group of counters updated together in write() for better cache locality.
-   * m_lwm and m_written_lsn are both accessed together in write() and write_to_store().
-   */
-  struct alignas(kCLS) Lsn_counters {
-    /** Low water mark, the circular buffer starts at this LSN. */
-    lsn_t m_lwm{};
+  /* Virtual offset, the low water mark, the data in the buffer that has not
+   * been written to the store starts at this LSN. */
+  lsn_t m_lwm{};
     
-    /** Highest LSN up to which data has been contiguously written.
-     * With a single consumer, writes are sequential so this represents contiguous data.
-     * This is used for sync operations to ensure we only sync data that has been fully written.
-     */ 
-    lsn_t m_written_lsn{};
-    
-    // Padding to ensure we use a full cache line
-    char padding[util::kHWCLS - (3 * sizeof(lsn_t))];
-  };
-
-  static_assert(sizeof(Lsn_counters) == util::kHWCLS, "Lsn_counters must be exactly one cache line");
-
-  Lsn_counters m_lsn_counters{};
-
-  /** Group of counters updated together in reserve() for better cache locality.
-   * m_hwm and m_n_pending_writes are both updated atomically in reserve().
-   */
-  struct alignas(kCLS) Reserve_counters {
-    /** High water mark. We have reserved this many bytes to the buffer.
-     * The writes may not have completed yet.
-     */
-    lsn_t m_hwm{};
-    
-    // FIXME: This is a debug variable, remove it later.
-    /** Number of pending writes. */
-    std::size_t m_n_pending_writes{};
-    
-    // Padding to ensure we use a full cache line
-    char padding[util::kHWCLS - (sizeof(lsn_t) + sizeof(std::size_t))];
-  };
-
-  static_assert(sizeof(Reserve_counters) == util::kHWCLS, "Reserve_counters must be exactly one cache line");
-
-  Reserve_counters m_reserve_counters{};
+  /* Virtual offset, the high water mwark, we have copied data to the buffer up to this LSN.
+   * When we write to store this must equal the LWM. */
+  lsn_t m_hwm{};
 
   Config m_config;
 
@@ -835,8 +705,6 @@ struct [[nodiscard]] Log {
 
   /* We want to avoid a circular dependency, buffer_pool.h includes this file. */
   std::unique_ptr<Pool> m_pool;
-
-  std::size_t m_write_batch_size{std::numeric_limits<std::size_t>::max()};
 
   /** Metrics collector shared by all buffers in the pool. */
   util::Metrics* m_metrics{nullptr};

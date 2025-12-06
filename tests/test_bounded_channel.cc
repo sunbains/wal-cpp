@@ -13,13 +13,14 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstdio>
+#include <print>
 
 #include "util/bounded_channel.h"
 
 using util::Bounded_queue;
 
 static void test_basic_single_thread() {
-  std::fprintf(stderr, "[test_basic_single_thread] start\n");
+  std::println(stderr, "[test_basic_single_thread] start");
   Bounded_queue<int> q(8); // ring size is 8, usable slots 8
   assert(q.capacity() == 8);
   assert(q.empty());
@@ -27,7 +28,7 @@ static void test_basic_single_thread() {
 
   // Enqueue 1..8
   for (int i = 1; i <= 8; ++i) {
-    if (!q.enqueue(i)) { std::fprintf(stderr, "enqueue fail at i=%d\n", i); std::abort(); }
+    if (!q.enqueue(i)) { std::println(stderr, "enqueue fail at i={}", i); std::abort(); }
   }
   assert(q.full());
   assert(q.full());
@@ -35,28 +36,28 @@ static void test_basic_single_thread() {
   // Dequeue and check order
   for (int i = 1; i <= 8; ++i) {
     int v = 0;
-    if (!q.dequeue(v)) { std::fprintf(stderr, "dequeue fail at i=%d\n", i); std::abort(); }
-    if (v != i) { std::fprintf(stderr, "order mismatch got=%d expect=%d\n", v, i); std::abort(); }
+    if (!q.dequeue(v)) { std::println(stderr, "dequeue fail at i={}", i); std::abort(); }
+    if (v != i) { std::println(stderr, "order mismatch got={} expect={}", v, i); std::abort(); }
   }
   assert(q.empty());
-  std::fprintf(stderr, "[test_basic_single_thread] done\n");
+  std::println(stderr, "[test_basic_single_thread] done");
 }
 
 static void test_wraparound() {
-  std::fprintf(stderr, "[test_wraparound] start\n");
+  std::println(stderr, "[test_wraparound] start");
   Bounded_queue<int> q(8); // ring size 8
 
   // Fill 0..7
-  for (int i = 0; i < 8; ++i) if (!q.enqueue(i)) { std::fprintf(stderr, "initial enqueue fail i=%d\n", i); std::abort(); }
+  for (int i = 0; i < 8; ++i) if (!q.enqueue(i)) { std::println(stderr, "initial enqueue fail i={}", i); std::abort(); }
 
   // Dequeue 0..3
   for (int i = 0; i < 4; ++i) {
-    int v{}; if (!q.dequeue(v)) { std::fprintf(stderr, "dequeue(phase1) fail i=%d\n", i); std::abort(); }
-    if (v != i) { std::fprintf(stderr, "order(phase1) mismatch got=%d expect=%d\n", v, i); std::abort(); }
+    int v{}; if (!q.dequeue(v)) { std::println(stderr, "dequeue(phase1) fail i={}", i); std::abort(); }
+    if (v != i) { std::println(stderr, "order(phase1) mismatch got={} expect={}", v, i); std::abort(); }
   }
 
   // Enqueue 8..11 to force wrap-around positions
-  for (int i = 8; i < 12; ++i) if (!q.enqueue(i)) { std::fprintf(stderr, "enqueue(phase2) fail i=%d\n", i); std::abort(); }
+  for (int i = 8; i < 12; ++i) if (!q.enqueue(i)) { std::println(stderr, "enqueue(phase2) fail i={}", i); std::abort(); }
 
   // Drain remaining in order: 4..11
   std::vector<int> out;
@@ -65,32 +66,32 @@ static void test_wraparound() {
 
   std::vector<int> expect{4,5,6,7,8,9,10,11};
   if (out != expect) {
-    std::fprintf(stderr, "wrap result mismatch\n");
-    std::fprintf(stderr, "got: "); for (auto x: out) std::fprintf(stderr, "%d ", x); std::fprintf(stderr, "\n");
-    std::fprintf(stderr, "exp: "); for (auto x: expect) std::fprintf(stderr, "%d ", x); std::fprintf(stderr, "\n");
+    std::println(stderr, "wrap result mismatch");
+    std::print(stderr, "got: "); for (auto x: out) std::print(stderr, "{} ", x); std::println(stderr);
+    std::print(stderr, "exp: "); for (auto x: expect) std::print(stderr, "{} ", x); std::println(stderr);
     std::abort();
   }
   assert(q.empty());
-  std::fprintf(stderr, "[test_wraparound] done\n");
+  std::println(stderr, "[test_wraparound] done");
 }
 
 static void test_emplace_and_types() {
-  std::fprintf(stderr, "[test_emplace_and_types] start\n");
+  std::println(stderr, "[test_emplace_and_types] start");
   Bounded_queue<std::pair<int, std::string>> q(4);
   assert(q.capacity() == 4);
 
-  if (!q.emplace(1, "a")) { std::fprintf(stderr, "emplace #1 failed\n"); std::abort(); }
-  if (!q.emplace(2, std::string{"bb"})) { std::fprintf(stderr, "emplace #2 failed\n"); std::abort(); }
+  if (!q.emplace(1, "a")) { std::println(stderr, "emplace #1 failed"); std::abort(); }
+  if (!q.emplace(2, std::string{"bb"})) { std::println(stderr, "emplace #2 failed"); std::abort(); }
   std::pair<int, std::string> p;
-  if (!q.dequeue(p)) { std::fprintf(stderr, "dequeue p1 fail\n"); std::abort(); }
+  if (!q.dequeue(p)) { std::println(stderr, "dequeue p1 fail"); std::abort(); }
   assert(p.first == 1 && p.second == "a");
-  if (!q.dequeue(p)) { std::fprintf(stderr, "dequeue p2 fail\n"); std::abort(); }
+  if (!q.dequeue(p)) { std::println(stderr, "dequeue p2 fail"); std::abort(); }
   assert(p.first == 2 && p.second == "bb");
-  std::fprintf(stderr, "[test_emplace_and_types] done\n");
+  std::println(stderr, "[test_emplace_and_types] done");
 }
 
 static void test_mpmc_basic() {
-  std::fprintf(stderr, "[test_mpmc_basic] start\n");
+  std::println(stderr, "[test_mpmc_basic] start");
   // Keep this small and robust; validate all items observed exactly once.
   constexpr int producers = 2;
   // consumers count implicitly derived from threads
@@ -142,7 +143,7 @@ static void test_mpmc_basic() {
   for (std::size_t i = 0; i < producers * items_per_producer; ++i) {
     assert(consumed[i] == i);
   }
-  std::fprintf(stderr, "[test_mpmc_basic] done\n");
+  std::println(stderr, "[test_mpmc_basic] done");
 }
 
 int main() {

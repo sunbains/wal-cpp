@@ -926,8 +926,8 @@ static void test_throughput_actor_model(const Test_config& config) {
 }
 
 static void print_usage(const char* program_name) noexcept {
-  std::fprintf(stderr,
-               "Usage: %s [OPTIONS]\n"
+  std::println(stderr,
+               "Usage: {} [OPTIONS]\n"
                "\n"
                "Options:\n"
                "  -M, --mailbox-size NUM   Mailbox size (default: 256)\n"
