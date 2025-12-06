@@ -364,45 +364,6 @@ Result<bool> Log::shutdown(Write_callback callback) noexcept {
 }
 
 
-Result<Log::Slot> Log::append(std::span<const std::byte> span, [[maybe_unused]] util::Thread_pool* thread_pool) noexcept {
-  WAL_ASSERT(span.size() > 0);
-  WAL_ASSERT(span.size() <= std::numeric_limits<std::uint16_t>::max());
-  WAL_ASSERT(m_pool->m_active != nullptr);
-
-  auto entry_ptr = m_pool->acquire_buffer();
-  auto buffer{&entry_ptr->m_buffer};
-  auto result = buffer->append(span);
-
-  Slot slot;
-
-  if (!result.has_value()) [[unlikely]] {
-    slot.m_len = 0;
-    slot.m_lsn = buffer->m_hwm;
-    WAL_ASSERT(result.error() == Status::Not_enough_space);
-  } else if (result.value().m_len == span.size()) [[likely]] {
-    return result;
-  } else {
-    slot = result.value();
-  }
-
-  /* Only the start LSN is required by the caller. */
-  const auto lsn = slot.m_lsn;
-
-  /* Span should fit in 64K a within a single buffer, it can overflow
-   * a single buffer but the  remaining bytes must fit in the next buffer. */
-
-  m_pool->prepare_buffer_for_io(entry_ptr, *thread_pool, m_write_callback);
-
-   /* Get the next buffer */
-  entry_ptr = m_pool->acquire_buffer();
-  buffer = &entry_ptr->m_buffer;
-  result = buffer->append(span.subspan(slot.m_len));
-
-  WAL_ASSERT(result.has_value());
-  WAL_ASSERT(result.value().m_len == span.size() - slot.m_len);
-
-  return Slot { .m_lsn = lsn, .m_len = uint16_t(span.size()) };
-}
 
 bool Log::is_full() const noexcept {
   WAL_ASSERT(m_pool->m_active != nullptr);

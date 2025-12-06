@@ -140,131 +140,42 @@ struct Log_message_processor {
       m_disable_log_writes(disable_log_writes),
       m_metrics(metrics),
       m_metrics_config(metrics_config) {
-
-    m_batch.reserve(1024);
-
-    if (m_metrics != nullptr && m_metrics_config != nullptr && m_metrics_config->m_enable_producer_latency) {
-      m_batch_send_times.reserve(1024);
-    }
   }
 
   void operator()(const Payload_type& payload, Clock::time_point send_time = Clock::time_point{}) noexcept{
     if (m_disable_log_writes) {
       return;
     }
-    /* Add to batch - caller will flush based on timer or batch size */
-    m_batch.push_back(payload);
 
-    /* Only track send times if metrics are enabled, producer latency is enabled, and send_time is valid */
-    if (m_metrics != nullptr && m_metrics_config != nullptr && 
-        m_metrics_config->m_enable_producer_latency && 
+    /* Write directly to log - no batching */
+    [[maybe_unused]] auto result = m_log->append(payload.get_span(), m_io_pool);
+
+    /* Track producer latency AFTER successful write to measure true end-to-end latency */
+    if (m_metrics != nullptr && m_metrics_config != nullptr &&
+        m_metrics_config->m_enable_producer_latency &&
         send_time != Clock::time_point{}) [[unlikely]] {
-      m_batch_send_times.push_back(send_time);
-    }
-    m_batch_size_bytes += payload.get_span().size();
-    
-    /* Flush if we've accumulated 4090 bytes or a multiple (block size - header - CRC32).
-     * 4096 - 12 (Block_header::Data) - 4 (CRC32) = 4080, using 4090 as specified */
-    constexpr std::size_t batch_unit_size = 4090;
-
-    if (m_batch_size_bytes >= batch_unit_size) {
-      flush_batch();
+      const auto write_time = Clock::now();
+      auto latency = std::chrono::duration_cast<std::chrono::nanoseconds>(write_time - send_time);
+      m_metrics->add_timing(util::MetricType::ProducerLatency, latency);
     }
   }
 
   void flush_batch() noexcept {
-    flush_batch_impl(false, false);
+    /* No-op: we write directly now, no batching */
   }
 
   void flush_batch_and_fdatasync() {
-    flush_batch_impl(true, false);
+    /* No-op: we write directly now, no batching */
   }
 
   void flush_batch_and_fsync() {
-    flush_batch_impl(false, true);
-  }
-
-private:
-  void flush_batch_impl([[maybe_unused]] bool do_fdatasync, [[maybe_unused]] bool do_fsync) {
-    if (m_batch.empty() || m_disable_log_writes) {
-      return;
-    }
-
-    /* Combine all batched messages into a single write */
-    std::size_t total_size = 0;
-
-    for (const auto& msg : m_batch) {
-      total_size += msg.get_span().size();
-    }
-
-    /* Allocate buffer for batched data */
-    std::vector<std::byte> batched_data;
-
-    batched_data.reserve(total_size);
-
-    for (const auto& msg : m_batch) {
-      auto span = msg.get_span();
-      batched_data.insert(batched_data.end(), span.begin(), span.end());
-    }
-
-    /* Write batched data to log */
-    auto write_result = m_log->append(std::span<const std::byte>(batched_data), m_io_pool);
-
-    /* If write fails, retry with back-pressure (like test_log_io_simple.cc) */
-    if (!write_result.has_value()) [[unlikely]] {
-      log_fatal("Failed to appendto the log");
-    }
-    
-    /* Track producer latency AFTER successful write to measure true end-to-end latency */
-    if (m_metrics != nullptr && m_metrics_config != nullptr && 
-        m_metrics_config->m_enable_producer_latency && 
-        !m_batch_send_times.empty() && write_result.has_value()) [[unlikely]] {
-      const auto flush_time = Clock::now();
-      /* Batch latency calculations - optimized: pre-size vector to avoid push_back overhead */
-      constexpr auto latency_type = util::MetricType::ProducerLatency;
-      const std::size_t num_timings = m_batch_send_times.size();
-      /* Count valid send times first to size vector exactly */
-      std::size_t valid_count = 0;
-      for (std::size_t i = 0; i < num_timings; ++i) {
-        if (m_batch_send_times[i] != Clock::time_point{}) {
-          ++valid_count;
-        }
-      }
-      if (valid_count > 0) {
-        /* Pre-size vector to exact size to avoid reallocations */
-        std::vector<std::chrono::nanoseconds> latencies;
-        latencies.reserve(valid_count);
-        /* Single pass: calculate latencies for valid send times */
-        for (std::size_t i = 0; i < num_timings; ++i) {
-          const auto& send_time = m_batch_send_times[i];
-          if (send_time != Clock::time_point{}) {
-            latencies.push_back(std::chrono::duration_cast<std::chrono::nanoseconds>(flush_time - send_time));
-          }
-        }
-        /* Batch add all latencies at once - use move to avoid copying */
-        m_metrics->add_timings_batch_move(latency_type, std::move(latencies));
-      }
-    }
-
-    /* Clear batch - only clear send times if we were tracking them */
-    m_batch.clear();
-    if (!m_batch_send_times.empty()) {
-      m_batch_send_times.clear();
-    }
-    m_batch_size_bytes = 0;
+    /* No-op: we write directly now, no batching */
   }
 
 public:
   std::shared_ptr<wal::Log> m_log;
   util::Thread_pool* m_io_pool;
   bool m_disable_log_writes;
-  std::vector<Payload_type> m_batch;
-
-  /** Send times for latency tracking (only populated if m_metrics != nullptr) */
-  std::vector<Clock::time_point> m_batch_send_times;
-
-  /** Track accumulated batch size in bytes */
-  std::size_t m_batch_size_bytes{0};
 
   /** Metrics collector for latency tracking */
   util::Metrics* m_metrics{nullptr};
