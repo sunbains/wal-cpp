@@ -1,34 +1,17 @@
 #pragma once
 
-#include <atomic>
-#include <span>
 #include <cstdint>
 #include <cstddef>
 #include <expected>
-#include <vector>
 #include <type_traits>
-#include <functional>
-#include <sys/uio.h>
 #include <string>
 #include <format>
-#include <thread>
-#include <optional>
 #include <cstdlib>
-#include <memory>
+#include <limits>
 #include <numa.h>
-#include <sched.h>
 
 #include "util/byte_order.h"
-#include "util/checksum.h"
-#include "util/logger.h"
-#include "util/metrics.h"
 #include "util/util.h"
-#include "util/thread_pool.h"
-#include "coro/task.h"
-#include "wal/async_io.h"
-
-// Forward declaration - full definition needed for template implementation
-struct Pool;
 
 #if defined(NDEBUG)
 #  define WAL_ASSERT(cond) ((void)0)
@@ -67,9 +50,6 @@ enum class Sync_type : std::uint8_t {
   Fdatasync = 1, /* fdatasync() */
   Fsync = 2      /* fsync() */
 };
-
-/** Forward declaration of the Pool. */
-struct Pool;
 
 /* For future users to support O_DIRECT */
 // constexpr auto O_DIRECT_ALIGNMENT = 512;

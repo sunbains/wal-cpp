@@ -1,21 +1,16 @@
 #include <cassert>
-#include <cstdio>
 #include <cstring>
 #include <vector>
 #include <thread>
 #include <atomic>
 #include <chrono>
 #include <getopt.h>
-#include <sched.h>
 #include <unistd.h>
 #include <sys/uio.h>
-#include <fcntl.h>
 #include <span>
 #include <print>
 #include <memory>
-#include <bit>
 #include <algorithm>
-#include <future>
 #include <variant>
 #include <array>
 #include <limits>
@@ -29,6 +24,7 @@
 #include "util/util.h"
 #include "util/thread_pool.h"
 #include "util/metrics.h"
+#include "util/checksum.h"
 #include "wal/wal.h"
 
 #include "log_io.h"
@@ -120,7 +116,7 @@ struct Consumer_context {
   util::Thread_pool* m_io_pool;
   Process_type* m_consumer_process;  /* Consumer's mailbox for poison pills */
   Scheduler_type* m_sched;
-  Log_message_processor* m_processor;  /* Pass by pointer so we can call flush_batch */
+  Log_message_processor* m_processor;  /* Pass by pointer so we can call write_and_fdatasync/fsync */
   std::size_t m_num_producers;
   std::chrono::milliseconds m_batch_timeout{std::chrono::milliseconds(10)};
 };
@@ -134,12 +130,14 @@ struct Log_message_processor {
     util::Thread_pool* io_pool,
     bool disable_log_writes,
     util::Metrics* metrics = nullptr,
-    const Metrics_config* metrics_config = nullptr
+    const Metrics_config* metrics_config = nullptr,
+    std::shared_ptr<Log_file> log_file = nullptr
   ) : m_log(std::move(log)),
       m_io_pool(io_pool),
       m_disable_log_writes(disable_log_writes),
       m_metrics(metrics),
-      m_metrics_config(metrics_config) {
+      m_metrics_config(metrics_config),
+      m_log_file(log_file) {
   }
 
   void operator()(const Payload_type& payload, Clock::time_point send_time = Clock::time_point{}) noexcept{
@@ -149,6 +147,7 @@ struct Log_message_processor {
 
     /* Write directly to log - no batching */
     [[maybe_unused]] auto result = m_log->append(payload.get_span(), m_io_pool);
+    WAL_ASSERT(result.has_value());
 
     /* Track producer latency AFTER successful write to measure true end-to-end latency */
     if (m_metrics != nullptr && m_metrics_config != nullptr &&
@@ -160,16 +159,90 @@ struct Log_message_processor {
     }
   }
 
-  void flush_batch() noexcept {
-    /* No-op: we write directly now, no batching */
+  void write_and_fdatasync() {
+    /* Flush any pending buffers and trigger fdatasync */
+    if (m_log && m_io_pool && m_log->m_write_callback) {
+      /* First, ensure the active buffer is flushed if it has data */
+      if (m_log->m_pool && m_log->m_pool->m_active && 
+          !m_log->m_pool->m_active->m_buffer.is_empty()) {
+        m_log->m_pool->prepare_buffer_for_io(m_log->m_pool->m_active, *m_io_pool, m_log->m_write_callback);
+      }
+      
+      /* Process any ready-for-io buffers with fdatasync */
+      auto sync_callback = [this](std::span<struct iovec> span, wal::Log::Sync_type) -> wal::Result<std::size_t> {
+        /* Always call with Fdatasync sync type */
+        return m_log->m_write_callback(span, wal::Log::Sync_type::Fdatasync);
+      };
+
+      [[maybe_unused]] auto result = m_log->write_to_store(sync_callback);
+      WAL_ASSERT(result.has_value());
+      
+      /* Also write the active buffer directly with fdatasync if it has data */
+      if (m_log->m_pool && m_log->m_pool->m_active && 
+          !m_log->m_pool->m_active->m_buffer.is_empty() &&
+          m_log->m_pool->m_active->m_buffer.is_write_pending()) {
+        auto active_sync_callback = [this](std::span<struct iovec> span, wal::Log::Sync_type) -> wal::Result<std::size_t> {
+          return m_log->m_write_callback(span, wal::Log::Sync_type::Fdatasync);
+        };
+
+        [[maybe_unused]] auto active_result = m_log->m_pool->m_active->m_buffer.write_to_store(active_sync_callback, 0, wal::Log::Sync_type::Fdatasync);
+        WAL_ASSERT(active_result.has_value());
+      }
+      
+      /* If no data was written but we still need to sync, call fdatasync directly */
+      if (m_log_file && m_log_file->m_fd != -1 && m_metrics) {
+        auto sync_start = Clock::now();
+        if (::fdatasync(m_log_file->m_fd) == 0) {
+          auto sync_end = Clock::now();
+          auto sync_duration = std::chrono::duration_cast<std::chrono::nanoseconds>(sync_end - sync_start);
+          m_metrics->inc(util::MetricType::FdatasyncCount);
+          m_metrics->add_timing(util::MetricType::FdatasyncTiming, sync_duration);
+        }
+      }
+    }
   }
 
-  void flush_batch_and_fdatasync() {
-    /* No-op: we write directly now, no batching */
-  }
+  void write_and_fsync() {
+    /* Flush any pending buffers and trigger fsync */
+    if (m_log && m_io_pool && m_log->m_write_callback) {
+      /* First, ensure the active buffer is flushed if it has data */
+      if (m_log->m_pool && m_log->m_pool->m_active && 
+          !m_log->m_pool->m_active->m_buffer.is_empty()) {
+        m_log->m_pool->prepare_buffer_for_io(m_log->m_pool->m_active, *m_io_pool, m_log->m_write_callback);
+      }
+      
+      /* Process any ready-for-io buffers with fsync */
+      auto sync_callback = [this](std::span<struct iovec> span, wal::Log::Sync_type) -> wal::Result<std::size_t> {
+        /* Always call with Fsync sync type */
+        return m_log->m_write_callback(span, wal::Log::Sync_type::Fsync);
+      };
 
-  void flush_batch_and_fsync() {
-    /* No-op: we write directly now, no batching */
+      [[maybe_unused]] auto result = m_log->write_to_store(sync_callback);
+      WAL_ASSERT(result.has_value());
+      
+      /* Also write the active buffer directly with fsync if it has data */
+      if (m_log->m_pool && m_log->m_pool->m_active && 
+          !m_log->m_pool->m_active->m_buffer.is_empty() &&
+          m_log->m_pool->m_active->m_buffer.is_write_pending()) {
+        auto active_sync_callback = [this](std::span<struct iovec> span, wal::Log::Sync_type) -> wal::Result<std::size_t> {
+          return m_log->m_write_callback(span, wal::Log::Sync_type::Fsync);
+        };
+
+        [[maybe_unused]] auto active_result = m_log->m_pool->m_active->m_buffer.write_to_store(active_sync_callback, 0, wal::Log::Sync_type::Fsync);
+        WAL_ASSERT(active_result.has_value());
+      }
+      
+      /* If no data was written but we still need to sync, call fsync directly */
+      if (m_log_file && m_log_file->m_fd != -1 && m_metrics) {
+        auto sync_start = Clock::now();
+        if (::fsync(m_log_file->m_fd) == 0) {
+          auto sync_end = Clock::now();
+          auto sync_duration = std::chrono::duration_cast<std::chrono::nanoseconds>(sync_end - sync_start);
+          m_metrics->inc(util::MetricType::FsyncCount);
+          m_metrics->add_timing(util::MetricType::FsyncTiming, sync_duration);
+        }
+      }
+    }
   }
 
 public:
@@ -182,6 +255,9 @@ public:
 
   /** Metrics configuration - which metrics to collect */
   const Metrics_config* m_metrics_config{nullptr};
+  
+  /** Log file for direct sync operations */
+  std::shared_ptr<Log_file> m_log_file{nullptr};
 };
 
 /** Producer actor - sends log messages to consumer
@@ -274,13 +350,7 @@ Task<void> consumer_actor(
     /* Check timer and flush batch if expired */
     auto now = std::chrono::steady_clock::now();
     auto time_since_flush = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_flush_time);
-    if (time_since_flush >= ctx.m_batch_timeout) {
-      /* Check if processor has flush_batch method using SFINAE */
-      if constexpr (requires { ctx.m_processor->flush_batch(); }) {
-        ctx.m_processor->flush_batch();
-        last_flush_time = now;
-      }
-    }
+    /* Timer-based flushing removed - we write directly now, no batching */
  
     /* Check for poison pills in consumer mailbox (if provided) */
     if (ctx.m_consumer_process != nullptr) {
@@ -338,33 +408,24 @@ Task<void> consumer_actor(
               loop_exited_normally = false;
               break;
             }
-          } else if constexpr (requires { ctx.m_processor->flush_batch(); }) {
+          } else {
             /* Check for Fdatasync */
             if (std::holds_alternative<Fdatasync>(msg.m_payload)) {
               /* Flush batch and call fdatasync */
-              if constexpr (requires { ctx.m_processor->flush_batch_and_fdatasync(); }) {
-                ctx.m_processor->flush_batch_and_fdatasync();
-              } else {
-                ctx.m_processor->flush_batch();
+              if constexpr (requires { ctx.m_processor->write_and_fdatasync(); }) {
+                ctx.m_processor->write_and_fdatasync();
               }
               continue;
             }
             /* Check for Fsync */
             if (std::holds_alternative<Fsync>(msg.m_payload)) {
               /* Flush batch and call fsync */
-              if constexpr (requires { ctx.m_processor->flush_batch_and_fsync(); }) {
-                ctx.m_processor->flush_batch_and_fsync();
-              } else {
-                ctx.m_processor->flush_batch();
+              if constexpr (requires { ctx.m_processor->write_and_fsync(); }) {
+                ctx.m_processor->write_and_fsync();
               }
               continue;
             }
             /* Regular payload message */
-            if (std::holds_alternative<Payload_type>(msg.m_payload)) {
-              process_payload_message(*ctx.m_processor, std::get<Payload_type>(msg.m_payload), msg);
-            }
-          } else {
-            /* Only process if it's actually a payload message */
             if (std::holds_alternative<Payload_type>(msg.m_payload)) {
               process_payload_message(*ctx.m_processor, std::get<Payload_type>(msg.m_payload), msg);
             }
@@ -416,22 +477,15 @@ Task<void> consumer_actor(
             if (completed_producers >= ctx.m_num_producers) {
               break;
             }
-          } else if constexpr (requires { ctx.m_processor->flush_batch(); }) {
+          } else {
             /* Check for Fdatasync */
             if (std::holds_alternative<Fdatasync>(msg.m_payload)) {
-              if constexpr (requires { ctx.m_processor->flush_batch_and_fdatasync(); }) {
-                ctx.m_processor->flush_batch_and_fdatasync();
-              } else {
-                ctx.m_processor->flush_batch();
+              if constexpr (requires { ctx.m_processor->write_and_fdatasync(); }) {
+                ctx.m_processor->write_and_fdatasync();
               }
               continue;
             }
             /* Regular payload message */
-            if (std::holds_alternative<Payload_type>(msg.m_payload)) {
-              process_payload_message(*ctx.m_processor, std::get<Payload_type>(msg.m_payload), msg);
-            }
-          } else {
-            /* Only process if it's actually a payload message */
             if (std::holds_alternative<Payload_type>(msg.m_payload)) {
               process_payload_message(*ctx.m_processor, std::get<Payload_type>(msg.m_payload), msg);
             }
@@ -448,12 +502,7 @@ Task<void> consumer_actor(
       util::cpu_pause();
     }
   }
- 
-  /* Flush any remaining batched messages before completing */
-  if constexpr (requires { ctx.m_processor->flush_batch(); }) {
-    ctx.m_processor->flush_batch();
-  }
- 
+
   if (ctx.m_consumer_done) {
     ctx.m_consumer_done->store(true, std::memory_order_release);
   }
@@ -503,17 +552,32 @@ static double test_throughput_actor_model_single_run(const Test_config& config) 
    * Use raw pointer since metrics lifetime is managed by this function scope */
   util::Metrics* metrics_ptr = (!config.m_disable_metrics) ? &metrics : nullptr;
 
-  Log_writer log_writer = [log_file, metrics_ptr, disable_writes = config.m_disable_writes]
+  /* Store log_file in a way that write_and_fdatasync/fsync can access it.
+   * We'll pass it through the Log_message_processor context */
+  struct Log_file_wrapper {
+    std::shared_ptr<Log_file> m_log_file;
+    util::Metrics* m_metrics_ptr;
+    bool m_disable_writes;
+  };
+  
+  auto log_file_wrapper = std::make_shared<Log_file_wrapper>(Log_file_wrapper{
+    .m_log_file = log_file,
+    .m_metrics_ptr = metrics_ptr,
+    .m_disable_writes = config.m_disable_writes
+  });
+
+  Log_writer log_writer = [log_file_wrapper]
     (std::span<struct iovec> span, wal::Log::Sync_type sync_type) -> wal::Result<std::size_t> {
 
-    auto result = log_file->write(span);
     
-    if (result.has_value() && !disable_writes) {
+    auto result = log_file_wrapper->m_log_file->write(span);
+    
+    if (result.has_value() && !log_file_wrapper->m_disable_writes) {
       bool sync_succeeded = false;
       
       if (sync_type == wal::Log::Sync_type::Fdatasync) [[likely]] {
         auto sync_start = Clock::now();
-        if (::fdatasync(log_file->m_fd) == 0) {
+        if (::fdatasync(log_file_wrapper->m_log_file->m_fd) == 0) {
           sync_succeeded = true;
         } else {
           log_err("fdatasync failed: {}", std::strerror(errno));
@@ -522,13 +586,13 @@ static double test_throughput_actor_model_single_run(const Test_config& config) 
         auto sync_end = Clock::now();
         auto sync_duration = std::chrono::duration_cast<std::chrono::nanoseconds>(sync_end - sync_start);
         
-        if (metrics_ptr != nullptr) {
-          metrics_ptr->inc(util::MetricType::FdatasyncCount);
-          metrics_ptr->add_timing(util::MetricType::FdatasyncTiming, sync_duration);
+        if (log_file_wrapper->m_metrics_ptr != nullptr) {
+          log_file_wrapper->m_metrics_ptr->inc(util::MetricType::FdatasyncCount);
+          log_file_wrapper->m_metrics_ptr->add_timing(util::MetricType::FdatasyncTiming, sync_duration);
         }
       } else if (sync_type == wal::Log::Sync_type::Fsync) {
         auto sync_start = Clock::now();
-        if (::fsync(log_file->m_fd) == 0) {
+        if (::fsync(log_file_wrapper->m_log_file->m_fd) == 0) {
           sync_succeeded = true;
         } else {
           log_err("fsync failed: {}", std::strerror(errno));
@@ -537,9 +601,9 @@ static double test_throughput_actor_model_single_run(const Test_config& config) 
         auto sync_end = Clock::now();
         auto sync_duration = std::chrono::duration_cast<std::chrono::nanoseconds>(sync_end - sync_start);
         
-        if (metrics_ptr != nullptr) {
-          metrics_ptr->inc(util::MetricType::FsyncCount);
-          metrics_ptr->add_timing(util::MetricType::FsyncTiming, sync_duration);
+        if (log_file_wrapper->m_metrics_ptr != nullptr) {
+          log_file_wrapper->m_metrics_ptr->inc(util::MetricType::FsyncCount);
+          log_file_wrapper->m_metrics_ptr->add_timing(util::MetricType::FsyncTiming, sync_duration);
         }
       }
       
@@ -548,10 +612,10 @@ static double test_throughput_actor_model_single_run(const Test_config& config) 
         if (n_blocks > 0) {
           const auto block_header = reinterpret_cast<const wal::Block_header*>(span[0].iov_base);
           const auto block_no = block_header->get_block_no();
-          const off_t length = static_cast<off_t>(n_blocks * log_file->m_block_size);
-          const off_t phy_off = static_cast<off_t>(block_no * log_file->m_block_size % static_cast<std::size_t>(log_file->m_max_file_size));
+          const off_t length = static_cast<off_t>(n_blocks * log_file_wrapper->m_log_file->m_block_size);
+          const off_t phy_off = static_cast<off_t>(block_no * log_file_wrapper->m_log_file->m_block_size % static_cast<std::size_t>(log_file_wrapper->m_log_file->m_max_file_size));
           
-          if (::posix_fadvise(log_file->m_fd, phy_off, length, POSIX_FADV_DONTNEED) != 0) {
+          if (::posix_fadvise(log_file_wrapper->m_log_file->m_fd, phy_off, length, POSIX_FADV_DONTNEED) != 0) {
             log_warn("posix_fadvise(DONTNEED) failed: {}", std::strerror(errno));
           }
         }
@@ -601,7 +665,8 @@ static double test_throughput_actor_model_single_run(const Test_config& config) 
     consumer_ctx.m_io_pool,
     consumer_ctx.m_disable_log_writes,
     config.m_disable_metrics ? nullptr : &metrics,  /* Pass metrics only if not disabled */
-    metrics_config_ptr  /* Pass metrics config for fine-grained control */
+    metrics_config_ptr,  /* Pass metrics config for fine-grained control */
+    log_file  /* Pass log_file for direct sync operations */
   );
 
   assert(config.m_num_consumers == 1);
@@ -611,7 +676,8 @@ static double test_throughput_actor_model_single_run(const Test_config& config) 
     consumer_ctx.m_io_pool,
     consumer_ctx.m_disable_log_writes,
     config.m_disable_metrics ? nullptr : &metrics,  /* Pass metrics only if not disabled */
-    metrics_config_ptr  /* Pass metrics config for fine-grained control */
+    metrics_config_ptr,  /* Pass metrics config for fine-grained control */
+    log_file  /* Pass log_file for direct sync operations */
   );
 
   /* Set additional fields in consumer context */
@@ -621,7 +687,7 @@ static double test_throughput_actor_model_single_run(const Test_config& config) 
   consumer_ctx.m_batch_timeout = std::chrono::milliseconds(10);  /* Flush batch every 10ms */
 
   /* Use simple lambda when writes are disabled, matching test_actor_model exactly */
-  /* Pass processor by reference so timer can call flush_batch */
+  /* Pass processor by reference so timer can call write_and_fdatasync/fsync */
   detach(consumer_actor(consumer_ctx, std::ref(start_flag)));
 
   /* Launch producer actors (coroutines) */

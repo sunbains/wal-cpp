@@ -1,5 +1,15 @@
 #pragma once
 
+#include <span>
+#include <vector>
+#include <functional>
+#include <sys/uio.h>
+#include <expected>
+#include <limits>
+#include <tuple>
+
+#include "util/checksum.h"
+#include "util/metrics.h"
 #include "wal/types.h"
 
 namespace wal {
@@ -249,9 +259,11 @@ struct [[nodiscard]] Buffer {
   /**
    * Write buffer to store synchronously - used for inline I/O when buffers exhausted.
    * @param[in] callback The callback function to write the data.
+   * @param[in] max_write_lsn Maximum LSN to write (0 = write all).
+   * @param[in] sync_type Sync type to use for the last batch (None = no sync, Fdatasync, Fsync).
    * @return Result with new LWM LSN on success.
    */
-  [[nodiscard]] Result<lsn_t> write_to_store(Write_callback callback, lsn_t max_write_lsn = 0) noexcept;
+  [[nodiscard]] Result<lsn_t> write_to_store(Write_callback callback, lsn_t max_write_lsn = 0, Sync_type sync_type = Sync_type::None) noexcept;
 
   /**
    * Clear the headers for the given range of LSNs.

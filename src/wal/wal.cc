@@ -3,11 +3,14 @@
 #include <format>
 #include <sys/uio.h>
 #include <cstring>
+#include <string>
+#include <sstream>
 
 #include <cassert>
 #include <limits>
 
 #include "util/checksum.h"
+#include "util/metrics.h"
 #include "wal/wal.h"
 #include "wal/buffer_pool.h"
 #include "wal/async_io.h"
@@ -176,7 +179,7 @@ std::size_t prepare_batch(Buffer& buffer, block_no_t start, block_no_t end, std:
 
 } // anonymous namespace
 
-Result<lsn_t> Buffer::write_to_store(Write_callback callback, lsn_t max_write_lsn) noexcept {
+Result<lsn_t> Buffer::write_to_store(Write_callback callback, lsn_t max_write_lsn, Sync_type sync_type) noexcept {
   WAL_ASSERT(!is_empty());
   WAL_ASSERT(is_write_pending());
 
@@ -243,7 +246,10 @@ Result<lsn_t> Buffer::write_to_store(Write_callback callback, lsn_t max_write_ls
       io_start = Clock::now();
     }
 
-    auto io_result = callback(std::span<struct iovec>(m_iovecs.data(), n_slots), wal::Log::Sync_type::None);
+    /* Use sync_type for the last batch only (when n_blocks_to_flush will be 0 after this batch) */
+    Sync_type batch_sync_type = (n_blocks_to_flush - flush_batch_size == 0) ? sync_type : Sync_type::None;
+    
+    auto io_result = callback(std::span<struct iovec>(m_iovecs.data(), n_slots), batch_sync_type);
 
     if (m_metrics != nullptr) [[likely]] {
       const auto io_end = Clock::now();
@@ -413,11 +419,16 @@ Result<bool> Log::write_to_store(Write_callback callback) noexcept {
   /* Create an adapter that converts Write_callback (takes span<iovec> and sync_type)
    * to a function that takes Buffer& and Thread_pool* and returns Task<Result<bool>> */
   auto adapter = [callback](Buffer& buffer) -> Result<bool> {
-    /* Create a wrapper callback that passes the sync type */
-    auto wrapped_callback = [callback](std::span<struct iovec> span, Log::Sync_type) -> Result<lsn_t> {
-      return callback(span, Sync_type::None);
+    /* Create a wrapper that captures the sync_type from the callback's parameter */
+    /* We need to extract sync_type from the callback somehow, but the callback signature doesn't allow that */
+    /* Instead, we'll use a different approach: the callback itself will determine sync_type */
+    auto wrapped_callback = [callback](std::span<struct iovec> span, Sync_type sync_type) -> Result<lsn_t> {
+      /* Pass through the sync_type - it will be None for all batches except the last */
+      return callback(span, sync_type);
     };
-    return buffer.write_to_store(wrapped_callback);
+    /* For now, we can't pass sync_type to write_to_store from here */
+    /* The sync_type needs to come from the Entry or be passed explicitly */
+    return buffer.write_to_store(wrapped_callback, 0, Sync_type::None);
   };
 
   return m_pool->write_to_store(adapter);

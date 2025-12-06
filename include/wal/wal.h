@@ -1,5 +1,6 @@
 #pragma once
 
+#include "util/metrics.h"
 #include "wal/buffer_pool.h"
 
 namespace wal {
