@@ -107,64 +107,22 @@ if(WAL_BUILD_LIB OR WAL_BUILD_TESTS)
     EXPORT_NAME wal
   )
 
-  # Warnings (portable baseline) + always treat warnings as errors.
-  # Base flags (warnings, etc.) that should be inherited by tests
+  # Compile options for wal library (respect build type: -O0 for Debug, -O3 for others)
   if(MSVC)
-    set(WAL_COMPILE_OPTIONS_BASE_MSVC
-      /W4
-      /WX
-    )
-    set(WAL_COMPILE_OPTIONS_MSVC
-      ${WAL_COMPILE_OPTIONS_BASE_MSVC}
-      # Debug: no optimization
+    target_compile_options(wal PRIVATE
+      /W4 /WX
       $<$<CONFIG:Debug>:/Zi /Od>
-      # Maximum safe optimization for Release builds
       $<$<CONFIG:Release>:/O2 /Ob2 /Oi /Ot /GL>
       $<$<CONFIG:RelWithDebInfo>:/O2 /Ob1 /Oi /Ot>
     )
-    target_compile_options(wal PRIVATE ${WAL_COMPILE_OPTIONS_MSVC})
-    # Test-specific flags for MSVC (respect build type)
-    set(WAL_TEST_COMPILE_OPTIONS_DEBUG_MSVC
-      ${WAL_COMPILE_OPTIONS_BASE_MSVC} /Zi
-      $<$<CONFIG:Debug>:/Od>
-      $<$<NOT:$<CONFIG:Debug>>:/O2>
-    )
-    set(WAL_TEST_COMPILE_OPTIONS_PERF_MSVC
-      ${WAL_COMPILE_OPTIONS_BASE_MSVC} /Zi
-      $<$<CONFIG:Debug>:/Od>
-      $<$<NOT:$<CONFIG:Debug>>:/O2>
-    )
   else()
-    set(WAL_COMPILE_OPTIONS_BASE_GCC_CLANG
+    target_compile_options(wal PRIVATE
       -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion
       -Werror
-      # SSE4.2 for CRC intrinsics in checksum.h
       -msse4.2
-    )
-    set(WAL_COMPILE_OPTIONS_GCC_CLANG
-      ${WAL_COMPILE_OPTIONS_BASE_GCC_CLANG}
       $<$<CONFIG:Debug>:-g3 -O0 -ggdb3>
-      # Maximum safe optimization for Release builds
       $<$<CONFIG:Release>:-g -O3 -flto -march=native -mtune=native -fno-omit-frame-pointer>
       $<$<CONFIG:RelWithDebInfo>:-g -O3 -flto -fno-omit-frame-pointer>
-    )
-    target_compile_options(wal PRIVATE ${WAL_COMPILE_OPTIONS_GCC_CLANG})
-
-    # Test-specific flags for GCC/Clang (respect build type: -O0 for Debug, -O3 for others)
-    set(WAL_TEST_COMPILE_OPTIONS_DEBUG_GCC_CLANG
-      ${WAL_COMPILE_OPTIONS_BASE_GCC_CLANG} -ggdb3 -fno-omit-frame-pointer
-      $<$<CONFIG:Debug>:-O0>
-      $<$<NOT:$<CONFIG:Debug>>:-O3>
-    )
-    set(WAL_TEST_COMPILE_OPTIONS_PERF_LTO_GCC_CLANG
-      ${WAL_COMPILE_OPTIONS_BASE_GCC_CLANG} -ggdb3 -fno-omit-frame-pointer
-      $<$<CONFIG:Debug>:-O0>
-      $<$<NOT:$<CONFIG:Debug>>:-O3 -flto -march=native -mtune=native>
-    )
-    set(WAL_TEST_COMPILE_OPTIONS_CORO_GCC_CLANG
-      ${WAL_COMPILE_OPTIONS_BASE_GCC_CLANG} -ggdb3 -fno-omit-frame-pointer
-      $<$<CONFIG:Debug>:-O0>
-      $<$<NOT:$<CONFIG:Debug>>:-O3>
     )
   endif()
 
