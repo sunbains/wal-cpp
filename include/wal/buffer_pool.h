@@ -51,14 +51,14 @@ struct Pool {
   struct Io_operation {
     /* Write operation - buffer entry to write */
     struct Write_op {
-      Entry* entry_ptr;
-      Buffer::Write_callback* write_callback;
+      Entry* m_entry_ptr;
+      Buffer::Write_callback* m_write_callback;
     };
     
     /* Sync operation - fsync or fdatasync */
     struct Sync_op {
-      Sync_type sync_type;
-      std::function<Result<bool>(Sync_type)>* sync_callback;
+      Sync_type m_sync_type;
+      std::function<Result<bool>(Sync_type)>* m_sync_callback;
     };
     
     /* Read operation - placeholder for future use */
@@ -194,7 +194,7 @@ struct Pool {
     if (m_free_buffers.dequeue(free_entry_ptr)) {
       /* Enqueue write operation to IO queue */
       Io_operation io_op;
-      io_op.m_op = Io_operation::Write_op{.entry_ptr = entry_ptr, .write_callback = &write_callback};
+      io_op.m_op = Io_operation::Write_op{.m_entry_ptr = entry_ptr, .m_write_callback = &write_callback};
       [[maybe_unused]] auto ret = m_io_operations.enqueue(io_op);
       WAL_ASSERT(ret);
       
@@ -243,7 +243,7 @@ struct Pool {
     }
     
     Io_operation io_op;
-    io_op.m_op = Io_operation::Sync_op{.sync_type = sync_type, .sync_callback = &sync_callback};
+    io_op.m_op = Io_operation::Sync_op{.m_sync_type = sync_type, .m_sync_callback = &sync_callback};
     [[maybe_unused]] auto ret = m_io_operations.enqueue(io_op);
     WAL_ASSERT(ret);
     
@@ -255,10 +255,10 @@ struct Pool {
   }
 
   /* Delete copy and move operations - Pool is not copyable or movable */
-  Pool(const Pool&) = delete;
-  Pool& operator=(const Pool&) = delete;
   Pool(Pool&&) = delete;
+  Pool(const Pool&) = delete;
   Pool& operator=(Pool&&) = delete;
+  Pool& operator=(const Pool&) = delete;
 
   /* I/O coroutine function - processes all IO operations (writes, syncs, reads) from the queue.
    * All operations are serialized through the single queue since we only configure one IO thread.
@@ -270,8 +270,8 @@ struct Pool {
       if (std::holds_alternative<Io_operation::Write_op>(io_op.m_op)) {
         /* Handle write operation */
         auto& write_op = std::get<Io_operation::Write_op>(io_op.m_op);
-        Entry* entry_ptr = write_op.entry_ptr;
-        Buffer::Write_callback* write_callback = write_op.write_callback;
+        auto entry_ptr = write_op.m_entry_ptr;
+        auto write_callback = write_op.m_write_callback;
         
         WAL_ASSERT(write_callback && "I/O callback must be set via start_io");
         
@@ -296,8 +296,8 @@ struct Pool {
         /* Handle sync operation */
         auto& sync_op = std::get<Io_operation::Sync_op>(io_op.m_op);
         
-        if ((sync_op.sync_callback != nullptr) && sync_op.sync_type != Sync_type::None) {
-          auto sync_result = (*sync_op.sync_callback)(sync_op.sync_type);
+        if ((sync_op.m_sync_callback != nullptr) && sync_op.m_sync_type != Sync_type::None) {
+          auto sync_result = (*sync_op.m_sync_callback)(sync_op.m_sync_type);
           if (!sync_result.has_value()) {
             log_fatal("Sync operation failed");
           }
@@ -306,6 +306,7 @@ struct Pool {
       } else if (std::holds_alternative<Io_operation::Read_op>(io_op.m_op)) {
         /* Handle read operation - placeholder for future use */
         /* TODO: Implement read operation */
+        std::abort();
       }
     }
     
