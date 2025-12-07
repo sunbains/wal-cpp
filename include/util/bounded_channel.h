@@ -187,6 +187,158 @@ struct Bounded_queue {
     return result;
   }
 
+  /**
+   * Dequeue multiple items at once (batch dequeue)
+   * Uses SIMD optimization for trivially copyable types
+   * @param values Pointer to output array (must have space for at least max_count items)
+   * @param max_count Maximum number of items to dequeue
+   * @return Number of items actually dequeued (0 if queue is empty)
+   */
+  [[nodiscard]] std::size_t dequeue_batch(T* values, std::size_t max_count) noexcept {
+    if (max_count == 0) {
+      return 0;
+    }
+
+    Cell *ring_ptr = m_ring.get();
+    auto pos{atomic_load_const<Pos, std::memory_order_relaxed>(&m_dpos)};
+    std::size_t claimed = 0;
+
+    // Try to claim as many positions as possible (up to max_count)
+    for (;;) {
+      // Check how many items are available starting from pos
+      std::size_t available = 0;
+      for (std::size_t i = 0; i < max_count; ++i) {
+        Cell *cell = &ring_ptr[(pos + i) & m_capacity];
+        const auto seq{atomic_load_const<Pos, std::memory_order_acquire>(&cell->m_pos)};
+        const auto diff = static_cast<std::ptrdiff_t>(seq) - static_cast<std::ptrdiff_t>(pos + i + 1);
+
+        if (diff == 0) {
+          // This item is available
+          available++;
+        } else {
+          // No more items available
+          break;
+        }
+      }
+
+      if (available == 0) {
+        // Queue is empty or another thread consumed items
+        return 0;
+      }
+
+      // Try to atomically claim 'available' positions
+      Pos expected = pos;
+      if (atomic_compare_exchange_weak_const<Pos, std::memory_order_relaxed, std::memory_order_relaxed>(
+            &m_dpos, &expected, pos + available)) {
+        claimed = available;
+        break;
+      }
+
+      // CAS failed, retry with updated pos
+      pos = expected;
+    }
+
+    // Now we have claimed 'claimed' items starting at position 'pos'
+    // Copy them to the output array
+    // Note: Cell layout (T data, atomic<Pos> pos) means data is not contiguous,
+    // so we copy item by item. Main benefit is reducing atomic operations.
+    for (std::size_t i = 0; i < claimed; ++i) {
+      Cell *cell = &ring_ptr[(pos + i) & m_capacity];
+
+      if constexpr (std::is_trivially_copyable_v<T>) {
+        std::memcpy(&values[i], &cell->m_data, sizeof(T));
+      } else {
+        values[i] = cell->m_data;
+      }
+
+      // Set the sequence to what it should be next time around
+      atomic_store_const<Pos, std::memory_order_release>(&cell->m_pos, pos + i + m_capacity + 1);
+    }
+
+    return claimed;
+  }
+
+  /**
+   * Dequeue multiple items at once using a callback (zero-copy batch dequeue)
+   * Processes items in-place without copying to a separate buffer
+   * @param max_count Maximum number of items to dequeue
+   * @param callback Function to call for each dequeued item: bool callback(T&)
+   *                 Return false from callback to stop early
+   * @return Number of items actually dequeued (0 if queue is empty)
+   */
+  template<typename F>
+  [[nodiscard]] std::size_t dequeue_batch(std::size_t max_count, F&& callback) noexcept {
+    if (max_count == 0) {
+      return 0;
+    }
+
+    Cell *ring_ptr = m_ring.get();
+    auto pos{atomic_load_const<Pos, std::memory_order_relaxed>(&m_dpos)};
+    std::size_t claimed = 0;
+
+    // Try to claim as many positions as possible (up to max_count)
+    for (;;) {
+      // Check how many items are available starting from pos
+      std::size_t available = 0;
+      for (std::size_t i = 0; i < max_count; ++i) {
+        Cell *cell = &ring_ptr[(pos + i) & m_capacity];
+        const auto seq{atomic_load_const<Pos, std::memory_order_acquire>(&cell->m_pos)};
+        const auto diff = static_cast<std::ptrdiff_t>(seq) - static_cast<std::ptrdiff_t>(pos + i + 1);
+
+        if (diff == 0) {
+          // This item is available
+          available++;
+        } else {
+          // No more items available
+          break;
+        }
+      }
+
+      if (available == 0) {
+        // Queue is empty or another thread consumed items
+        return 0;
+      }
+
+      // Try to atomically claim 'available' positions
+      Pos expected = pos;
+      if (atomic_compare_exchange_weak_const<Pos, std::memory_order_relaxed, std::memory_order_relaxed>(
+            &m_dpos, &expected, pos + available)) {
+        claimed = available;
+        break;
+      }
+
+      // CAS failed, retry with updated pos
+      pos = expected;
+    }
+
+    // Now we have claimed 'claimed' items starting at position 'pos'
+    // Process them in-place with the callback
+    std::size_t processed = 0;
+    for (std::size_t i = 0; i < claimed; ++i) {
+      Cell *cell = &ring_ptr[(pos + i) & m_capacity];
+
+      // Call callback with the cell's data
+      if (!callback(cell->m_data)) {
+        // Early exit requested by callback
+        processed = i + 1;
+
+        // Still need to release all claimed cells
+        for (std::size_t j = 0; j < claimed; ++j) {
+          Cell *release_cell = &ring_ptr[(pos + j) & m_capacity];
+          atomic_store_const<Pos, std::memory_order_release>(&release_cell->m_pos, pos + j + m_capacity + 1);
+        }
+
+        return processed;
+      }
+
+      // Set the sequence to what it should be next time around
+      atomic_store_const<Pos, std::memory_order_release>(&cell->m_pos, pos + i + m_capacity + 1);
+      processed++;
+    }
+
+    return processed;
+  }
+
   /** @return the capacity of the Bounded_queue */
   [[nodiscard]] auto capacity() const noexcept { return m_capacity + 1; }
 

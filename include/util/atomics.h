@@ -218,3 +218,87 @@ template <typename T, std::memory_order SuccessOrder, std::memory_order FailureO
 }
 
 #endif // WAL_USE_ATOMIC_BUILTINS
+
+/* ============================================================================
+ * SIMD UTILITIES FOR BATCH OPERATIONS
+ * ============================================================================
+ * SIMD intrinsics for optimized batch copying in queues
+ */
+
+// SIMD intrinsics detection and includes
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+  #if defined(__AVX512F__)
+    #include <immintrin.h>
+    #define UTIL_HAS_AVX512
+  #elif defined(__AVX2__)
+    #include <immintrin.h>
+    #define UTIL_HAS_AVX2
+  #elif defined(__SSE2__) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+    #include <emmintrin.h>
+    #define UTIL_HAS_SSE2
+  #endif
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+  #include <arm_neon.h>
+  #define UTIL_HAS_NEON
+#endif
+
+#include <cstring>
+#include <type_traits>
+
+namespace util {
+
+/**
+ * SIMD-optimized batch copy for trivially copyable types
+ * Falls back to memcpy for non-SIMD or when size is too small
+ */
+template <typename T>
+inline void simd_batch_copy(T* dest, const T* src, std::size_t count) noexcept {
+  static_assert(std::is_trivially_copyable_v<T>, "Type must be trivially copyable for SIMD copy");
+
+  const std::size_t total_bytes = count * sizeof(T);
+  auto* dest_bytes = reinterpret_cast<char*>(dest);
+  const auto* src_bytes = reinterpret_cast<const char*>(src);
+
+  std::size_t offset = 0;
+
+#if defined(UTIL_HAS_AVX512)
+  // AVX-512: 64 bytes (512 bits) at a time
+  constexpr std::size_t simd_width = 64;
+  while (offset + simd_width <= total_bytes) {
+    __m512i data = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(src_bytes + offset));
+    _mm512_storeu_si512(reinterpret_cast<__m512i*>(dest_bytes + offset), data);
+    offset += simd_width;
+  }
+#elif defined(UTIL_HAS_AVX2)
+  // AVX2: 32 bytes (256 bits) at a time
+  constexpr std::size_t simd_width = 32;
+  while (offset + simd_width <= total_bytes) {
+    __m256i data = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src_bytes + offset));
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(dest_bytes + offset), data);
+    offset += simd_width;
+  }
+#elif defined(UTIL_HAS_SSE2)
+  // SSE2: 16 bytes (128 bits) at a time
+  constexpr std::size_t simd_width = 16;
+  while (offset + simd_width <= total_bytes) {
+    __m128i data = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src_bytes + offset));
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(dest_bytes + offset), data);
+    offset += simd_width;
+  }
+#elif defined(UTIL_HAS_NEON)
+  // NEON: 16 bytes (128 bits) at a time
+  constexpr std::size_t simd_width = 16;
+  while (offset + simd_width <= total_bytes) {
+    uint8x16_t data = vld1q_u8(reinterpret_cast<const uint8_t*>(src_bytes + offset));
+    vst1q_u8(reinterpret_cast<uint8_t*>(dest_bytes + offset), data);
+    offset += simd_width;
+  }
+#endif
+
+  // Copy remaining bytes with memcpy (handles tail and fallback for non-SIMD)
+  if (offset < total_bytes) {
+    std::memcpy(dest_bytes + offset, src_bytes + offset, total_bytes - offset);
+  }
+}
+
+} // namespace util

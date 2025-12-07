@@ -74,6 +74,12 @@ struct Test_config {
 
   /** Fine-grained control over which metrics to collect */
   Metrics_config m_metrics_config{};
+
+  /** Enable batch dequeue (default: false - single dequeue) */
+  bool m_enable_batch_dequeue{false};
+
+  /** Batch size for batch dequeue (default: 32) */
+  std::size_t m_batch_size{32};
 };
 
 /**
@@ -121,6 +127,8 @@ struct Consumer_context {
   Log_message_processor* m_processor;  /* Pass by pointer so we can call write_and_fdatasync/fsync */
   std::size_t m_num_producers;
   std::chrono::milliseconds m_batch_timeout{std::chrono::milliseconds(10)};
+  bool m_enable_batch_dequeue{false};
+  std::size_t m_batch_size{32};
 };
 
 /* Function object wrapper that stores values as members and calls static function */
@@ -324,7 +332,7 @@ Task<void> consumer_actor(
   std::size_t completed_producers = 0;
   util::Message_envelope<Payload_type> msg;
   std::size_t no_work_iterations = 0;
- 
+
   constexpr std::size_t bulk_read_size = 64;
   std::array<std::size_t, bulk_read_size> notification_buffer;
  
@@ -377,35 +385,76 @@ Task<void> consumer_actor(
         util::prefetch_for_read<3>(proc);
 
         proc->m_in_process_mailbox.store(false, std::memory_order_release);
- 
-        while (proc->m_mailbox.dequeue(msg)) {
-          if (std::holds_alternative<util::Poison_pill>(msg.m_payload)) [[unlikely]] {
-            ++completed_producers;
- 
+
+        if (ctx.m_enable_batch_dequeue) {
+          /* Batch dequeue mode - loop until mailbox is drained using lambda API */
+          while (proc->m_mailbox.dequeue_batch(ctx.m_batch_size, [&](auto& batch_msg) {
+            if (std::holds_alternative<util::Poison_pill>(batch_msg.m_payload)) [[unlikely]] {
+              ++completed_producers;
+
+              if (completed_producers >= ctx.m_num_producers) {
+                loop_exited_normally = false;
+                return false;  // Stop processing
+              }
+            } else {
+              /* Check for Fdatasync */
+              if (std::holds_alternative<wal::Fdatasync>(batch_msg.m_payload)) {
+                /* Flush batch and call fdatasync */
+                if constexpr (requires { ctx.m_processor->write_and_fdatasync(); }) {
+                  ctx.m_processor->write_and_fdatasync();
+                }
+                return true;  // Continue processing
+              }
+              /* Check for Fsync */
+              if (std::holds_alternative<wal::Fsync>(batch_msg.m_payload)) {
+                /* Flush batch and call fsync */
+                if constexpr (requires { ctx.m_processor->write_and_fsync(); }) {
+                  ctx.m_processor->write_and_fsync();
+                }
+                return true;  // Continue processing
+              }
+              /* Regular payload message */
+              if (std::holds_alternative<Payload_type>(batch_msg.m_payload)) {
+                process_payload_message(*ctx.m_processor, std::get<Payload_type>(batch_msg.m_payload), batch_msg);
+              }
+            }
+            return true;  // Continue processing
+          }) > 0) {
             if (completed_producers >= ctx.m_num_producers) {
-              loop_exited_normally = false;
               break;
             }
-          } else {
-            /* Check for Fdatasync */
-            if (std::holds_alternative<wal::Fdatasync>(msg.m_payload)) {
-              /* Flush batch and call fdatasync */
-              if constexpr (requires { ctx.m_processor->write_and_fdatasync(); }) {
-                ctx.m_processor->write_and_fdatasync();
+          }
+        } else {
+          /* Single dequeue mode (original behavior) */
+          while (proc->m_mailbox.dequeue(msg)) {
+            if (std::holds_alternative<util::Poison_pill>(msg.m_payload)) [[unlikely]] {
+              ++completed_producers;
+
+              if (completed_producers >= ctx.m_num_producers) {
+                loop_exited_normally = false;
+                break;
               }
-              continue;
-            }
-            /* Check for Fsync */
-            if (std::holds_alternative<wal::Fsync>(msg.m_payload)) {
-              /* Flush batch and call fsync */
-              if constexpr (requires { ctx.m_processor->write_and_fsync(); }) {
-                ctx.m_processor->write_and_fsync();
+            } else {
+              /* Check for Fdatasync */
+              if (std::holds_alternative<wal::Fdatasync>(msg.m_payload)) {
+                /* Flush batch and call fdatasync */
+                if constexpr (requires { ctx.m_processor->write_and_fdatasync(); }) {
+                  ctx.m_processor->write_and_fdatasync();
+                }
+                continue;
               }
-              continue;
-            }
-            /* Regular payload message */
-            if (std::holds_alternative<Payload_type>(msg.m_payload)) {
-              process_payload_message(*ctx.m_processor, std::get<Payload_type>(msg.m_payload), msg);
+              /* Check for Fsync */
+              if (std::holds_alternative<wal::Fsync>(msg.m_payload)) {
+                /* Flush batch and call fsync */
+                if constexpr (requires { ctx.m_processor->write_and_fsync(); }) {
+                  ctx.m_processor->write_and_fsync();
+                }
+                continue;
+              }
+              /* Regular payload message */
+              if (std::holds_alternative<Payload_type>(msg.m_payload)) {
+                process_payload_message(*ctx.m_processor, std::get<Payload_type>(msg.m_payload), msg);
+              }
             }
           }
         }
@@ -627,7 +676,9 @@ static double test_throughput_actor_model_single_run(const Test_config& config) 
     .m_sched = nullptr,  /* Will be set after processor is created */
     .m_processor = nullptr,  /* Will be set after processor is created */
     .m_num_producers = 0,  /* Will be set after processor is created */
-    .m_batch_timeout = std::chrono::milliseconds(10)
+    .m_batch_timeout = std::chrono::milliseconds(10),
+    .m_enable_batch_dequeue = config.m_enable_batch_dequeue,
+    .m_batch_size = config.m_batch_size
   };
 
   /* Start the background I/O coroutine to process buffers on dedicated I/O pool */
@@ -899,6 +950,8 @@ static void print_usage(const char* program_name) noexcept {
                "      --timeout-ms NUM     Timeout in milliseconds (0 disables, default: 3000)\n"
                "  -f, --fdatasync-interval NUM Send sync messages with probability NUM (0.0-1.0, e.g., 0.3 = 30%%, default: 0)\n"
                "      --use-fsync          Use fsync messages instead of fdatasync (default: fdatasync)\n"
+               "  -b, --batch-dequeue      Enable batch dequeue mode (default: off)\n"
+               "  -B, --batch-size NUM     Batch size for batch dequeue (default: 32)\n"
                "  -h, --help                Show this help message\n",
                program_name);
 }
@@ -923,13 +976,15 @@ int main(int argc, char** argv) {
     {"timeout-ms", required_argument, nullptr, 'T'},
     {"fdatasync-interval", required_argument, nullptr, 'f'},
     {"use-fsync", no_argument, nullptr, 1005},
+    {"batch-dequeue", no_argument, nullptr, 'b'},
+    {"batch-size", required_argument, nullptr, 'B'},
     {"help", no_argument, nullptr, 'h'},
     {nullptr, 0, nullptr, 0}
   };
 
   int opt;
   int option_index = 0;
-  while ((opt = getopt_long(argc, argv, "M:m:i:p:c:hwdSXL:R:T:f:", long_options, &option_index)) != -1) {
+  while ((opt = getopt_long(argc, argv, "M:m:i:p:c:hwdSXL:R:T:f:bB:", long_options, &option_index)) != -1) {
     switch (opt) {
       case 'M':
         config.m_mailbox_size = std::stoull(optarg);
@@ -989,6 +1044,12 @@ int main(int argc, char** argv) {
       }
       case 1005:
         config.m_sync_type = Sync_message_type::Fsync;
+        break;
+      case 'b':
+        config.m_enable_batch_dequeue = true;
+        break;
+      case 'B':
+        config.m_batch_size = std::stoull(optarg);
         break;
       case 'h':
         show_help = true;
