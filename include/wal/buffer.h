@@ -52,13 +52,13 @@ struct [[nodiscard]] Buffer {
 
     ~Config() = default;
 
-    const size_t m_n_blocks;
-    const size_t m_block_size;
-    const util::ChecksumAlgorithm m_checksum_algorithm;
-
     std::size_t get_data_size_in_block() const noexcept {
       return m_block_size - sizeof(Block_header::Data) - sizeof(crc32_t);
     }
+
+    const size_t m_n_blocks;
+    const size_t m_block_size;
+    const util::ChecksumAlgorithm m_checksum_algorithm;
   };
 
   /**
@@ -262,17 +262,6 @@ struct [[nodiscard]] Buffer {
    * @return The new LWM LSN.
    */
   [[nodiscard]] Result<lsn_t> read_from_store(lsn_t lsn, Read_callback callback) noexcept;
-
-  /**
-   * Write data to the store using Tasks for async I/O.
-   * on the provided thread pool (or synchronously if pool is nullptr).
-   *
-   * @param[in] callback The callback function to write the data.
-   * @param[in] thread_pool Thread pool for executing I/O operations. If nullptr, executes synchronously.
-   * @param[in] max_blocks_per_batch The maximum number of blocks to write per batch.
-   * @return A Task that yields the new LWM LSN.
-   */
-  // [[nodiscard]] Task<Result<lsn_t>> write_to_store(Write_callback callback, util::Thread_pool* thread_pool = nullptr, std::size_t max_blocks_per_batch = kMaxBlocks) noexcept;
 
   /**
    * Write buffer to store synchronously - used for inline I/O when buffers exhausted.
