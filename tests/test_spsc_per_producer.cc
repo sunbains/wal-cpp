@@ -37,15 +37,18 @@ struct Config {
 };
 
 /* Producer state - owns SPSC queue */
-struct Producer_state {
+/* Cache-line aligned to prevent false sharing between producers */
+struct alignas(std::hardware_destructive_interference_size) Producer_state {
   explicit Producer_state(std::size_t producer_id, std::size_t queue_size)
     : m_id(producer_id), m_queue(queue_size) {}
 
   /* Enqueue self into scheduling queue if not already scheduled */
   void schedule_self() {
     if (m_schedule_queue && !m_in_schedule_queue.exchange(true, std::memory_order_acq_rel)) {
-      while (!m_schedule_queue->enqueue(this)) {
-        std::this_thread::yield();
+      /* Try to enqueue - if it fails, caller will retry after suspending */
+      if (!m_schedule_queue->enqueue(this)) {
+        /* Failed to enqueue - reset flag so we can try again later */
+        m_in_schedule_queue.store(false, std::memory_order_release);
       }
     }
   }
@@ -69,13 +72,21 @@ Task<void> producer_coro(Producer_state& state, util::Thread_pool& pool, std::si
 
   /* Tight loop: produce all items */
   for (std::size_t i = 0; i < num_items; ++i) {
-    if (!state.m_queue.enqueue(i)) {
+    /* Hybrid approach: spin briefly, then suspend if queue stays full */
+    std::size_t spin_count = 0;
+    constexpr std::size_t MAX_SPIN = 64;
+
+    while (!state.m_queue.enqueue(i)) {
       /* Queue full - schedule self to notify consumer */
       state.schedule_self();
 
-      /* Spin until space available */
-      while (!state.m_queue.enqueue(i)) {
-        std::this_thread::yield();
+      if (spin_count++ < MAX_SPIN) {
+        /* Short spin with CPU pause - low latency for brief waits */
+        util::cpu_pause_n(4);
+      } else {
+        /* Long wait - suspend to thread pool to avoid wasting CPU */
+        co_await pool.schedule();
+        spin_count = 0;  /* Reset after suspension */
       }
     }
   }
@@ -108,24 +119,28 @@ Task<void> consumer_coro(Consumer_context& ctx) {
   }
 
   /* Tight loop: pull from scheduling queue and drain SPSC queues */
-  Item item;
   std::size_t local_consumed = 0;
+  std::size_t empty_spins = 0;
+  constexpr std::size_t MAX_EMPTY_SPIN = 128;
 
   while (local_consumed < ctx.m_total_items) {
     Producer_state* producer = nullptr;
 
     /* Dequeue next producer from scheduling queue */
     if (ctx.m_schedule_queue->dequeue(producer)) {
+      empty_spins = 0;  /* Reset spin counter on successful dequeue */
+
       /* Mark as not in queue so it can re-schedule */
       producer->m_in_schedule_queue.store(false, std::memory_order_release);
 
-      /* Drain this producer's SPSC queue aggressively */
-      std::size_t drained = 0;
-      while (drained < ctx.m_drain_batch_size && producer->m_queue.dequeue(item)) {
-        ++drained;
+      /* Drain this producer's SPSC queue using batch interface */
+      std::size_t max_batch = std::min(ctx.m_drain_batch_size, ctx.m_total_items - local_consumed);
+      std::size_t drained = producer->m_queue.dequeue_batch(max_batch, [&](Item& value) {
+        /* Process each item in the batch */
+        (void)value;  /* Item consumed */
         ++local_consumed;
-        if (local_consumed >= ctx.m_total_items) break;
-      }
+        return local_consumed < ctx.m_total_items;  /* Continue until done */
+      });
 
       /* If producer still has data, re-schedule it immediately */
       if (drained == ctx.m_drain_batch_size && local_consumed < ctx.m_total_items) {
@@ -133,8 +148,15 @@ Task<void> consumer_coro(Consumer_context& ctx) {
         producer->schedule_self();
       }
     } else {
-      /* No producers in queue - yield briefly to avoid spinning */
-      std::this_thread::yield();
+      /* No producers in queue - hybrid spin-then-suspend */
+      if (empty_spins++ < MAX_EMPTY_SPIN) {
+        /* Short spin for low latency */
+        util::cpu_pause_n(8);
+      } else {
+        /* Long wait - suspend to avoid wasting CPU */
+        co_await ctx.m_pool->schedule();
+        empty_spins = 0;
+      }
     }
   }
 
