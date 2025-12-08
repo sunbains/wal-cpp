@@ -338,12 +338,19 @@ Task<void> producer_actor(Producer_context ctx, std::size_t num_items, std::atom
 
   ctx.m_proc->schedule_self(ctx.m_sched->m_mailboxes, n_mailboxes);
 
+  std::size_t notify_counter = 0;
+
   auto enqueue_with_retry = [&](auto&& env_factory) {
     while (true) {
       auto env = env_factory();
       if (ctx.m_proc->m_mailbox.enqueue(std::move(env))) [[likely]] {
-        /* Notify consumer only if not already scheduled. */
-        if (!ctx.m_proc->m_in_process_mailbox.load(std::memory_order_acquire)) {
+        /* Reduce scheduling overhead when log writes are disabled */
+        if (ctx.m_disable_log_writes) {
+          ++notify_counter;
+          if ((notify_counter & 0xFFu) == 0) {
+            ctx.m_proc->schedule_self(ctx.m_sched->m_mailboxes, n_mailboxes);
+          }
+        } else if (!ctx.m_proc->m_in_process_mailbox.load(std::memory_order_acquire)) {
           ctx.m_proc->schedule_self(ctx.m_sched->m_mailboxes, n_mailboxes);
         }
         break;
@@ -691,9 +698,11 @@ static Test_run_result test_throughput_actor_model_single_run(const Test_config&
     producer_pids.push_back(service_setup.m_sched.spawn(config.m_mailbox_size));
   }
 
-  /* Create log service process for poison pills */
-  util::Pid service_pid = service_setup.m_sched.spawn(config.m_mailbox_size);
-  auto service_process = service_setup.m_sched.get_process(service_pid);
+  Process_type* service_process = nullptr;
+  if (!config.m_disable_log_writes) {
+    util::Pid service_pid = service_setup.m_sched.spawn(config.m_mailbox_size);
+    service_process = service_setup.m_sched.get_process(service_pid);
+  }
 
   std::atomic<bool> start_flag{false};
   std::atomic<bool> service_done{false};
@@ -706,9 +715,9 @@ static Test_run_result test_throughput_actor_model_single_run(const Test_config&
     .m_service_pool = &service_setup.m_consumer_pool,
     .m_io_pool = &service_setup.m_io_pool,
     .m_service_process = service_process,
-    .m_sched = nullptr,  /* Will be set after processor is created */
-    .m_processor = nullptr,  /* Will be set after processor is created */
-    .m_num_producers = 0,  /* Will be set after processor is created */
+    .m_sched = nullptr,
+    .m_processor = nullptr,
+    .m_num_producers = 0,
     .m_enable_batch_dequeue = config.m_enable_batch_dequeue,
     .m_batch_size = config.m_batch_size
   };
