@@ -178,19 +178,32 @@ Task<void> consumer_actor(
     std::size_t num_notifications = 0;
     std::size_t notified_mailbox_idx = 0;
     
-    const std::size_t n_workers = sched->m_mailboxes->m_active_queues.size();
-    for (std::size_t q = 0; q < n_workers && num_notifications < bulk_read_size; ++q) {
-      const std::size_t qid = (next_active_queue + q) % n_workers;
-      while (num_notifications < bulk_read_size &&
-             sched->m_mailboxes->dequeue_active(qid, notified_mailbox_idx)) {
-        notification_buffer[num_notifications++] = notified_mailbox_idx;
+    constexpr std::size_t fast_scan_limit = 8;
+    const bool use_fast_scan = (sched->m_mailboxes->size() <= fast_scan_limit &&
+                                sched->m_mailboxes->m_active_count.load(std::memory_order_acquire) <= fast_scan_limit);
+
+    if (!use_fast_scan) {
+      const std::size_t n_workers = sched->m_mailboxes->m_active_queues.size();
+      for (std::size_t q = 0; q < n_workers && num_notifications < bulk_read_size; ++q) {
+        const std::size_t qid = (next_active_queue + q) % n_workers;
+        while (num_notifications < bulk_read_size &&
+               sched->m_mailboxes->dequeue_active(qid, notified_mailbox_idx)) {
+          notification_buffer[num_notifications++] = notified_mailbox_idx;
+        }
       }
-    }
-    if (n_workers > 0) {
-      next_active_queue = (next_active_queue + 1) % n_workers;
-    }
-    if (num_notifications > 1) {
-      std::sort(notification_buffer.begin(), notification_buffer.begin() + num_notifications);
+      if (n_workers > 0) {
+        next_active_queue = (next_active_queue + 1) % n_workers;
+      }
+      if (num_notifications > 1) {
+        std::sort(notification_buffer.begin(), notification_buffer.begin() + num_notifications);
+      }
+    } else {
+      for (std::size_t pid = 0; pid < sched->m_mailboxes->size() && num_notifications < bulk_read_size; ++pid) {
+        auto mbox = sched->m_mailboxes->get_for_process(pid);
+        if (mbox && mbox->m_has_messages.load(std::memory_order_acquire)) {
+          notification_buffer[num_notifications++] = pid;
+        }
+      }
     }
 
     for (std::size_t i = 0; i < num_notifications; ++i) {

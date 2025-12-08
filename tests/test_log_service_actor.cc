@@ -563,7 +563,11 @@ Task<void> log_service_actor(
     std::size_t n_notifications{0};
     std::size_t notified_mailbox_idx{0};
     
-    if (!ctx.m_sched->m_round_robin_drain) {
+    constexpr std::size_t fast_scan_limit = 8;
+    const bool use_fast_scan = (ctx.m_sched->m_mailboxes->size() <= fast_scan_limit &&
+                                ctx.m_sched->m_mailboxes->m_active_count.load(std::memory_order_acquire) <= fast_scan_limit);
+
+    if (!ctx.m_sched->m_round_robin_drain && !use_fast_scan) {
       const std::size_t n_workers = ctx.m_sched->m_mailboxes->m_active_queues.size();
       for (std::size_t q = 0; q < n_workers && n_notifications < bulk_read_size; ++q) {
         const std::size_t qid = (next_active_queue + q) % n_workers;
@@ -578,6 +582,14 @@ Task<void> log_service_actor(
       /* Process notifications in deterministic order to reduce jitter */
       if (n_notifications > 1) {
         std::sort(notification_buffer.begin(), notification_buffer.begin() + n_notifications);
+      }
+    } else if (use_fast_scan) {
+      /* Fast path: scan mailboxes directly */
+      for (std::size_t pid = 0; pid < ctx.m_sched->m_mailboxes->size() && n_notifications < bulk_read_size; ++pid) {
+        auto mbox = ctx.m_sched->m_mailboxes->get_for_process(pid);
+        if (mbox && mbox->m_has_messages.load(std::memory_order_acquire)) {
+          notification_buffer[n_notifications++] = pid;
+        }
       }
     }
 

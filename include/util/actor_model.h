@@ -143,6 +143,7 @@ struct Process_mailboxes {
     m_pending_flags_size = n_processes;
     m_active_queues.clear();
     m_worker_index.clear();
+    m_active_count.store(0, std::memory_order_relaxed);
 
     for (std::size_t i = 0; i < n_processes; ++i) {
       m_mailboxes.push_back(std::make_unique<Mailbox_type>(capacity));
@@ -202,6 +203,7 @@ struct Process_mailboxes {
     if (!m_pending_flags[process_id].compare_exchange_strong(expected_pending, true, std::memory_order_acq_rel)) {
       return false;  /* already pending */
     }
+    m_active_count.fetch_add(1, std::memory_order_acq_rel);
 
     mbox->m_has_messages.store(true, std::memory_order_release);
 
@@ -215,7 +217,10 @@ struct Process_mailboxes {
 
   void clear_pending_flag(std::size_t process_id) {
     if (process_id < m_pending_flags_size && m_pending_flags) {
-      m_pending_flags[process_id].store(false, std::memory_order_release);
+      bool was_pending = m_pending_flags[process_id].exchange(false, std::memory_order_release);
+      if (was_pending) {
+        m_active_count.fetch_sub(1, std::memory_order_acq_rel);
+      }
     }
   }
 
@@ -231,6 +236,7 @@ struct Process_mailboxes {
   std::unique_ptr<std::atomic<bool>[]> m_pending_flags;
   std::size_t m_pending_flags_size{0};
   std::vector<std::size_t> m_worker_index;
+  std::atomic<std::size_t> m_active_count{0};
 };
 
 /**
