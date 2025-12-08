@@ -195,19 +195,11 @@ struct Log_message_processor {
         m_log->m_pool->prepare_buffer_for_io(m_log->m_pool->m_active, *m_io_pool, m_log->m_write_callback);
       }
       
-      auto sync_callback = [this](std::span<struct iovec> span, wal::Log::Sync_type) -> wal::Result<std::size_t> {
-        return m_log->m_write_callback(span, wal::Log::Sync_type::Fdatasync);
-      };
-
-      [[maybe_unused]] auto result = m_log->write_to_store(sync_callback);
+      [[maybe_unused]] auto result = m_log->write_to_store(m_log->m_write_callback);
       WAL_ASSERT(result.has_value());
       
       if (m_log->m_pool && m_log->m_pool->m_active && !m_log->m_pool->m_active->m_buffer.is_empty() && m_log->m_pool->m_active->m_buffer.is_write_pending()) {
-        auto active_sync_callback = [this](std::span<struct iovec> span, wal::Log::Sync_type) -> wal::Result<std::size_t> {
-          return m_log->m_write_callback(span, wal::Log::Sync_type::Fdatasync);
-        };
-
-        [[maybe_unused]] auto active_result = m_log->m_pool->m_active->m_buffer.write_to_store(active_sync_callback, 0, wal::Log::Sync_type::Fdatasync);
+        [[maybe_unused]] auto active_result = m_log->m_pool->m_active->m_buffer.write_to_store(m_log->m_write_callback, 0);
         WAL_ASSERT(active_result.has_value());
       }
       
@@ -229,19 +221,11 @@ struct Log_message_processor {
         m_log->m_pool->prepare_buffer_for_io(m_log->m_pool->m_active, *m_io_pool, m_log->m_write_callback);
       }
       
-      auto sync_callback = [this](std::span<struct iovec> span, wal::Log::Sync_type) -> wal::Result<std::size_t> {
-        return m_log->m_write_callback(span, wal::Log::Sync_type::Fsync);
-      };
-
-      [[maybe_unused]] auto result = m_log->write_to_store(sync_callback);
+      [[maybe_unused]] auto result = m_log->write_to_store(m_log->m_write_callback);
       WAL_ASSERT(result.has_value());
       
       if (m_log->m_pool && m_log->m_pool->m_active && !m_log->m_pool->m_active->m_buffer.is_empty() && m_log->m_pool->m_active->m_buffer.is_write_pending()) {
-        auto active_sync_callback = [this](std::span<struct iovec> span, wal::Log::Sync_type) -> wal::Result<std::size_t> {
-          return m_log->m_write_callback(span, wal::Log::Sync_type::Fsync);
-        };
-
-        [[maybe_unused]] auto active_result = m_log->m_pool->m_active->m_buffer.write_to_store(active_sync_callback, 0, wal::Log::Sync_type::Fsync);
+        [[maybe_unused]] auto active_result = m_log->m_pool->m_active->m_buffer.write_to_store(m_log->m_write_callback, 0);
         WAL_ASSERT(active_result.has_value());
       }
       
@@ -411,11 +395,11 @@ Task<void> consumer_actor(
       break;
     }
  
-    util::Process<Payload_type>* proc = nullptr;
-    bool found_work = false;
+    bool found_work{false};
+    util::Process<Payload_type>* proc{nullptr};
  
-    std::size_t num_notifications = 0;
-    std::size_t notified_mailbox_idx = 0;
+    std::size_t num_notifications{0};
+    std::size_t notified_mailbox_idx{0};
     
     while (num_notifications < bulk_read_size && ctx.m_sched->m_mailboxes->m_notify_queue->dequeue(notified_mailbox_idx)) {
       notification_buffer[num_notifications++] = notified_mailbox_idx;
@@ -426,15 +410,15 @@ Task<void> consumer_actor(
  
       auto process_mbox = ctx.m_sched->m_mailboxes->get_for_process(mailbox_idx);
 
-      if (process_mbox == nullptr) {
+      if (process_mbox == nullptr) [[unlikely]] {
         continue;
       }
 
-      if (!process_mbox->m_has_messages.load(std::memory_order_acquire)) {
+      if (!process_mbox->m_has_messages.load(std::memory_order_acquire)) [[unlikely]] {
         continue;
       }
 
-      bool loop_exited_normally = true;
+      bool loop_exited_normally{true};
 
       while (process_mbox->m_queue.dequeue(proc)) {
         found_work = true;
@@ -443,8 +427,7 @@ Task<void> consumer_actor(
 
         proc->m_in_process_mailbox.store(false, std::memory_order_release);
 
-        if (ctx.m_enable_batch_dequeue) {
-          /* Batch dequeue mode - loop until mailbox is drained using lambda API */
+        if (ctx.m_enable_batch_dequeue) [[likely]] {
           while (proc->m_mailbox.dequeue_batch(ctx.m_batch_size, [&](auto& batch_msg) {
             return process_single_message(batch_msg, ctx, completed_producers, loop_exited_normally);
           }) > 0) {
@@ -490,7 +473,8 @@ Task<void> consumer_actor(
        */
       for (std::size_t pid = 0; pid < ctx.m_sched->m_processes.size() && completed_producers < ctx.m_num_producers; ++pid) {
         auto* p = ctx.m_sched->get_process(pid);
-        if (p == nullptr) {
+
+        if (p == nullptr) [[unlikely]] {
           continue;
         }
         
@@ -506,14 +490,12 @@ Task<void> consumer_actor(
               break;
             }
           } else {
-            /* Check for Fdatasync */
             if (std::holds_alternative<wal::Fdatasync>(msg.m_payload)) {
               if constexpr (requires { ctx.m_processor->write_and_fdatasync(); }) {
                 ctx.m_processor->write_and_fdatasync();
               }
               continue;
             }
-            /* Regular payload message */
             if (std::holds_alternative<Payload_type>(msg.m_payload)) {
               process_payload_message(*ctx.m_processor, std::get<Payload_type>(msg.m_payload), msg);
             }
@@ -580,8 +562,6 @@ static double test_throughput_actor_model_single_run(const Test_config& config) 
    * Use raw pointer since metrics lifetime is managed by this function scope */
   util::Metrics* metrics_ptr = (!config.m_disable_metrics) ? &metrics : nullptr;
 
-  /* Store log_file in a way that write_and_fdatasync/fsync can access it.
-   * We'll pass it through the Log_message_processor context */
   struct Log_file_wrapper {
     std::shared_ptr<wal::Log_file> m_log_file;
     util::Metrics* m_metrics_ptr;
@@ -595,60 +575,10 @@ static double test_throughput_actor_model_single_run(const Test_config& config) 
   });
 
   Log_writer log_writer = [log_file_wrapper]
-    (std::span<struct iovec> span, wal::Log::Sync_type sync_type) -> wal::Result<std::size_t> {
+    (std::span<struct iovec> span) -> wal::Result<std::size_t> {
     
     auto result = log_file_wrapper->m_log_file->write(span);
-    
-    if (result.has_value() && !log_file_wrapper->m_disable_writes) {
-      bool sync_succeeded = false;
-      
-      if (sync_type == wal::Log::Sync_type::Fdatasync) [[likely]] {
-        auto sync_start = Clock::now();
-        if (::fdatasync(log_file_wrapper->m_log_file->m_fd) == 0) {
-          sync_succeeded = true;
-        } else {
-          log_err("fdatasync failed: {}", std::strerror(errno));
-          return std::unexpected(wal::Status::IO_error);
-        }
-        auto sync_end = Clock::now();
-        auto sync_duration = std::chrono::duration_cast<std::chrono::nanoseconds>(sync_end - sync_start);
-        
-        if (log_file_wrapper->m_metrics_ptr != nullptr) {
-          log_file_wrapper->m_metrics_ptr->inc(util::MetricType::FdatasyncCount);
-          log_file_wrapper->m_metrics_ptr->add_timing(util::MetricType::FdatasyncTiming, sync_duration);
-        }
-      } else if (sync_type == wal::Log::Sync_type::Fsync) {
-        auto sync_start = Clock::now();
-        if (::fsync(log_file_wrapper->m_log_file->m_fd) == 0) {
-          sync_succeeded = true;
-        } else {
-          log_err("fsync failed: {}", std::strerror(errno));
-          return std::unexpected(wal::Status::IO_error);
-        }
-        auto sync_end = Clock::now();
-        auto sync_duration = std::chrono::duration_cast<std::chrono::nanoseconds>(sync_end - sync_start);
-        
-        if (log_file_wrapper->m_metrics_ptr != nullptr) {
-          log_file_wrapper->m_metrics_ptr->inc(util::MetricType::FsyncCount);
-          log_file_wrapper->m_metrics_ptr->add_timing(util::MetricType::FsyncTiming, sync_duration);
-        }
-      }
-      
-      if (sync_succeeded && !span.empty()) {
-        const auto n_blocks = span.size() / 3;
-        if (n_blocks > 0) {
-          const auto block_header = reinterpret_cast<const wal::Block_header*>(span[0].iov_base);
-          const auto block_no = block_header->get_block_no();
-          const off_t length = static_cast<off_t>(n_blocks * log_file_wrapper->m_log_file->m_block_size);
-          const off_t phy_off = static_cast<off_t>(block_no * log_file_wrapper->m_log_file->m_block_size % static_cast<std::size_t>(log_file_wrapper->m_log_file->m_max_file_size));
-          
-          if (::posix_fadvise(log_file_wrapper->m_log_file->m_fd, phy_off, length, POSIX_FADV_DONTNEED) != 0) {
-            log_warn("posix_fadvise(DONTNEED) failed: {}", std::strerror(errno));
-          }
-        }
-      }
-    }
-    
+    /* Note: Sync operations are now handled separately via request_sync() */
     return result;
   };
 
@@ -714,7 +644,6 @@ static double test_throughput_actor_model_single_run(const Test_config& config) 
   consumer_ctx.m_num_producers = producers;
 
   /* Use simple lambda when writes are disabled, matching test_actor_model exactly */
-  /* Pass processor by reference so timer can call write_and_fdatasync/fsync */
   detach(consumer_actor(consumer_ctx, std::ref(start_flag)));
 
   /* Launch producer actors (coroutines) */

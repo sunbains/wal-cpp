@@ -197,7 +197,7 @@ std::size_t prepare_batch(Buffer& buffer, block_no_t start, block_no_t end, std:
 
 } // anonymous namespace
 
-Result<lsn_t> Buffer::write_to_store(Write_callback callback, lsn_t max_write_lsn, Sync_type sync_type) noexcept {
+Result<lsn_t> Buffer::write_to_store(Write_callback callback, lsn_t max_write_lsn) noexcept {
   WAL_ASSERT(!is_empty());
   WAL_ASSERT(is_write_pending());
 
@@ -264,10 +264,7 @@ Result<lsn_t> Buffer::write_to_store(Write_callback callback, lsn_t max_write_ls
       io_start = Clock::now();
     }
 
-    /* Use sync_type for the last batch only (when n_blocks_to_flush will be 0 after this batch) */
-    Sync_type batch_sync_type = (n_blocks_to_flush - flush_batch_size == 0) ? sync_type : Sync_type::None;
-    
-    auto io_result = callback(std::span<struct iovec>(m_iovecs.data(), n_slots), batch_sync_type);
+    auto io_result = callback(std::span<struct iovec>(m_iovecs.data(), n_slots));
 
     if (m_metrics != nullptr) [[likely]] {
       const auto io_end = Clock::now();
@@ -415,20 +412,12 @@ void Log::start_io(Write_callback callback, util::Thread_pool* thread_pool) noex
   /* Store sync callback for inline I/O when buffers exhausted */
   m_pool->m_sync_write_callback = callback;
 
-  /* Create an adapter that converts Write_callback (takes span<iovec> and sync_type)
-   * to a function that takes Buffer& and returns Task<Result<lsn_t>>.
-   * Tasks are posted directly by consumer, no background coroutine needed.
-   * The adapter checks for pending sync requests and passes them to the callback */
+  /* Create an adapter that converts Write_callback to a function that takes Buffer& and returns Result<lsn_t>.
+   * Tasks are posted directly by consumer, no background coroutine needed. */
   auto adapter = [this](Buffer& buffer) -> Result<lsn_t> {
-
-    /* Create a wrapper callback that passes the sync type */
-    auto wrapped_callback = [this](std::span<struct iovec> span, Sync_type) -> Result<lsn_t> {
-      return m_write_callback(span, Sync_type::None);
-    };
-    
     /* Write the full buffer - sync_target_lsn is just a marker for when to sync, not a write limit.
      * We always write the full buffer to maintain buffer state consistency */
-    return buffer.write_to_store(wrapped_callback);
+    return buffer.write_to_store(m_write_callback);
   };
 
   /* Store the callback in Log - Log is the coordinator and controls orchestration */
@@ -437,20 +426,9 @@ void Log::start_io(Write_callback callback, util::Thread_pool* thread_pool) noex
 }
 
 Result<bool> Log::write_to_store(Write_callback callback) noexcept {
-  
-  /* Create an adapter that converts Write_callback (takes span<iovec> and sync_type)
-   * to a function that takes Buffer& and Thread_pool* and returns Task<Result<bool>> */
+  /* Create an adapter that converts Write_callback to a function that takes Buffer& and returns Result<bool> */
   auto adapter = [callback](Buffer& buffer) -> Result<bool> {
-    /* Create a wrapper that captures the sync_type from the callback's parameter */
-    /* We need to extract sync_type from the callback somehow, but the callback signature doesn't allow that */
-    /* Instead, we'll use a different approach: the callback itself will determine sync_type */
-    auto wrapped_callback = [callback](std::span<struct iovec> span, Sync_type sync_type) -> Result<lsn_t> {
-      /* Pass through the sync_type - it will be None for all batches except the last */
-      return callback(span, sync_type);
-    };
-    /* For now, we can't pass sync_type to write_to_store from here */
-    /* The sync_type needs to come from the Entry or be passed explicitly */
-    return buffer.write_to_store(wrapped_callback, 0, Sync_type::None);
+    return buffer.write_to_store(callback, 0);
   };
 
   return m_pool->write_to_store(adapter);

@@ -99,24 +99,9 @@ static void test_log_io_simple(const Test_config& config) {
   auto wal_config = wal::Config(config.m_log_buffer_size_blocks, config.m_log_block_size, util::ChecksumAlgorithm::CRC32C);
   auto log = std::make_shared<wal::Log>(0, buffer_pool_size, wal_config);
 
-  Log_writer log_writer = [&](std::span<struct iovec> span, wal::Log::Sync_type sync_type) -> wal::Result<std::size_t> {
+  Log_writer log_writer = [&](std::span<struct iovec> span) -> wal::Result<std::size_t> {
     auto result = log_file->write(span);
-    
-    /* Perform sync if requested and write succeeded */
-    if (result.has_value() && !config.m_disable_writes) {
-      if (sync_type == wal::Log::Sync_type::Fdatasync) {
-        if (::fdatasync(log_file->m_fd) != 0) {
-          log_fatal("fdatasync failed: {}", std::strerror(errno));
-          return std::unexpected(wal::Status::IO_error);
-        }
-      } else if (sync_type == wal::Log::Sync_type::Fsync) {
-        if (::fsync(log_file->m_fd) != 0) {
-          log_fatal("fsync failed: {}", std::strerror(errno));
-          return std::unexpected(wal::Status::IO_error);
-        }
-      }
-    }
-    
+    /* Note: Sync operations are now handled separately via request_sync() */
     return result;
   };
 

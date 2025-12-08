@@ -44,7 +44,7 @@ util::Logger<util::MT_logger_writer> g_logger(util::MT_logger_writer{std::cerr},
 /* Physical write function that simulates writing to storage without actually doing I/O.
  * This is called by Buffer::write_to_store as the Write_callback.
  * Returns the number of bytes that would have been written. */
-static wal::Result<std::size_t> null_writer(std::span<struct iovec> span, wal::Log::Sync_type) {
+static wal::Result<std::size_t> null_writer(std::span<struct iovec> span) {
   WAL_ASSERT(span.size() > 0);
   WAL_ASSERT(span.size() % 3 == 0);
 
@@ -54,8 +54,8 @@ static wal::Result<std::size_t> null_writer(std::span<struct iovec> span, wal::L
 /* Helper to call write_to_store synchronously in tests */
 /* Pass nullptr to pool to execute I/O synchronously on the same thread */
 static wal::Result<wal::lsn_t> write_to_store(Buffer& buffer, lsn_t max_write_lsn = 0) {
-  return buffer.write_to_store([](std::span<struct iovec> span, wal::Log::Sync_type) -> wal::Result<wal::lsn_t> {
-    return null_writer(span, wal::Log::Sync_type::None);
+  return buffer.write_to_store([](std::span<struct iovec> span) -> wal::Result<wal::lsn_t> {
+    return null_writer(span);
   }, max_write_lsn);
 }
 
@@ -313,7 +313,7 @@ static void test_log_write() {
 
   /* Write data */
   Record data(100, std::byte{'A'});
-  auto null_writer = [](std::span<struct iovec>, wal::Log::Sync_type) -> wal::Result<size_t> {
+  auto null_writer = [](std::span<struct iovec>) -> wal::Result<size_t> {
     return wal::Result<size_t>(0);
   };
   auto write_result = log.append(std::as_bytes(std::span{data}));
@@ -341,7 +341,7 @@ static void test_log_multiple_writes() {
   
   log.start_io(null_writer, nullptr);
 
-  auto null_writer = [](std::span<struct iovec>, wal::Log::Sync_type) -> wal::Result<size_t> {
+  auto null_writer = [](std::span<struct iovec>) -> wal::Result<size_t> {
     return wal::Result<size_t>(0);
   };
   

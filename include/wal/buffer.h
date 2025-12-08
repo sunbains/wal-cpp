@@ -74,10 +74,9 @@ struct [[nodiscard]] Buffer {
    * Callback function to flush the buffer to disk.
    * 
    * @param iovecs The IO vectors to flush (span of iovec elements).
-   * @param sync_type Whether to sync after write (None, Fdatasync, or Fsync).
    * @return The new LWM LSN.
    */
-  using Write_callback = std::function<Result<lsn_t>(std::span<struct iovec> span, Sync_type sync_type)>;
+  using Write_callback = std::function<Result<lsn_t>(std::span<struct iovec> span)>;
 
   struct [[nodiscard]] Slot {
     /** Start LSN of this slot. */
@@ -270,7 +269,7 @@ struct [[nodiscard]] Buffer {
    * @param[in] sync_type Sync type to use for the last batch (None = no sync, Fdatasync, Fsync).
    * @return Result with new LWM LSN on success.
    */
-  [[nodiscard]] Result<lsn_t> write_to_store(Write_callback callback, lsn_t max_write_lsn = 0, Sync_type sync_type = Sync_type::None) noexcept;
+  [[nodiscard]] Result<lsn_t> write_to_store(Write_callback callback, lsn_t max_write_lsn = 0) noexcept;
 
   /**
    * Clear the headers for the given range of LSNs.

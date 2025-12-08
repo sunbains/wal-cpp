@@ -235,12 +235,8 @@ struct Pool {
 
       WAL_ASSERT(write_callback && "I/O callback must be set via start_io");
 
-      /* For synchronous writes, use write-only callback */
-      auto write_only_callback = [&write_callback](std::span<struct iovec> span, Sync_type) -> Result<lsn_t> {
-        return write_callback(span, Sync_type::None);
-      };
-      
-      auto result = entry_ptr->m_buffer.write_to_store(write_only_callback);
+      /* For synchronous writes, use write callback directly */
+      auto result = entry_ptr->m_buffer.write_to_store(write_callback);
 
       if (!result.has_value()) {
         log_fatal("IO task failed");
@@ -299,12 +295,7 @@ struct Pool {
         
         WAL_ASSERT(write_callback && "I/O callback must be set via start_io");
         
-        /* Use write-only callback (no syncs in write path) */
-        auto write_only_callback = [write_callback](std::span<struct iovec> span, Sync_type) -> Result<lsn_t> {
-          return (*write_callback)(span, Sync_type::None);
-        };
-        
-        auto result = entry_ptr->m_buffer.write_to_store(write_only_callback);
+        auto result = entry_ptr->m_buffer.write_to_store(*write_callback);
 
         ++pool->m_write_count;
         
@@ -440,7 +431,7 @@ struct Pool {
   alignas(kCLS) std::atomic<bool> m_io_thread_running{false};
 
   /* Synchronous write callback for inline I/O when buffers exhausted */
-  std::function<Result<std::size_t>(std::span<struct iovec>, wal::Sync_type)> m_sync_write_callback;
+  Buffer::Write_callback m_sync_write_callback;
 
   /* Unified queue for all IO operations (writes, syncs, reads) - serialized execution */
   util::Bounded_queue<Io_operation> m_io_operations;
