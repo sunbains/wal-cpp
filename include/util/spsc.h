@@ -65,11 +65,14 @@ struct Spsc_bounded_queue {
       }
     }
     
+    // Prefetch the next slot to reduce store latency
+    PREFETCH_FOR_WRITE(&m_storage[next]);
+
     // Write data
     if constexpr (std::is_trivially_copyable_v<T>) {
       std::memcpy(&m_storage[head], &value, sizeof(T));
     } else {
-    m_storage[head] = value;
+      m_storage[head] = value;
     }
     
     // Publish: release ensures consumer sees the data
@@ -91,6 +94,8 @@ struct Spsc_bounded_queue {
       }
     }
     
+    PREFETCH_FOR_WRITE(&m_storage[next]);
+
     // Move data
     m_storage[head] = std::move(value);
     
@@ -115,7 +120,8 @@ struct Spsc_bounded_queue {
     if constexpr (std::is_trivially_copyable_v<T>) {
       std::memcpy(&value, &m_storage[tail], sizeof(T));
     } else {
-    value = m_storage[tail];
+      // Move out to avoid an extra copy for non-trivial types
+      value = std::move(m_storage[tail]);
     }
 
     // Advance tail: release ensures producer sees we've consumed

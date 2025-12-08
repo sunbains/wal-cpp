@@ -130,8 +130,8 @@ struct Test_config {
   /** Fine-grained control over which metrics to collect */
   Metrics_config m_metrics_config{};
 
-  /** Enable batch dequeue (default: false - single dequeue) */
-  bool m_enable_batch_dequeue{false};
+  /** Enable batch dequeue (default: true - single dequeue is slower) */
+  bool m_enable_batch_dequeue{true};
 
   /** Batch size for batch dequeue (default: 32) */
   std::size_t m_batch_size{32};
@@ -187,7 +187,7 @@ struct Log_service_context {
   /** Pass by pointer so we can call write_and_fdatasync/fsync */
   Log_message_processor* m_processor;
   std::size_t m_num_producers;
-  bool m_enable_batch_dequeue{false};
+  bool m_enable_batch_dequeue{true};
   /** Batch size for batch dequeue, only used if m_enable_batch_dequeue is true */
   std::size_t m_batch_size{32};
 };
@@ -1002,7 +1002,8 @@ static void print_usage(const char* program_name) noexcept {
                "      --timeout-ms NUM     Timeout in milliseconds (0 disables, default: 3000)\n"
                "  -f, --fdatasync-interval NUM Send sync messages with probability NUM (0.0-1.0, e.g., 0.3 = 30%%, default: 0)\n"
                "      --use-fsync          Use fsync messages instead of fdatasync (default: fdatasync)\n"
-               "  -b, --batch-dequeue      Enable batch dequeue mode (default: off)\n"
+               "  -b, --batch-dequeue      Enable batch dequeue mode (default: on)\n"
+               "      --no-batch-dequeue   Disable batch dequeue mode\n"
                "  -B, --batch-size NUM     Batch size for batch dequeue (default: 32)\n"
                "  -v, --verbose            Increase verbosity (metrics): repeat for more detail (e.g., -vv)\n"
                "  -h, --help                Show this help message\n",
@@ -1029,6 +1030,7 @@ int main(int argc, char** argv) {
     {"fdatasync-interval", required_argument, nullptr, 'f'},
     {"use-fsync", no_argument, nullptr, 1005},
     {"batch-dequeue", no_argument, nullptr, 'b'},
+    {"no-batch-dequeue", no_argument, nullptr, 1009},
     {"batch-size", required_argument, nullptr, 'B'},
     {"help", no_argument, nullptr, 'h'},
     {nullptr, 0, nullptr, 0}
@@ -1102,6 +1104,9 @@ int main(int argc, char** argv) {
         break;
       case 'b':
         config.m_enable_batch_dequeue = true;
+        break;
+      case 1009:
+        config.m_enable_batch_dequeue = false;
         break;
       case 'B':
         config.m_batch_size = std::stoull(optarg);

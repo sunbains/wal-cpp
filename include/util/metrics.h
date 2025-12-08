@@ -67,6 +67,19 @@ struct Metrics {
   using Timer = std::chrono::nanoseconds;
   static constexpr std::size_t kMetricCount = static_cast<std::size_t>(MetricType::Count);
 
+  struct Spin_guard {
+    explicit Spin_guard(std::atomic_flag& flag) noexcept : m_flag(flag) {
+      while (m_flag.test_and_set(std::memory_order_acquire)) {
+        // busy-wait
+      }
+    }
+    ~Spin_guard() noexcept { m_flag.clear(std::memory_order_release); }
+    Spin_guard(const Spin_guard&) = delete;
+    Spin_guard& operator=(const Spin_guard&) = delete;
+  private:
+    std::atomic_flag& m_flag;
+  };
+
   Metrics() = default;
   Metrics(Metrics&&) = delete;
   Metrics(const Metrics&) = delete;
@@ -107,6 +120,7 @@ struct Metrics {
   void add_timing(MetricType type, Timer duration) noexcept {
     const auto idx = static_cast<std::size_t>(type);
     if (idx < kMetricCount) {
+      Spin_guard guard(m_timing_locks[idx]);
       m_timings[idx].push_back(duration);
     }
   }
@@ -116,6 +130,7 @@ struct Metrics {
    * @param size_bytes Size of the IO request in bytes
    */
   void add_io_size(std::size_t size_bytes) noexcept {
+    Spin_guard guard(m_io_lock);
     m_io_sizes.push_back(size_bytes);
   }
 
@@ -143,6 +158,7 @@ struct Metrics {
     const auto idx = static_cast<std::size_t>(type);
     if (idx < kMetricCount && !timings.empty()) {
       auto& target = m_timings[idx];
+      Spin_guard guard(m_timing_locks[idx]);
       /* Reserve space if needed to avoid multiple reallocations */
       const auto current_size = target.size();
       const auto new_size = current_size + timings.size();
@@ -164,6 +180,7 @@ struct Metrics {
     const auto idx = static_cast<std::size_t>(type);
     if (idx < kMetricCount && !timings.empty()) {
       auto& target = m_timings[idx];
+      Spin_guard guard(m_timing_locks[idx]);
       const auto current_size = target.size();
       const auto new_size = current_size + timings.size();
       if (new_size > target.capacity()) {
@@ -339,12 +356,21 @@ public:
   [[nodiscard]] TimingStats get_timing_stats(MetricType type) const noexcept {
     const auto idx = static_cast<std::size_t>(type);
     TimingStats stats{};
-    
-    if (idx >= kMetricCount || m_timings[idx].empty()) {
+
+    if (idx >= kMetricCount) {
       return stats;
     }
 
-    const auto& timings = m_timings[idx];
+    std::vector<Timer> timings;
+    {
+      Spin_guard guard(m_timing_locks[idx]);
+      timings = m_timings[idx];
+    }
+
+    if (timings.empty()) {
+      return stats;
+    }
+
     stats.m_count = timings.size();
     
     if (stats.m_count == 0) {
@@ -382,11 +408,17 @@ public:
 
     // Merge timings
     for (std::size_t i = 0; i < kMetricCount; ++i) {
-      m_timings[i].insert(m_timings[i].end(), other.m_timings[i].begin(), other.m_timings[i].end());
+      if (!other.m_timings[i].empty()) {
+        Spin_guard guard(m_timing_locks[i]);
+        m_timings[i].insert(m_timings[i].end(), other.m_timings[i].begin(), other.m_timings[i].end());
+      }
     }
 
     // Merge IO sizes
-    m_io_sizes.insert(m_io_sizes.end(), other.m_io_sizes.begin(), other.m_io_sizes.end());
+    if (!other.m_io_sizes.empty()) {
+      Spin_guard guard(m_io_lock);
+      m_io_sizes.insert(m_io_sizes.end(), other.m_io_sizes.begin(), other.m_io_sizes.end());
+    }
   }
 
   /**
@@ -396,9 +428,15 @@ public:
   void reset() noexcept {
     for (std::size_t i = 0; i < kMetricCount; ++i) {
       m_counters[i].store(0, std::memory_order_relaxed);
-      m_timings[i].clear();
+      {
+        Spin_guard guard(m_timing_locks[i]);
+        m_timings[i].clear();
+      }
     }
-    m_io_sizes.clear();
+    {
+      Spin_guard guard(m_io_lock);
+      m_io_sizes.clear();
+    }
   }
 
   /**
@@ -505,6 +543,8 @@ public:
   /* Preallocated member arrays indexed by MetricType enum (not static storage) */
   std::array<Counter, kMetricCount> m_counters{};
   std::array<std::vector<Timer>, kMetricCount> m_timings{};
+  mutable std::array<std::atomic_flag, kMetricCount> m_timing_locks{};
+  mutable std::atomic_flag m_io_lock{};
   std::vector<std::size_t> m_io_sizes{};  /* IO request sizes in bytes */
 };
 
