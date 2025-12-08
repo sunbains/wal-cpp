@@ -9,7 +9,6 @@ set(TEST_TARGETS
   wal_tests_actor_model
   wal_tests_log_service_actor
   wal_tests_log_io_simple
-  wal_tests_io_uring_writer
   wal_tests_batch_dequeue
 )
 
@@ -35,6 +34,7 @@ if(MSVC)
     /W4 /WX /Zi
     $<$<CONFIG:Debug>:/Od>
     $<$<NOT:$<CONFIG:Debug>>:/O2>
+    ${SANITIZER_COMPILE_FLAGS}
   )
 else()
   set(TEST_COMPILE_OPTIONS
@@ -45,8 +45,9 @@ else()
     -fno-omit-frame-pointer
     $<$<CONFIG:Debug>:-O0>
     $<$<NOT:$<CONFIG:Debug>>:-O3>
+    ${SANITIZER_COMPILE_FLAGS}
   )
-  
+
   # Performance test with LTO for non-Debug builds
   set(TEST_PERF_COMPILE_OPTIONS
     ${TEST_COMPILE_OPTIONS}
@@ -80,7 +81,6 @@ set(TESTS_WITH_WAL
   wal_tests
   wal_tests_log_service_actor
   wal_tests_log_io_simple
-  wal_tests_io_uring_writer
 )
 
 foreach(TARGET ${TEST_TARGETS})
@@ -90,9 +90,6 @@ foreach(TARGET ${TEST_TARGETS})
     target_link_libraries(${TARGET} PRIVATE wal::wal)
   endif()
 endforeach()
-
-# Special case: io_uring_writer needs uring library
-target_link_libraries(wal_tests_io_uring_writer PRIVATE uring)
 
 # Pass __atomic builtin availability to tests
 if(WAL_USE_ATOMIC_BUILTINS)
@@ -114,19 +111,19 @@ endif()
 
 # Linker options (non-MSVC): build-id and mold if present
 if(NOT MSVC)
-  set(TEST_LINK_OPTIONS -Wl,--build-id)
-  
+  set(TEST_LINK_OPTIONS -Wl,--build-id ${SANITIZER_LINK_FLAGS})
+
   # Performance test gets LTO for non-Debug builds
   set(TEST_PERF_LINK_OPTIONS
     ${TEST_LINK_OPTIONS}
     $<$<NOT:$<CONFIG:Debug>>:-flto>
   )
-  
+
   if(MOLD_LD)
     list(APPEND TEST_LINK_OPTIONS -fuse-ld=mold)
     list(APPEND TEST_PERF_LINK_OPTIONS -fuse-ld=mold)
   endif()
-  
+
   foreach(TARGET ${TEST_TARGETS})
     if("${TARGET}" STREQUAL "wal_tests_bounded_queue_perf")
       target_link_options(${TARGET} PRIVATE ${TEST_PERF_LINK_OPTIONS})

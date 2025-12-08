@@ -22,6 +22,39 @@ endif()
 
 message("Build type: " ${CMAKE_BUILD_TYPE})
 
+# Sanitizer options - ASAN defaults to ON for Debug builds
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+  option(WAL_ENABLE_ASAN "Enable AddressSanitizer" ON)
+else()
+  option(WAL_ENABLE_ASAN "Enable AddressSanitizer" OFF)
+endif()
+option(WAL_ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer" OFF)
+
+# ----------------------------- Sanitizer setup -------------------------------
+set(SANITIZER_COMPILE_FLAGS "")
+set(SANITIZER_LINK_FLAGS "")
+
+if(WAL_ENABLE_ASAN)
+  if(MSVC)
+    list(APPEND SANITIZER_COMPILE_FLAGS /fsanitize=address)
+    message(STATUS "AddressSanitizer enabled (MSVC)")
+  else()
+    list(APPEND SANITIZER_COMPILE_FLAGS -fsanitize=address -fno-omit-frame-pointer)
+    list(APPEND SANITIZER_LINK_FLAGS -fsanitize=address)
+    message(STATUS "AddressSanitizer enabled")
+  endif()
+endif()
+
+if(WAL_ENABLE_UBSAN)
+  if(MSVC)
+    message(WARNING "UndefinedBehaviorSanitizer is not supported on MSVC")
+  else()
+    list(APPEND SANITIZER_COMPILE_FLAGS -fsanitize=undefined -fno-omit-frame-pointer)
+    list(APPEND SANITIZER_LINK_FLAGS -fsanitize=undefined)
+    message(STATUS "UndefinedBehaviorSanitizer enabled")
+  endif()
+endif()
+
 # ---------------------------- C++ standard -----------------------------------
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -114,6 +147,7 @@ if(WAL_BUILD_LIB OR WAL_BUILD_TESTS)
       $<$<CONFIG:Debug>:/Zi /Od>
       $<$<CONFIG:Release>:/O2 /Ob2 /Oi /Ot /GL>
       $<$<CONFIG:RelWithDebInfo>:/O2 /Ob1 /Oi /Ot>
+      ${SANITIZER_COMPILE_FLAGS}
     )
   else()
     target_compile_options(wal PRIVATE
@@ -123,6 +157,7 @@ if(WAL_BUILD_LIB OR WAL_BUILD_TESTS)
       $<$<CONFIG:Debug>:-g3 -O0 -ggdb3>
       $<$<CONFIG:Release>:-g -O3 -flto -march=native -mtune=native -fno-omit-frame-pointer>
       $<$<CONFIG:RelWithDebInfo>:-g -O3 -flto -fno-omit-frame-pointer>
+      ${SANITIZER_COMPILE_FLAGS}
     )
   endif()
 
@@ -136,6 +171,7 @@ if(WAL_BUILD_LIB OR WAL_BUILD_TESTS)
       # Enable LTO in linker for Release builds
       $<$<CONFIG:Release>:-flto>
       $<$<CONFIG:RelWithDebInfo>:-flto>
+      ${SANITIZER_LINK_FLAGS}
     )
   endif()
 
