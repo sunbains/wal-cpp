@@ -65,6 +65,9 @@ build/tests/wal_tests_log_service_actor --log-buffer-blocks 64
 
 # Larger buffers (2048 blocks) and bigger block size (8192 bytes)
 build/tests/wal_tests_log_service_actor --log-buffer-blocks 2048 --log-block-size 8192
+
+# Two I/O threads for background flush/sync
+build/tests/wal_tests_log_service_actor --io-threads 2
 ```
 
 Common flags:
@@ -76,6 +79,8 @@ Common flags:
 - `-b/--batch-dequeue`         batch dequeue mode
 - `-B/--batch-size NUM`        batch size when batch dequeue is enabled
 - `-v/--verbose`               increase metrics verbosity (repeatable)
+- `--producer-latency`         enable per-message latency metrics (disabled by default for speed)
+- `--io-threads NUM`           number of I/O threads for background flush/sync (default: 1)
 
 For full usage, run:
 ```bash

@@ -92,7 +92,7 @@ using Log_writer = wal::Log_writer;
 using Clock = std::chrono::steady_clock;
 
 struct Metrics_config {
-  bool m_enable_producer_latency{true};  /* Most expensive - track per-message latency */
+  bool m_enable_producer_latency{false};  /* Opt-in: per-message latency tracking is expensive */
   
   /* Returns true if any metrics are enabled */
   [[nodiscard]] bool any_enabled() const noexcept {
@@ -109,6 +109,8 @@ struct Test_config {
   std::size_t m_num_messages{10000000};
   /** Number of runs to average for stability */
   std::size_t m_num_iterations{1};
+  /** Number of I/O threads for background flush/sync */
+  std::size_t m_io_threads{1};
   bool m_disable_writes{false};
   bool m_disable_log_writes{false};
   bool m_skip_memcpy{false};
@@ -691,7 +693,7 @@ static Test_run_result test_throughput_actor_model_single_run(const Test_config&
     return result;
   };
 
-  wal::Log_service_setup<Payload_type, Scheduler_type> service_setup(producers);
+  wal::Log_service_setup<Payload_type, Scheduler_type> service_setup(producers, config.m_io_threads);
 
   std::vector<util::Pid> producer_pids;
   for (std::size_t i = 0; i < producers; ++i) {
@@ -994,11 +996,12 @@ static void print_usage(const char* program_name) noexcept {
                "  -w, --disable-log-writes Disable log->append() calls entirely (default: off)\n"
                "  -S, --skip-memcpy        Skip memcpy in write operation (default: off)\n"
                "  -X, --disable-metrics    Disable metrics collection entirely (default: off)\n"
-               "      --no-producer-latency Disable producer latency tracking (most expensive metric)\n"
+               "      --producer-latency    Enable per-message producer latency tracking (opt-in, expensive)\n"
                "      --log-block-size NUM Size of each log block in bytes (default: 4096)\n"
                "      --log-buffer-blocks NUM Number of blocks in log buffer (default: 16384)\n"
                "      --pool-size NUM        Number of buffers in pool (default: 32, must be power of 2)\n"
                "      --io-queue-size NUM     Size of IO operations queue (default: pool_size * 2, must be power of 2)\n"
+               "      --io-threads NUM        Number of I/O threads for background writes/syncs (default: 1)\n"
                "      --timeout-ms NUM     Timeout in milliseconds (0 disables, default: 3000)\n"
                "  -f, --fdatasync-interval NUM Send sync messages with probability NUM (0.0-1.0, e.g., 0.3 = 30%%, default: 0)\n"
                "      --use-fsync          Use fsync messages instead of fdatasync (default: fdatasync)\n"
@@ -1023,9 +1026,10 @@ int main(int argc, char** argv) {
     {"disable-log-writes", no_argument, nullptr, 'w'},
     {"skip-memcpy", no_argument, nullptr, 'S'},
     {"disable-metrics", no_argument, nullptr, 'X'},
-    {"no-producer-latency", no_argument, nullptr, 1000},
+    {"producer-latency", no_argument, nullptr, 1000},
     {"log-block-size", required_argument, nullptr, 'L'},
     {"log-buffer-blocks", required_argument, nullptr, 'R'},
+    {"io-threads", required_argument, nullptr, 1009},
     {"timeout-ms", required_argument, nullptr, 'T'},
     {"fdatasync-interval", required_argument, nullptr, 'f'},
     {"use-fsync", no_argument, nullptr, 1005},
@@ -1065,7 +1069,7 @@ int main(int argc, char** argv) {
         config.m_disable_metrics = true;
         break;
       case 1000:
-        config.m_metrics_config.m_enable_producer_latency = false;
+        config.m_metrics_config.m_enable_producer_latency = true;
         break;
       case 'L':
         config.m_log_block_size = std::stoull(optarg);
@@ -1078,6 +1082,12 @@ int main(int argc, char** argv) {
         break;
       case 1008:
         config.m_io_queue_size = std::stoull(optarg);
+        break;
+      case 1009:
+        config.m_io_threads = std::stoull(optarg);
+        if (config.m_io_threads == 0) {
+          config.m_io_threads = 1;
+        }
         break;
       case 'T':
         config.m_timeout_ms = std::stoull(optarg);
