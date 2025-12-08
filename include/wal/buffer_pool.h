@@ -280,6 +280,9 @@ struct Pool {
       if (!result.has_value()) {
         log_fatal("IO task failed");
       }
+      
+      /* Reset last operation type since we did a synchronous write */
+      m_last_io_op_type.store(Last_io_op_type::None, std::memory_order_release);
     }
 
     m_active->m_state = Entry::State::In_use;
@@ -309,6 +312,11 @@ struct Pool {
   template<typename CallableType>
   void enqueue_sync_operation(Sync_type sync_type, CallableType* sync_callable, util::Thread_pool& thread_pool) noexcept {
     if (sync_type == Sync_type::None) {
+      return;
+    }
+    
+    /* Don't enqueue multiple syncs if the last operation was already a sync */
+    if (m_last_io_op_type.load(std::memory_order_acquire) == Last_io_op_type::Sync) {
       return;
     }
     
@@ -345,6 +353,7 @@ struct Pool {
       if (std::holds_alternative<Io_operation::Write_op>(io_op.m_op)) {
         /* Handle write operation */
         auto& write_op = std::get<Io_operation::Write_op>(io_op.m_op);
+        
         auto entry_ptr = write_op.m_entry_ptr;
         auto write_callback = write_op.m_write_callback;
         
@@ -372,6 +381,9 @@ struct Pool {
             log_fatal("Sync operation failed");
           }
         }
+        
+        /* Reset last operation type when a sync completes */
+        pool->m_last_io_op_type.store(Last_io_op_type::None, std::memory_order_release);
         
       } else if (std::holds_alternative<Io_operation::Read_op>(io_op.m_op)) {
         /* Handle read operation - placeholder for future use */
