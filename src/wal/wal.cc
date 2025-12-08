@@ -327,6 +327,7 @@ Result<lsn_t> Buffer::write_to_store(Write_callback callback, lsn_t max_write_ls
   }
 
   m_lwm = start_lwm;
+  m_append_ptr = m_data_array;
 
   /* Record overall timing and counters */
   if (m_metrics != nullptr) [[likely]] {
