@@ -72,6 +72,9 @@ static void test_all_levels() {
   auto g_logger = util::make_logger(std::ref(writer), Log_level::Trace);
   log_info("[test_all_levels] start");
 
+  /* Clear messages from setup logging */
+  writer.clear();
+
   log_trace("trace message {}", 1);
   log_debug("debug message {}", 2);
   log_info("info message {}", 3);
@@ -140,6 +143,9 @@ static void test_message_format() {
   auto g_logger = util::make_logger(std::ref(writer), Log_level::Info);
   log_info("[test_message_format] start");
 
+  /* Clear messages from setup logging */
+  writer.clear();
+
   log_info("test message {}", 42);
 
   const auto messages = writer.get_messages();
@@ -162,6 +168,9 @@ static void test_multi_threaded_writes() {
   Capturing_writer writer;
   auto g_logger = util::make_logger(std::ref(writer), Log_level::Debug);
   log_info("[test_multi_threaded_writes] start");
+
+  /* Clear messages from setup logging */
+  writer.clear();
 
   constexpr int num_threads = 8;
   constexpr int messages_per_thread = 100;
@@ -223,6 +232,9 @@ static void test_concurrent_level_changes() {
   Capturing_writer writer;
   auto g_logger = util::make_logger(std::ref(writer), Log_level::Info);
   log_info("[test_concurrent_level_changes] start");
+
+  /* Clear messages from setup logging */
+  writer.clear();
 
   constexpr int num_threads = 4;
   std::atomic<bool> done{false};
