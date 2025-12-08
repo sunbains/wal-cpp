@@ -22,10 +22,12 @@
 #include <vector>
 #include <thread>
 #include <atomic>
+#include <cstdint>
 #include <chrono>
 #include <getopt.h>
 #include <unistd.h>
 #include <sys/uio.h>
+#include <fcntl.h>
 #include <span>
 #include <print>
 #include <memory>
@@ -122,6 +124,9 @@ struct Test_config {
 
   /** Batch size for batch dequeue (default: 32) */
   std::size_t m_batch_size{32};
+
+  /** Verbosity level for metrics output (0=concise, 1=summary, 2=full histograms) */
+  int m_verbosity{0};
 };
 
 /**
@@ -158,15 +163,15 @@ struct Producer_context : public wal::Producer_context_base<Payload_type, Schedu
 /* Forward declaration */
 struct Log_message_processor;
 
-struct Consumer_context {
+struct Log_service_context {
   std::shared_ptr<wal::Log> m_log;
   Log_writer m_log_writer;
-  std::atomic<bool>* m_consumer_done;
+  std::atomic<bool>* m_service_done;
   bool m_disable_log_writes;
-  util::Thread_pool* m_consumer_pool;
+  util::Thread_pool* m_service_pool;
   util::Thread_pool* m_io_pool;
-  /** Consumer's process for poison pills */
-  Process_type* m_consumer_process;
+  /** Service process for poison pills */
+  Process_type* m_service_process;
   Scheduler_type* m_sched;
   /** Pass by pointer so we can call write_and_fdatasync/fsync */
   Log_message_processor* m_processor;
@@ -180,11 +185,13 @@ struct Consumer_context {
 struct Log_message_processor;
 
 /* Callable for sync operations (fdatasync/fsync) - defined before Log_message_processor
- * but operator() implementation accesses Log_message_processor members */
+ * Carries fd, offset, and metrics */
 struct Sync_callable {
   [[nodiscard]] wal::Result<bool> operator()() const noexcept;
-  Log_message_processor* m_processor;
+  int m_fd{-1};
   wal::Sync_type m_sync_type;
+  wal::lsn_t m_sync_offset{0};
+  util::Metrics* m_metrics{nullptr};
 };
 
 /* Function object wrapper that stores values as members and calls static function */
@@ -204,8 +211,8 @@ struct Log_message_processor {
       m_metrics(metrics),
       m_metrics_config(metrics_config),
       m_log_file(log_file),
-      m_fdatasync_callable{this, wal::Sync_type::Fdatasync},
-      m_fsync_callable{this, wal::Sync_type::Fsync} {
+      m_fdatasync_callable{.m_fd = log_file ? log_file->m_fd : -1, .m_sync_type = wal::Sync_type::Fdatasync, .m_metrics = metrics},
+      m_fsync_callable{.m_fd = log_file ? log_file->m_fd : -1, .m_sync_type = wal::Sync_type::Fsync, .m_metrics = metrics} {
   }
 
   void operator()(const Payload_type& payload, Clock::time_point send_time = Clock::time_point{}) noexcept{
@@ -228,10 +235,16 @@ struct Log_message_processor {
   }
 
   void write_and_fdatasync(int) {
+    if (m_log != nullptr && m_log->m_pool != nullptr && m_log->m_pool->m_active != nullptr) {
+      m_fdatasync_callable.m_sync_offset = m_log->m_pool->m_active->m_buffer.m_hwm;
+    }
     m_log->request_sync(wal::Sync_type::Fdatasync, &m_fdatasync_callable);
   }
 
   void write_and_fsync(int) {
+    if (m_log != nullptr && m_log->m_pool != nullptr && m_log->m_pool->m_active != nullptr) {
+      m_fsync_callable.m_sync_offset = m_log->m_pool->m_active->m_buffer.m_hwm;
+    }
     m_log->request_sync(wal::Sync_type::Fsync, &m_fsync_callable);
   }
 
@@ -259,29 +272,34 @@ public:
 /* Implementation of Sync_callable::operator() - defined after Log_message_processor is complete */
 inline wal::Result<bool> Sync_callable::operator()() const noexcept {
   Clock::time_point sync_start;
-  if (m_processor->m_metrics != nullptr) [[likely]] {
+  if (m_metrics != nullptr) [[likely]] {
     sync_start = Clock::now();
   }
   
-  if (m_processor->m_log_file != nullptr && m_processor->m_log_file->m_fd != -1) {
+  if (m_fd != -1) {
     int result = -1;
     if (m_sync_type == wal::Sync_type::Fdatasync) [[likely]] {
-      result = portable_fdatasync(m_processor->m_log_file->m_fd);
+      result = portable_fdatasync(m_fd);
     } else if (m_sync_type == wal::Sync_type::Fsync) {
-      result = ::fsync(m_processor->m_log_file->m_fd);
+      result = ::fsync(m_fd);
     }
     
     if (result == 0) [[likely]] {
-      if (m_processor->m_metrics != nullptr) [[likely]] {
+      if (m_metrics != nullptr) [[likely]] {
         auto sync_end = Clock::now();
         auto sync_duration = std::chrono::duration_cast<std::chrono::nanoseconds>(sync_end - sync_start);
         if (m_sync_type == wal::Sync_type::Fdatasync) {
-          m_processor->m_metrics->inc(util::MetricType::FdatasyncCount);
-          m_processor->m_metrics->add_timing(util::MetricType::FdatasyncTiming, sync_duration);
+          m_metrics->inc(util::MetricType::FdatasyncCount);
+          m_metrics->add_timing(util::MetricType::FdatasyncTiming, sync_duration);
         } else {
-          m_processor->m_metrics->inc(util::MetricType::FsyncCount);
-          m_processor->m_metrics->add_timing(util::MetricType::FsyncTiming, sync_duration);
+          m_metrics->inc(util::MetricType::FsyncCount);
+          m_metrics->add_timing(util::MetricType::FsyncTiming, sync_duration);
         }
+      }
+
+      /* Drop cache for all data written up to current HWM (best effort) */
+      if (m_sync_offset > 0) {
+        ::posix_fadvise(m_fd, 0, static_cast<off_t>(m_sync_offset), POSIX_FADV_DONTNEED);
       }
       return wal::Result<bool>(true);
     }
@@ -338,9 +356,7 @@ Task<void> producer_actor(Producer_context ctx, std::size_t num_items, std::atom
     });
 
     /* Optionally send an additional sync message */
-    if (ctx.m_fdatasync_interval > 0 &&
-        !ctx.m_disable_log_writes &&
-        ((i + 1) % ctx.m_fdatasync_interval == 0)) {
+    if (ctx.m_fdatasync_interval > 0 && !ctx.m_disable_log_writes && ((i + 1) % ctx.m_fdatasync_interval == 0)) {
       enqueue_with_retry([&]() {
         util::Message_envelope<Payload_type> env;
         env.m_sender = ctx.m_self;
@@ -370,7 +386,7 @@ Task<void> producer_actor(Producer_context ctx, std::size_t num_items, std::atom
 /* Process a single message and return true if processing should continue, false to stop */
 [[nodiscard]] inline bool process_single_message(
   const util::Message_envelope<Payload_type>& msg,
-  Consumer_context& ctx,
+  Log_service_context& ctx,
   std::size_t& completed_producers,
   bool& loop_exited_normally
 ) noexcept {
@@ -420,7 +436,7 @@ Task<void> producer_actor(Producer_context ctx, std::size_t num_items, std::atom
  */
 [[nodiscard]] inline bool process_mailbox(
   util::Process<Payload_type>* process,
-  Consumer_context& ctx,
+  Log_service_context& ctx,
   std::size_t& completed_producers,
   util::Message_envelope<Payload_type>& msg
 ) noexcept {
@@ -428,8 +444,8 @@ Task<void> producer_actor(Producer_context ctx, std::size_t num_items, std::atom
     return true;
   }
   
-  /* Skip consumer process mailbox - producers don't send poison pills there */
-  if (ctx.m_consumer_process && process == ctx.m_consumer_process) {
+  /* Skip service process mailbox - producers don't send poison pills there */
+  if (ctx.m_service_process && process == ctx.m_service_process) {
     return true;
   }
   
@@ -443,12 +459,12 @@ Task<void> producer_actor(Producer_context ctx, std::size_t num_items, std::atom
   return completed_producers < ctx.m_num_producers;
 }
 
-/* Consumer coroutine - runs on thread pool and writes to log */
-Task<void> consumer_actor(
-  Consumer_context ctx,
+/* Log service coroutine - runs on thread pool and writes to log */
+Task<void> log_service_actor(
+  Log_service_context ctx,
   std::atomic<bool>& start_flag
 ) noexcept {
-  co_await ctx.m_sched->m_consumer_pool->schedule();
+  co_await ctx.m_service_pool->schedule();
  
   while (!start_flag.load(std::memory_order_acquire)) {
     util::cpu_pause();
@@ -462,9 +478,9 @@ Task<void> consumer_actor(
  
   while (completed_producers < ctx.m_num_producers) {
  
-    /* Check for poison pills in consumer mailbox (if provided) */
-    if (ctx.m_consumer_process != nullptr) {
-      while (ctx.m_consumer_process->m_mailbox.dequeue(msg)) {
+    /* Check for poison pills in service mailbox (if provided) */
+    if (ctx.m_service_process != nullptr) {
+      while (ctx.m_service_process->m_mailbox.dequeue(msg)) {
         if (std::holds_alternative<util::Poison_pill>(msg.m_payload)) {
           ++completed_producers;
           if (completed_producers >= ctx.m_num_producers) {
@@ -490,7 +506,7 @@ Task<void> consumer_actor(
  
     for (std::size_t i = 0; i < n_notifications; ++i) {
       std::size_t mailbox_idx = notification_buffer[i];
- 
+
       auto process_mbox = ctx.m_sched->m_mailboxes->get_for_process(mailbox_idx);
 
       if (process_mbox == nullptr) [[unlikely]] {
@@ -567,8 +583,8 @@ Task<void> consumer_actor(
     }
   }
 
-  if (ctx.m_consumer_done) {
-    ctx.m_consumer_done->store(true, std::memory_order_release);
+  if (ctx.m_service_done) {
+    ctx.m_service_done->store(true, std::memory_order_release);
   }
   co_return;
 }
@@ -664,21 +680,21 @@ static Test_run_result test_throughput_actor_model_single_run(const Test_config&
     producer_pids.push_back(service_setup.m_sched.spawn(config.m_mailbox_size));
   }
 
-  /* Create consumer process for poison pills */
-  util::Pid consumer_pid = service_setup.m_sched.spawn(config.m_mailbox_size);
-  auto consumer_process = service_setup.m_sched.get_process(consumer_pid);
+  /* Create log service process for poison pills */
+  util::Pid service_pid = service_setup.m_sched.spawn(config.m_mailbox_size);
+  auto service_process = service_setup.m_sched.get_process(service_pid);
 
   std::atomic<bool> start_flag{false};
-  std::atomic<bool> consumer_done{false};
+  std::atomic<bool> service_done{false};
 
-  Consumer_context consumer_ctx{
+  Log_service_context service_ctx{
     .m_log = log,
     .m_log_writer = log_writer,
-    .m_consumer_done = &consumer_done,
+    .m_service_done = &service_done,
     .m_disable_log_writes = config.m_disable_log_writes,
-    .m_consumer_pool = &service_setup.m_consumer_pool,
+    .m_service_pool = &service_setup.m_consumer_pool,
     .m_io_pool = &service_setup.m_io_pool,
-    .m_consumer_process = consumer_process,
+    .m_service_process = service_process,
     .m_sched = nullptr,  /* Will be set after processor is created */
     .m_processor = nullptr,  /* Will be set after processor is created */
     .m_num_producers = 0,  /* Will be set after processor is created */
@@ -694,9 +710,9 @@ static Test_run_result test_throughput_actor_model_single_run(const Test_config&
   }
 
   Log_message_processor processor(
-    consumer_ctx.m_log,
-    consumer_ctx.m_io_pool,
-    consumer_ctx.m_disable_log_writes,
+    service_ctx.m_log,
+    service_ctx.m_io_pool,
+    service_ctx.m_disable_log_writes,
     config.m_disable_metrics ? nullptr : &metrics,  /* Pass metrics only if not disabled */
     metrics_config_ptr,  /* Pass metrics config for fine-grained control */
     log_file  /* Pass log_file for direct sync operations */
@@ -705,21 +721,21 @@ static Test_run_result test_throughput_actor_model_single_run(const Test_config&
   assert(config.m_num_consumers == 1);
 
   Log_message_processor msg_processor(
-    consumer_ctx.m_log,
-    consumer_ctx.m_io_pool,
-    consumer_ctx.m_disable_log_writes,
+    service_ctx.m_log,
+    service_ctx.m_io_pool,
+    service_ctx.m_disable_log_writes,
     config.m_disable_metrics ? nullptr : &metrics,  /* Pass metrics only if not disabled */
     metrics_config_ptr,  /* Pass metrics config for fine-grained control */
     log_file  /* Pass log_file for direct sync operations */
   );
 
   /* Set additional fields in consumer context */
-  consumer_ctx.m_sched = &service_setup.m_sched;
-  consumer_ctx.m_processor = &msg_processor;
-  consumer_ctx.m_num_producers = producers;
+  service_ctx.m_sched = &service_setup.m_sched;
+  service_ctx.m_processor = &msg_processor;
+  service_ctx.m_num_producers = producers;
 
   /* Use simple lambda when writes are disabled, matching test_actor_model exactly */
-  detach(consumer_actor(consumer_ctx, std::ref(start_flag)));
+  detach(log_service_actor(service_ctx, std::ref(start_flag)));
 
   /* Launch producer actors (coroutines) */
   for (std::size_t p = 0; p < producers; ++p) {
@@ -748,11 +764,11 @@ static Test_run_result test_throughput_actor_model_single_run(const Test_config&
   auto start = Clock::now();
   start_flag.store(true, std::memory_order_release);
 
-  /* Wait for consumer to complete (event-based) */
+  /* Wait for service to complete (event-based) */
   constexpr auto max_wait_time = std::chrono::seconds(600);
   auto wait_start = Clock::now();
 
-  while (!consumer_done.load(std::memory_order_acquire)) {
+  while (!service_done.load(std::memory_order_acquire)) {
     auto elapsed = Clock::now() - wait_start;
     if (elapsed > max_wait_time) {
       std::println(stderr, "ERROR: Timeout waiting for consumer to complete");
@@ -763,7 +779,7 @@ static Test_run_result test_throughput_actor_model_single_run(const Test_config&
     }
   }
 
-  /* Consumer coroutines will complete and signal via consumer_done flag */
+  /* Service coroutine will complete and signal via service_done flag */
 
   auto end = Clock::now();
 
@@ -805,80 +821,81 @@ static Test_run_result test_throughput_actor_model_single_run(const Test_config&
   const auto elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
   double elapsed_s = static_cast<double>(elapsed_ns.count()) / 1'000'000'000.0;
 
-  /* All messages were processed when consumer_done is true */
+  /* All messages were processed when service_done is true */
   const auto processed = total_messages;
   const auto ops_per_sec = elapsed_s == 0.0 ? 0.0 : static_cast<double>(processed) / elapsed_s;
 
-  /* Print all metrics if enabled */
+  /* Print metrics with verbosity control */
   if (!config.m_disable_metrics && log->get_metrics() != nullptr) {
-    /* Print write-to-store metrics */
-    log->get_metrics()->print("Write-to-Store Metrics:");
-    
-    /* Explicitly print sync metrics even if count is 0 for visibility */
-    auto fdatasync_count = log->get_metrics()->get_counter(util::MetricType::FdatasyncCount);
-    auto fsync_count = log->get_metrics()->get_counter(util::MetricType::FsyncCount);
-    std::println("\nSync Operations:");
-    std::println("  fdatasync.count: {}", fdatasync_count);
-    std::println("  fsync.count: {}", fsync_count);
-    
-    if (fdatasync_count > 0) {
-      auto fdatasync_stats = log->get_metrics()->get_timing_stats(util::MetricType::FdatasyncTiming);
-      if (fdatasync_stats.m_count > 0) {
-        std::println("  fdatasync.timing: count: {} min: {}ns max: {}ns avg: {:.2f}ns total: {}ns",
-                     fdatasync_stats.m_count, fdatasync_stats.m_min_ns, fdatasync_stats.m_max_ns,
-                     static_cast<double>(fdatasync_stats.m_avg_ns), fdatasync_stats.m_sum_ns);
-        const auto& timings = log->get_metrics()->get_timings(util::MetricType::FdatasyncTiming);
-        if (!timings.empty()) {
-          auto histogram = util::Metrics::generate_timing_histogram(timings, 20);
+    auto* m = log->get_metrics();
+    const auto write_calls = m->get_counter(util::MetricType::WriteToStoreCalls);
+    const auto blocks_written = m->get_counter(util::MetricType::WriteToStoreBlocksWritten);
+    const auto bytes_written = m->get_counter(util::MetricType::WriteToStoreBytesWritten);
+    const auto wts_total = m->get_timing_stats(util::MetricType::WriteToStoreTotal);
+    const auto io_cb = m->get_timing_stats(util::MetricType::WriteToStoreIoCallback);
+    const auto prep = m->get_timing_stats(util::MetricType::WriteToStorePrepareBatch);
+
+    auto fdatasync_count = m->get_counter(util::MetricType::FdatasyncCount);
+    auto fsync_count = m->get_counter(util::MetricType::FsyncCount);
+    auto fdatasync_stats = m->get_timing_stats(util::MetricType::FdatasyncTiming);
+    auto fsync_stats = m->get_timing_stats(util::MetricType::FsyncTiming);
+
+    auto producer_lat = m->get_timing_stats(util::MetricType::ProducerLatency);
+
+    std::println("Write-to-Store Metrics:");
+    std::println("  calls={} blocks={} bytes={} avg_total={:.2f}us avg_io={:.2f}us avg_prep={:.2f}us",
+                 write_calls, blocks_written, bytes_written,
+                 wts_total.m_count ? static_cast<double>(wts_total.m_avg_ns) / 1000.0 : 0.0,
+                 io_cb.m_count ? static_cast<double>(io_cb.m_avg_ns) / 1000.0 : 0.0,
+                 prep.m_count ? static_cast<double>(prep.m_avg_ns) / 1000.0 : 0.0);
+
+    std::println("Sync Metrics: fdatasync.count={} avg={:.2f}us fsync.count={} avg={:.2f}us",
+                 fdatasync_count,
+                 fdatasync_stats.m_count ? static_cast<double>(fdatasync_stats.m_avg_ns) / 1000.0 : 0.0,
+                 fsync_count,
+                 fsync_stats.m_count ? static_cast<double>(fsync_stats.m_avg_ns) / 1000.0 : 0.0);
+
+    if (producer_lat.m_count > 0) {
+      std::println("Producer Latency: count={} avg={:.2f}us min={:.2f}us max={:.2f}us",
+                   producer_lat.m_count,
+                   static_cast<double>(producer_lat.m_avg_ns) / 1000.0,
+                   static_cast<double>(producer_lat.m_min_ns) / 1000.0,
+                   static_cast<double>(producer_lat.m_max_ns) / 1000.0);
+    }
+
+    if (config.m_verbosity >= 1) {
+      const auto print_hist = [&](util::MetricType t, std::string_view label) {
+        const auto& timings = m->get_timings(t);
+        if (timings.empty()) {
+          std::println("  {}: no samples", label);
+          return;
+        }
+        auto stats = m->get_timing_stats(t);
+        std::println("  {}: count={} min={}ns max={}ns avg={:.2f}ns", label, stats.m_count,
+                     stats.m_min_ns, stats.m_max_ns, static_cast<double>(stats.m_avg_ns));
+        if (config.m_verbosity >= 2) {
+          auto hist = util::Metrics::generate_timing_histogram(timings, 20);
           std::println("    histogram:");
-          for (const auto& [range, count] : histogram) {
-            double percentage = (100.0 * static_cast<double>(count) / static_cast<double>(fdatasync_stats.m_count));
-            std::println("      {}: {} ({:.2f}%)", range, count, percentage);
+          for (const auto& [range, count] : hist) {
+            double pct = (100.0 * static_cast<double>(count) / static_cast<double>(stats.m_count));
+            std::println("      {}: {} ({:.2f}%)", range, count, pct);
           }
         }
-      } else {
-        std::println("  fdatasync.timing: no timing data collected");
+      };
+
+      std::println("Detailed Timings:");
+      print_hist(util::MetricType::WriteToStoreTotal, "write_to_store.total");
+      print_hist(util::MetricType::WriteToStoreIoCallback, "write_to_store.io_callback");
+      print_hist(util::MetricType::WriteToStorePrepareBatch, "write_to_store.prepare_batch");
+
+      if (fdatasync_count > 0) {
+        print_hist(util::MetricType::FdatasyncTiming, "fdatasync.timing");
       }
-    }
-    
-    if (fsync_count > 0) {
-      auto fsync_stats = log->get_metrics()->get_timing_stats(util::MetricType::FsyncTiming);
-      if (fsync_stats.m_count > 0) {
-        std::println("  fsync.timing: count: {} min: {}ns max: {}ns avg: {:.2f}ns total: {}ns",
-                     fsync_stats.m_count, fsync_stats.m_min_ns, fsync_stats.m_max_ns,
-                     static_cast<double>(fsync_stats.m_avg_ns), fsync_stats.m_sum_ns);
-        const auto& timings = log->get_metrics()->get_timings(util::MetricType::FsyncTiming);
-        if (!timings.empty()) {
-          auto histogram = util::Metrics::generate_timing_histogram(timings, 20);
-          std::println("    histogram:");
-          for (const auto& [range, count] : histogram) {
-            double percentage = (100.0 * static_cast<double>(count) / static_cast<double>(fsync_stats.m_count));
-            std::println("      {}: {} ({:.2f}%)", range, count, percentage);
-          }
-        }
-      } else {
-        std::println("  fsync.timing: no timing data collected");
+      if (fsync_count > 0) {
+        print_hist(util::MetricType::FsyncTiming, "fsync.timing");
       }
-    }
-    
-    /* Print producer latency histogram */
-    auto latency_stats = log->get_metrics()->get_timing_stats(util::MetricType::ProducerLatency);
-    if (latency_stats.m_count > 0) {
-      std::println("\nProducer Latency Statistics:");
-      std::println("  Total requests: {}", latency_stats.m_count);
-      std::println("  Min latency: {} ns ({:.3f} us)", latency_stats.m_min_ns, static_cast<double>(latency_stats.m_min_ns) / 1000.0);
-      std::println("  Max latency: {} ns ({:.3f} us)", latency_stats.m_max_ns, static_cast<double>(latency_stats.m_max_ns) / 1000.0);
-      std::println("  Avg latency: {:.2f} ns ({:.3f} us)", static_cast<double>(latency_stats.m_avg_ns), static_cast<double>(latency_stats.m_avg_ns) / 1000.0);
-      
-      /* Print latency histogram */
-      const auto& timings = log->get_metrics()->get_timings(util::MetricType::ProducerLatency);
-      if (!timings.empty()) {
-        auto histogram = util::Metrics::generate_timing_histogram(timings, 20);
-        std::println("\n  Producer Latency Histogram:");
-        for (const auto& [range, count] : histogram) {
-          double percentage = (100.0 * static_cast<double>(count) / static_cast<double>(latency_stats.m_count));
-          std::println("    {}: {} ({:.2f}%)", range, count, percentage);
-        }
+      if (producer_lat.m_count > 0) {
+        print_hist(util::MetricType::ProducerLatency, "producer.latency");
       }
     }
   }
@@ -970,6 +987,7 @@ static void print_usage(const char* program_name) noexcept {
                "      --use-fsync          Use fsync messages instead of fdatasync (default: fdatasync)\n"
                "  -b, --batch-dequeue      Enable batch dequeue mode (default: off)\n"
                "  -B, --batch-size NUM     Batch size for batch dequeue (default: 32)\n"
+               "  -v, --verbose            Increase verbosity (metrics): repeat for more detail (e.g., -vv)\n"
                "  -h, --help                Show this help message\n",
                program_name);
 }
@@ -1002,7 +1020,7 @@ int main(int argc, char** argv) {
 
   int opt;
   int option_index = 0;
-  while ((opt = getopt_long(argc, argv, "M:m:i:p:c:hwdSXL:R:T:f:bB:", long_options, &option_index)) != -1) {
+  while ((opt = getopt_long(argc, argv, "M:m:i:p:c:hwdSXL:R:T:f:bB:v", long_options, &option_index)) != -1) {
     switch (opt) {
       case 'M':
         config.m_mailbox_size = std::stoull(optarg);
@@ -1074,6 +1092,9 @@ int main(int argc, char** argv) {
         break;
       case 'B':
         config.m_batch_size = std::stoull(optarg);
+        break;
+      case 'v':
+        ++config.m_verbosity;
         break;
       case 'h':
         show_help = true;
