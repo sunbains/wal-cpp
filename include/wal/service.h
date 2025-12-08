@@ -60,10 +60,10 @@ struct Producer_context_base {
  */
 template<typename PayloadType, typename SchedulerType>
 struct Log_service_setup {
-  Log_service_setup(std::size_t num_producers, std::size_t io_threads = 1)
-    : m_producer_pool(create_producer_pool_config(num_producers)),
-      m_consumer_pool(create_consumer_pool_config()),
-      m_io_pool(create_io_pool_config(io_threads)) {
+  Log_service_setup(std::size_t num_producers, std::size_t io_threads = 1, bool pin_workers = false)
+    : m_producer_pool(create_producer_pool_config(num_producers, pin_workers)),
+      m_consumer_pool(create_consumer_pool_config(pin_workers)),
+      m_io_pool(create_io_pool_config(io_threads, pin_workers)) {
      std::size_t hw_threads = std::thread::hardware_concurrency();
  
      if (hw_threads == 0) {
@@ -75,7 +75,8 @@ struct Log_service_setup {
      if (!std::has_single_bit(thread_mailbox_capacity)) {
        thread_mailbox_capacity = std::bit_ceil(thread_mailbox_capacity);
      }
-     m_thread_mailboxes.initialize(m_producer_pool.m_workers.size(), thread_mailbox_capacity);
+     /* One mailbox per producer to keep mailboxes SPSC and avoid contention */
+     m_thread_mailboxes.initialize(num_producers, thread_mailbox_capacity, num_producers);
  
      m_sched.m_producer_pool = &m_producer_pool;
      m_sched.m_consumer_pool = &m_consumer_pool;
@@ -95,7 +96,7 @@ struct Log_service_setup {
    }
  
  private:
-   static util::Thread_pool::Config create_producer_pool_config(std::size_t num_producers) {
+   static util::Thread_pool::Config create_producer_pool_config(std::size_t num_producers, bool pin_workers) {
      util::Thread_pool::Config producer_pool_config;
  
      std::size_t hw_threads = std::thread::hardware_concurrency();
@@ -106,6 +107,7 @@ struct Log_service_setup {
  
      producer_pool_config.m_num_threads = std::max<std::size_t>(1, hw_threads / 2);
      producer_pool_config.m_queue_capacity = std::min<std::size_t>(1024, std::max<std::size_t>(4096, num_producers * 4));
+     producer_pool_config.m_pin_workers = pin_workers;
  
      if (!std::has_single_bit(producer_pool_config.m_queue_capacity)) {
        producer_pool_config.m_queue_capacity = std::bit_ceil(producer_pool_config.m_queue_capacity);
@@ -113,7 +115,7 @@ struct Log_service_setup {
      return producer_pool_config;
    }
  
-   static util::Thread_pool::Config create_consumer_pool_config() {
+   static util::Thread_pool::Config create_consumer_pool_config(bool pin_workers) {
      util::Thread_pool::Config consumer_pool_config;
  
      std::size_t hw_threads = std::thread::hardware_concurrency();
@@ -124,6 +126,7 @@ struct Log_service_setup {
  
      consumer_pool_config.m_num_threads = 1;
      consumer_pool_config.m_queue_capacity = 32;
+     consumer_pool_config.m_pin_workers = pin_workers;
  
      if (!std::has_single_bit(consumer_pool_config.m_queue_capacity)) {
        consumer_pool_config.m_queue_capacity = std::bit_ceil(consumer_pool_config.m_queue_capacity);
@@ -132,7 +135,7 @@ struct Log_service_setup {
      return consumer_pool_config;
    }
  
-  static util::Thread_pool::Config create_io_pool_config(std::size_t io_threads = 1) {
+  static util::Thread_pool::Config create_io_pool_config(std::size_t io_threads = 1, bool pin_workers = false) {
     util::Thread_pool::Config io_pool_config;
  
      std::size_t hw_threads = std::thread::hardware_concurrency();
@@ -143,6 +146,7 @@ struct Log_service_setup {
  
     io_pool_config.m_num_threads = std::max<std::size_t>(std::size_t(1), io_threads);
      io_pool_config.m_queue_capacity = 64;
+     io_pool_config.m_pin_workers = pin_workers;
  
      if (!std::has_single_bit(io_pool_config.m_queue_capacity)) {
        io_pool_config.m_queue_capacity = std::bit_ceil(io_pool_config.m_queue_capacity);

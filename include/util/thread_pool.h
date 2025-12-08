@@ -39,6 +39,7 @@
 #include <linux/futex.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#include <pthread.h>
 #endif
 
 #include "util/bounded_channel.h"
@@ -220,6 +221,11 @@ struct Thread_pool {
     /** Number of protected workers (first N workers don't allow stealing) */
     std::size_t m_num_protected_workers{0};
 
+    /** Optional list of CPU IDs to pin workers to (round-robin if shorter than worker count) */
+    std::vector<int> m_cpu_affinity{};
+    /** Convenience flag: pin workers to sequential CPUs starting at 0 (Linux-only; ignored elsewhere) */
+    bool m_pin_workers{false};
+
     Config() = default;
 
     Config(std::size_t n_threads, std::size_t q_capacity = 1024, std::size_t n_protected = 0)
@@ -338,6 +344,18 @@ struct Thread_pool {
     }
 
     m_num_protected_workers = std::min(config.m_num_protected_workers, n_threads);
+    m_cpu_affinity = config.m_cpu_affinity;
+    /* If requested, pin workers to sequential CPUs starting at 0 (Linux only). */
+    if (m_cpu_affinity.empty() && config.m_pin_workers) {
+      std::size_t hw_threads = std::thread::hardware_concurrency();
+      if (hw_threads == 0) {
+        hw_threads = n_threads;
+      }
+      for (std::size_t i = 0; i < n_threads; ++i) {
+        m_cpu_affinity.push_back(static_cast<int>(i % hw_threads));
+      }
+    }
+    m_use_affinity = !m_cpu_affinity.empty();
 
     m_worker_queues.resize(n_threads);
 
@@ -350,7 +368,11 @@ struct Thread_pool {
      * Use shared stop_token from m_stop_source for coordinated shutdown */
     auto stop_token = m_stop_source.get_token();
     for (std::size_t i = 0; i < n_threads; ++i) {
-      m_workers.emplace_back([this, i, stop_token]() { 
+      const int cpu = (m_use_affinity && !m_cpu_affinity.empty())
+                        ? m_cpu_affinity[i % m_cpu_affinity.size()]
+                        : -1;
+      m_workers.emplace_back([this, i, stop_token, cpu]() { 
+        apply_affinity(cpu);
         this->worker_loop(i, stop_token); 
       });
     }
@@ -559,6 +581,20 @@ public:
   }
 
 private:
+  static void apply_affinity(int cpu) noexcept {
+#ifdef __linux__
+    if (cpu < 0) {
+      return;
+    }
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(static_cast<unsigned int>(cpu), &set);
+    (void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+#else
+    (void)cpu;
+#endif
+  }
+
   void worker_loop(std::size_t worker_id, std::stop_token stop_token) noexcept {
     auto& wq = *m_worker_queues[worker_id];
     
@@ -755,6 +791,10 @@ private:
 
   /* Number of protected workers (first N workers don't allow stealing) */
   std::size_t m_num_protected_workers{0};
+
+  /* Optional CPU affinity mapping for workers */
+  std::vector<int> m_cpu_affinity;
+  bool m_use_affinity{false};
 
   /* Per-worker queues - MPMC (multiple producers, single consumer per queue) */
   std::vector<std::unique_ptr<Worker_queue>> m_worker_queues;

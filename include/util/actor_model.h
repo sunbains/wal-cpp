@@ -139,6 +139,9 @@ struct Process_mailboxes {
   
   void initialize(std::size_t n_processes, std::size_t capacity, std::size_t n_producers = 0) {
     m_mailboxes.clear();
+    m_pending_flags.reset();
+    m_pending_flags_size = n_processes;
+    m_active_queues.clear();
 
     for (std::size_t i = 0; i < n_processes; ++i) {
       m_mailboxes.push_back(std::make_unique<Mailbox_type>(capacity));
@@ -159,7 +162,16 @@ struct Process_mailboxes {
       notify_capacity = std::max<std::size_t>(n_processes * 8, 1024);
     }
     notify_capacity = std::bit_ceil(notify_capacity);
-    m_notify_queue = std::make_unique<Spsc_bounded_queue<std::size_t>>(notify_capacity);
+    /* Build per-worker queues to reduce contention */
+    const std::size_t n_workers = std::max<std::size_t>(std::size_t(1), n_processes);
+    m_active_queues.reserve(n_workers);
+    for (std::size_t i = 0; i < n_workers; ++i) {
+      m_active_queues.push_back(std::make_unique<Bounded_queue<std::size_t>>(notify_capacity));
+    }
+    m_pending_flags = std::make_unique<std::atomic<bool>[]>(m_pending_flags_size);
+    for (std::size_t i = 0; i < m_pending_flags_size; ++i) {
+      m_pending_flags[i].store(false, std::memory_order_relaxed);
+    }
   }
 
   Mailbox_type* get_for_process(std::size_t process_id) {
@@ -171,42 +183,47 @@ struct Process_mailboxes {
 
   std::size_t size() const { return m_mailboxes.size(); }
 
-  /* Notify consumer that a mailbox has messages (level-triggered)
-   * Only notifies when transitioning from empty (consumer finished) to non-empty (new messages)
-   * Returns true if notification was sent, false if already notified */
-  bool notify_mailbox_has_messages(std::size_t process_id) {
-    if (process_id >= m_mailboxes.size()) {
+  /* Notify consumer that a mailbox has messages (level-triggered + pending dedupe)
+   * Enqueues process_id onto its home active queue when transitioning pending=false->true */
+  bool notify_mailbox_has_messages(std::size_t process_id, std::size_t n_workers) {
+    if (process_id >= m_mailboxes.size() || m_active_queues.empty()) {
       return false;
     }
     
     auto mbox = m_mailboxes[process_id].get();
 
-    /* Level-triggered: only notify when flag transitions from false (consumer finished) to true (new messages)
-     * This ensures we only notify when consumer has read all entries from the SPSC queue */
-    bool expected{};
-
-    if (mbox->m_has_messages.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-      /* Try to enqueue notification (non-blocking - if queue is full, retry a few times)
-       * If still full, the consumer will find it via the m_has_messages flag during scanning */
-      bool notified{};
-      for (int retry = 0; retry < 3 && !notified; ++retry) {
-        if (m_notify_queue->enqueue(process_id)) {
-          notified = true;
-        } else if (retry < 2) {
-          /* Brief pause before retry to let consumer drain */
-          cpu_pause();
-        }
-      }
-      /* If notification queue is full after retries, consumer will find via flag during scan */
-      return true;
+    /* Only notify if we successfully transition pending from false to true */
+    bool expected_pending = false;
+    if (!m_pending_flags[process_id].compare_exchange_strong(expected_pending, true, std::memory_order_acq_rel)) {
+      return false;  /* already pending */
     }
 
-    /* Already notified (consumer hasn't finished processing yet) */
-    return false;
+    mbox->m_has_messages.store(true, std::memory_order_release);
+
+    const std::size_t qid = (n_workers == 0) ? 0 : (process_id % n_workers);
+    auto& act_q = *m_active_queues[qid];
+    [[maybe_unused]] auto ok = act_q.enqueue(process_id);
+    (void)ok;
+    return true;
+  }
+
+  void clear_pending_flag(std::size_t process_id) {
+    if (process_id < m_pending_flags_size && m_pending_flags) {
+      m_pending_flags[process_id].store(false, std::memory_order_release);
+    }
+  }
+
+  bool dequeue_active(std::size_t queue_id, std::size_t& pid_out) {
+    if (queue_id >= m_active_queues.size()) {
+      return false;
+    }
+    return m_active_queues[queue_id]->dequeue(pid_out);
   }
 
   std::vector<std::unique_ptr<Mailbox_type>> m_mailboxes;
-  std::unique_ptr<Spsc_bounded_queue<std::size_t>> m_notify_queue;
+  std::vector<std::unique_ptr<Bounded_queue<std::size_t>>> m_active_queues;
+  std::unique_ptr<std::atomic<bool>[]> m_pending_flags;
+  std::size_t m_pending_flags_size{0};
 };
 
 /**
@@ -219,19 +236,15 @@ struct alignas(64) Process {
     : m_pid(p), m_mailbox(mailbox_size) {}
 
   /* Self-schedule into a process mailbox for better work distribution
-   * Uses hash-based distribution instead of current process ID to balance load
-   * Also notifies consumer via notification queue
+   * Deterministic mapping to keep SPSC semantics and avoid global contention
    * Returns true if successfully scheduled, false if already scheduled or needs retry */
   bool schedule_self(Process_mailboxes<PayloadType>* mailboxes, std::size_t n_processes) {
     if (n_processes == 0){
       return false;
     }
     
-    /* Hash-based distribution: use process ID to consistently map to a process mailbox
-     * This distributes work evenly across processes regardless of where producer is running
-     * Use a better hash function (multiply by prime) to improve distribution quality
-     * This reduces clustering when many producers hash to the same process */
-    std::size_t target_process_id = (m_pid * 2654435761ULL) % n_processes;
+    /* Deterministic mapping: each process uses its own mailbox to preserve SPSC semantics */
+    std::size_t target_process_id = m_pid % n_processes;
 
     auto process_mbox = mailboxes->get_for_process(target_process_id);
 
@@ -248,7 +261,7 @@ struct alignas(64) Process {
       for (int i = 0; i < max_yields; ++i) {
         if (process_mbox->m_queue.enqueue(this)) {
           /* Notify consumer that this mailbox has messages (only first time) */
-          mailboxes->notify_mailbox_has_messages(target_process_id);
+          mailboxes->notify_mailbox_has_messages(target_process_id, n_processes);
           return true;
         }
         /* Use minimal CPU pause to avoid syscalls */
@@ -297,6 +310,8 @@ struct Scheduler_base {
   Thread_pool* m_producer_pool;
   Thread_pool* m_consumer_pool;
   Mailboxes_type* m_mailboxes{nullptr};
+  /* Optional: force consumer to drain all mailboxes round-robin each loop */
+  bool m_round_robin_drain{false};
   std::vector<std::unique_ptr<Process_type>> m_processes;
 };
 

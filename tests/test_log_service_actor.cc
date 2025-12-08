@@ -114,6 +114,7 @@ struct Test_config {
   bool m_disable_writes{false};
   bool m_disable_log_writes{false};
   bool m_skip_memcpy{false};
+  bool m_pin_threads{false};
   std::size_t m_log_block_size{4096};
   std::size_t m_log_buffer_size_blocks{16384};
   std::size_t m_pool_size{32};
@@ -137,6 +138,12 @@ struct Test_config {
 
   /** Batch size for batch dequeue (default: 32) */
   std::size_t m_batch_size{32};
+
+  /** Max messages to process per consumer loop iteration (reductions); 0 = unlimited */
+  std::size_t m_reduction_budget{0};
+
+  /** Force deterministic round-robin drain of all mailboxes each loop (reduces jitter) */
+  bool m_round_robin_drain{false};
 
   /** Verbosity level for metrics output (0=concise, 1=summary, 2=full histograms) */
   int m_verbosity{0};
@@ -192,6 +199,8 @@ struct Log_service_context {
   bool m_enable_batch_dequeue{true};
   /** Batch size for batch dequeue, only used if m_enable_batch_dequeue is true */
   std::size_t m_batch_size{32};
+  /** Max messages to process per loop before yielding (reductions) */
+  std::size_t m_reduction_budget{4096};
 };
 
 /* Forward declaration */
@@ -337,6 +346,13 @@ Task<void> producer_actor(Producer_context ctx, std::size_t num_items, std::atom
 
   /* Cache mailbox count - it never changes during execution (6.39% hotspot) */
   const std::size_t n_mailboxes = ctx.m_sched->m_mailboxes->size();
+  /* Reduce notify frequency for very large producer counts to limit scheduling overhead */
+  std::size_t notify_stride = 1;
+  if (n_mailboxes > 8192) {
+    notify_stride = 32;
+  } else if (n_mailboxes > 2048) {
+    notify_stride = 8;
+  }
 
   ctx.m_proc->schedule_self(ctx.m_sched->m_mailboxes, n_mailboxes);
 
@@ -352,8 +368,12 @@ Task<void> producer_actor(Producer_context ctx, std::size_t num_items, std::atom
           if ((notify_counter & 0xFFu) == 0) {
             ctx.m_proc->schedule_self(ctx.m_sched->m_mailboxes, n_mailboxes);
           }
-        } else if (!ctx.m_proc->m_in_process_mailbox.load(std::memory_order_acquire)) {
-          ctx.m_proc->schedule_self(ctx.m_sched->m_mailboxes, n_mailboxes);
+        } else {
+          ++notify_counter;
+          if ((notify_counter & (notify_stride - 1)) == 0 &&
+              !ctx.m_proc->m_in_process_mailbox.load(std::memory_order_acquire)) {
+            ctx.m_proc->schedule_self(ctx.m_sched->m_mailboxes, n_mailboxes);
+          }
         }
         break;
       }
@@ -492,12 +512,15 @@ Task<void> log_service_actor(
  
   std::size_t completed_producers = 0;
   std::size_t no_work_iterations = 0;
+  const std::size_t reduction_budget = std::numeric_limits<std::size_t>::max();
   util::Message_envelope<Payload_type> msg;
   constexpr std::size_t bulk_read_size = 64;
   std::array<std::size_t, bulk_read_size> notification_buffer;
+  std::size_t next_active_queue{0};
  
   while (completed_producers < ctx.m_num_producers) {
- 
+    std::size_t reductions_left = reduction_budget;
+
     /* Check for poison pills in service mailbox (if provided) */
     if (ctx.m_service_process != nullptr) {
       while (ctx.m_service_process->m_mailbox.dequeue(msg)) {
@@ -509,83 +532,123 @@ Task<void> log_service_actor(
         }
       }
     }
- 
+
     if (completed_producers >= ctx.m_num_producers) {
       break;
     }
- 
+
     bool found_work{false};
     util::Process<Payload_type>* proc{nullptr};
- 
+
     std::size_t n_notifications{0};
     std::size_t notified_mailbox_idx{0};
     
-    while (n_notifications < bulk_read_size && ctx.m_sched->m_mailboxes->m_notify_queue->dequeue(notified_mailbox_idx)) {
-      notification_buffer[n_notifications++] = notified_mailbox_idx;
+    if (!ctx.m_sched->m_round_robin_drain) {
+      const std::size_t n_workers = ctx.m_sched->m_mailboxes->m_active_queues.size();
+      for (std::size_t q = 0; q < n_workers && n_notifications < bulk_read_size; ++q) {
+        const std::size_t qid = (next_active_queue + q) % n_workers;
+        while (n_notifications < bulk_read_size &&
+               ctx.m_sched->m_mailboxes->dequeue_active(qid, notified_mailbox_idx)) {
+          notification_buffer[n_notifications++] = notified_mailbox_idx;
+        }
+      }
+      if (n_workers > 0) {
+        next_active_queue = (next_active_queue + 1) % n_workers;
+      }
+      /* Process notifications in deterministic order to reduce jitter */
+      if (n_notifications > 1) {
+        std::sort(notification_buffer.begin(), notification_buffer.begin() + n_notifications);
+      }
     }
- 
-    for (std::size_t i = 0; i < n_notifications; ++i) {
-      std::size_t mailbox_idx = notification_buffer[i];
 
-      auto process_mbox = ctx.m_sched->m_mailboxes->get_for_process(mailbox_idx);
-
-      if (process_mbox == nullptr) [[unlikely]] {
-        continue;
+    const auto process_queue = [&](std::size_t mailbox_idx, util::Process_mailbox<Payload_type>* process_mbox) {
+      if (process_mbox == nullptr) {
+        return;
       }
 
-      if (!process_mbox->m_has_messages.load(std::memory_order_acquire)) [[unlikely]] {
-        continue;
+      if (!process_mbox->m_has_messages.load(std::memory_order_acquire)) {
+        return;
       }
 
       bool loop_exited_normally{true};
 
-      while (process_mbox->m_queue.dequeue(proc)) [[likely]] {
+      while (process_mbox->m_queue.dequeue(proc) && reductions_left > 0) {
         found_work = true;
 
         util::prefetch_for_read<3>(proc);
 
         proc->m_in_process_mailbox.store(false, std::memory_order_release);
 
-        if (ctx.m_enable_batch_dequeue) [[likely]] {
-          while (proc->m_mailbox.dequeue_batch(ctx.m_batch_size, [&](auto& batch_msg) {
-            return process_single_message(batch_msg, ctx, completed_producers, loop_exited_normally);
-          }) > 0) [[likely]] {
-            if (completed_producers >= ctx.m_num_producers) [[unlikely]] {
+        if (ctx.m_enable_batch_dequeue) {
+          while (reductions_left > 0) {
+            const std::size_t to_deq = std::min(ctx.m_batch_size, reductions_left);
+            auto drained = proc->m_mailbox.dequeue_batch(to_deq, [&](auto& batch_msg) {
+              return process_single_message(batch_msg, ctx, completed_producers, loop_exited_normally);
+            });
+            if (drained == 0) {
+              break;
+            }
+            reductions_left -= drained;
+            if (completed_producers >= ctx.m_num_producers || reductions_left == 0) {
               break;
             }
           }
         } else {
-          while (proc->m_mailbox.dequeue(msg)) [[likely]] {
-            if (!process_single_message(msg, ctx, completed_producers, loop_exited_normally)) [[unlikely]] {
+          while (reductions_left > 0 && proc->m_mailbox.dequeue(msg)) {
+            --reductions_left;
+            if (!process_single_message(msg, ctx, completed_producers, loop_exited_normally)) {
+              break;
+            }
+            if (reductions_left == 0) {
               break;
             }
           }
         }
         
-        if (completed_producers >= ctx.m_num_producers) [[unlikely]] {
+        if (completed_producers >= ctx.m_num_producers) {
           loop_exited_normally = false;
           break;
         }
+        if (reductions_left == 0) {
+          break;
+        }
       }
- 
+
       if (loop_exited_normally) {
         process_mbox->m_has_messages.store(false, std::memory_order_release);
+        ctx.m_sched->m_mailboxes->clear_pending_flag(mailbox_idx);
       }
-      
-      if (completed_producers >= ctx.m_num_producers) {
-        break;
+    };
+
+    if (ctx.m_sched->m_round_robin_drain) {
+      for (std::size_t pid = 0; pid < ctx.m_sched->m_mailboxes->size() && completed_producers < ctx.m_num_producers; ++pid) {
+        auto* process_mbox = ctx.m_sched->m_mailboxes->get_for_process(pid);
+        process_queue(pid, process_mbox);
+      }
+    } else {
+      for (std::size_t i = 0; i < n_notifications; ++i) {
+        /* Skip duplicate notifications after sorting */
+        if (i > 0 && notification_buffer[i] == notification_buffer[i - 1]) {
+          continue;
+        }
+        std::size_t mailbox_idx = notification_buffer[i];
+        auto process_mbox = ctx.m_sched->m_mailboxes->get_for_process(mailbox_idx);
+        process_queue(mailbox_idx, process_mbox);
+        if (completed_producers >= ctx.m_num_producers) {
+          break;
+        }
       }
     }
- 
+
     const std::size_t scan_interval = (ctx.m_num_producers == 1) ? 1000 : 20;
- 
+
     if (!found_work) {
       ++no_work_iterations;
     } else {
       no_work_iterations = 0;
     }
- 
-    if (no_work_iterations % scan_interval == 0) {
+
+    if (ctx.m_sched->m_round_robin_drain || (no_work_iterations % scan_interval == 0)) {
       /* Scan all processes to find poison pills in producer mailboxes.
        * Producers send poison pills to their own mailboxes, so we need to scan all processes.
        * Skip the consumer process (if provided) since producers don't send poison pills there.
@@ -597,8 +660,8 @@ Task<void> log_service_actor(
         }
       }
     }
- 
-    if (!found_work) [[unlikely]] {
+
+    if (!found_work) {
       util::cpu_pause();
     }
   }
@@ -693,7 +756,7 @@ static Test_run_result test_throughput_actor_model_single_run(const Test_config&
     return result;
   };
 
-  wal::Log_service_setup<Payload_type, Scheduler_type> service_setup(producers, config.m_io_threads);
+  wal::Log_service_setup<Payload_type, Scheduler_type> service_setup(producers, config.m_io_threads, config.m_pin_threads);
 
   std::vector<util::Pid> producer_pids;
   for (std::size_t i = 0; i < producers; ++i) {
@@ -753,6 +816,8 @@ static Test_run_result test_throughput_actor_model_single_run(const Test_config&
   service_ctx.m_sched = &service_setup.m_sched;
   service_ctx.m_processor = &msg_processor;
   service_ctx.m_num_producers = producers;
+  service_ctx.m_reduction_budget = 0;
+  service_setup.m_sched.m_round_robin_drain = config.m_round_robin_drain;
 
   /* Use simple lambda when writes are disabled, matching test_actor_model exactly */
   detach(log_service_actor(service_ctx, std::ref(start_flag)));
@@ -1002,6 +1067,8 @@ static void print_usage(const char* program_name) noexcept {
                "      --pool-size NUM        Number of buffers in pool (default: 32, must be power of 2)\n"
                "      --io-queue-size NUM     Size of IO operations queue (default: pool_size * 2, must be power of 2)\n"
                "      --io-threads NUM        Number of I/O threads for background writes/syncs (default: 1)\n"
+               "      --pin-threads           Pin worker threads to CPUs (Linux only, default: off)\n"
+               "      --round-robin-drain     Force consumer to scan all mailboxes each loop (reduces jitter)\n"
                "      --timeout-ms NUM     Timeout in milliseconds (0 disables, default: 3000)\n"
                "  -f, --fdatasync-interval NUM Send sync messages with probability NUM (0.0-1.0, e.g., 0.3 = 30%%, default: 0)\n"
                "      --use-fsync          Use fsync messages instead of fdatasync (default: fdatasync)\n"
@@ -1032,6 +1099,8 @@ int main(int argc, char** argv) {
     {"pool-size", required_argument, nullptr, 1007},
     {"io-queue-size", required_argument, nullptr, 1008},
     {"io-threads", required_argument, nullptr, 1009},
+    {"pin-threads", no_argument, nullptr, 1011},
+    {"round-robin-drain", no_argument, nullptr, 1012},
     {"timeout-ms", required_argument, nullptr, 'T'},
     {"fdatasync-interval", required_argument, nullptr, 'f'},
     {"use-fsync", no_argument, nullptr, 1005},
@@ -1090,6 +1159,12 @@ int main(int argc, char** argv) {
         if (config.m_io_threads == 0) {
           config.m_io_threads = 1;
         }
+        break;
+      case 1011:
+        config.m_pin_threads = true;
+        break;
+      case 1012:
+        config.m_round_robin_drain = true;
         break;
       case 'T':
         config.m_timeout_ms = std::stoull(optarg);

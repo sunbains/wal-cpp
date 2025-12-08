@@ -150,6 +150,7 @@ Task<void> consumer_actor(
   std::size_t completed_producers = 0;
   util::Message_envelope<Payload_size_t> msg;
   std::size_t no_work_iterations = 0;
+  std::size_t next_active_queue{0};
 
   constexpr std::size_t bulk_read_size = 64;
   std::array<std::size_t, bulk_read_size> notification_buffer;
@@ -177,11 +178,25 @@ Task<void> consumer_actor(
     std::size_t num_notifications = 0;
     std::size_t notified_mailbox_idx = 0;
     
-    while (num_notifications < bulk_read_size && sched->m_mailboxes->m_notify_queue->dequeue(notified_mailbox_idx)) {
-      notification_buffer[num_notifications++] = notified_mailbox_idx;
+    const std::size_t n_workers = sched->m_mailboxes->m_active_queues.size();
+    for (std::size_t q = 0; q < n_workers && num_notifications < bulk_read_size; ++q) {
+      const std::size_t qid = (next_active_queue + q) % n_workers;
+      while (num_notifications < bulk_read_size &&
+             sched->m_mailboxes->dequeue_active(qid, notified_mailbox_idx)) {
+        notification_buffer[num_notifications++] = notified_mailbox_idx;
+      }
+    }
+    if (n_workers > 0) {
+      next_active_queue = (next_active_queue + 1) % n_workers;
+    }
+    if (num_notifications > 1) {
+      std::sort(notification_buffer.begin(), notification_buffer.begin() + num_notifications);
     }
 
     for (std::size_t i = 0; i < num_notifications; ++i) {
+      if (i > 0 && notification_buffer[i] == notification_buffer[i - 1]) {
+        continue;
+      }
       std::size_t mailbox_idx = notification_buffer[i];
 
       auto process_mbox = sched->m_mailboxes->get_for_process(mailbox_idx);
@@ -225,6 +240,7 @@ Task<void> consumer_actor(
 
       if (loop_exited_normally) {
         process_mbox->m_has_messages.store(false, std::memory_order_release);
+        sched->m_mailboxes->clear_pending_flag(mailbox_idx);
       }
       
       if (completed_producers >= num_producers) {
