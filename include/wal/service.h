@@ -76,7 +76,7 @@ struct Log_service_setup {
        thread_mailbox_capacity = std::bit_ceil(thread_mailbox_capacity);
      }
      /* One mailbox per producer to keep mailboxes SPSC and avoid contention */
-     m_thread_mailboxes.initialize(num_producers, thread_mailbox_capacity, num_producers);
+     m_thread_mailboxes.initialize(num_producers, thread_mailbox_capacity, num_producers, m_producer_pool.m_workers.size());
  
      m_sched.m_producer_pool = &m_producer_pool;
      m_sched.m_consumer_pool = &m_consumer_pool;

@@ -137,11 +137,12 @@ template<typename PayloadType>
 struct Process_mailboxes {
   using Mailbox_type = Process_mailbox<PayloadType>;
   
-  void initialize(std::size_t n_processes, std::size_t capacity, std::size_t n_producers = 0) {
+  void initialize(std::size_t n_processes, std::size_t capacity, std::size_t n_producers = 0, std::size_t n_workers = 0) {
     m_mailboxes.clear();
     m_pending_flags.reset();
     m_pending_flags_size = n_processes;
     m_active_queues.clear();
+    m_worker_index.clear();
 
     for (std::size_t i = 0; i < n_processes; ++i) {
       m_mailboxes.push_back(std::make_unique<Mailbox_type>(capacity));
@@ -162,15 +163,19 @@ struct Process_mailboxes {
       notify_capacity = std::max<std::size_t>(n_processes * 8, 1024);
     }
     notify_capacity = std::bit_ceil(notify_capacity);
-    /* Build per-worker queues to reduce contention */
-    const std::size_t n_workers = std::max<std::size_t>(std::size_t(1), n_processes);
-    m_active_queues.reserve(n_workers);
-    for (std::size_t i = 0; i < n_workers; ++i) {
+    /* Build per-worker queues to reduce contention; default to mailboxes if workers not provided */
+    const std::size_t workers = (n_workers > 0) ? n_workers : n_processes;
+    m_active_queues.reserve(workers);
+    for (std::size_t i = 0; i < workers; ++i) {
       m_active_queues.push_back(std::make_unique<Bounded_queue<std::size_t>>(notify_capacity));
     }
     m_pending_flags = std::make_unique<std::atomic<bool>[]>(m_pending_flags_size);
     for (std::size_t i = 0; i < m_pending_flags_size; ++i) {
       m_pending_flags[i].store(false, std::memory_order_relaxed);
+    }
+    m_worker_index.resize(n_processes);
+    for (std::size_t pid = 0; pid < n_processes; ++pid) {
+      m_worker_index[pid] = (workers == 0) ? 0 : (pid % workers);
     }
   }
 
@@ -200,7 +205,8 @@ struct Process_mailboxes {
 
     mbox->m_has_messages.store(true, std::memory_order_release);
 
-    const std::size_t qid = (n_workers == 0) ? 0 : (process_id % n_workers);
+    const std::size_t qid = (process_id < m_worker_index.size()) ? m_worker_index[process_id]
+                             : ((n_workers == 0) ? 0 : (process_id % n_workers));
     auto& act_q = *m_active_queues[qid];
     [[maybe_unused]] auto ok = act_q.enqueue(process_id);
     (void)ok;
@@ -224,6 +230,7 @@ struct Process_mailboxes {
   std::vector<std::unique_ptr<Bounded_queue<std::size_t>>> m_active_queues;
   std::unique_ptr<std::atomic<bool>[]> m_pending_flags;
   std::size_t m_pending_flags_size{0};
+  std::vector<std::size_t> m_worker_index;
 };
 
 /**
