@@ -71,6 +71,17 @@ inline int portable_fdatasync(int fd) {
 #endif
 }
 
+inline int portable_posix_fadvise(int fd, off_t offset, off_t len) {
+#if defined(POSIX_FADV_DONTNEED) && !defined(__APPLE__)
+  return ::posix_fadvise(fd, offset, len, POSIX_FADV_DONTNEED);
+#else
+  (void)fd;
+  (void)offset;
+  (void)len;
+  return 0;
+#endif
+}
+
 } // namespace
 
 util::Logger<util::MT_logger_writer> g_logger(util::MT_logger_writer{std::cerr}, util::Log_level::Trace);
@@ -299,7 +310,7 @@ inline wal::Result<bool> Sync_callable::operator()() const noexcept {
 
       /* Drop cache for all data written up to current HWM (best effort) */
       if (m_sync_offset > 0) {
-        ::posix_fadvise(m_fd, 0, static_cast<off_t>(m_sync_offset), POSIX_FADV_DONTNEED);
+        portable_posix_fadvise(m_fd, 0, static_cast<off_t>(m_sync_offset));
       }
       return wal::Result<bool>(true);
     }
