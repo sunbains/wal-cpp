@@ -104,7 +104,7 @@ struct Test_config {
  * Erlang-style Actor Model for Log Service
  * - Each producer/consumer has its own SPSC mailbox
  * - Processes self-schedule into thread mailboxes when they have messages
- * - Consumer is a regular thread (not coroutine) that writes to WAL (like test_log_io_simple producer)
+ * - Consumer is a coroutine that writes to WAL (like test_log_io_simple producer)
  * - Consumer drains from thread mailboxes and writes to log
  */
 
@@ -140,12 +140,14 @@ struct Consumer_context {
   bool m_disable_log_writes;
   util::Thread_pool* m_consumer_pool;
   util::Thread_pool* m_io_pool;
-  Process_type* m_consumer_process;  /* Consumer's mailbox for poison pills */
+  /** Consumer's process for poison pills */
+  Process_type* m_consumer_process;
   Scheduler_type* m_sched;
-  Log_message_processor* m_processor;  /* Pass by pointer so we can call write_and_fdatasync/fsync */
+  /** Pass by pointer so we can call write_and_fdatasync/fsync */
+  Log_message_processor* m_processor;
   std::size_t m_num_producers;
-  std::chrono::milliseconds m_batch_timeout{std::chrono::milliseconds(10)};
   bool m_enable_batch_dequeue{false};
+  /** Batch size for batch dequeue, only used if m_enable_batch_dequeue is true */
   std::size_t m_batch_size{32};
 };
 
@@ -336,6 +338,43 @@ Task<void> producer_actor(Producer_context ctx, std::size_t num_items, std::atom
   co_return;
 }
 
+/* Process a single message and return true if processing should continue, false to stop */
+[[nodiscard]] inline bool process_single_message(
+  const util::Message_envelope<Payload_type>& msg,
+  Consumer_context& ctx,
+  std::size_t& completed_producers,
+  bool& loop_exited_normally
+) noexcept {
+  if (std::holds_alternative<util::Poison_pill>(msg.m_payload)) [[unlikely]] {
+    ++completed_producers;
+    if (completed_producers >= ctx.m_num_producers) {
+      loop_exited_normally = false;
+      return false;
+    }
+    return true;
+  }
+  
+  if (std::holds_alternative<wal::Fdatasync>(msg.m_payload)) {
+    if constexpr (requires { ctx.m_processor->write_and_fdatasync(); }) {
+      ctx.m_processor->write_and_fdatasync();
+    }
+    return true;
+  }
+  
+  if (std::holds_alternative<wal::Fsync>(msg.m_payload)) {
+    if constexpr (requires { ctx.m_processor->write_and_fsync(); }) {
+      ctx.m_processor->write_and_fsync();
+    }
+    return true;
+  }
+  
+  if (std::holds_alternative<Payload_type>(msg.m_payload)) {
+    process_payload_message(*ctx.m_processor, std::get<Payload_type>(msg.m_payload), msg);
+  }
+  
+  return true;
+}
+
 /* Consumer coroutine - runs on thread pool and writes to log */
 Task<void> consumer_actor(
   Consumer_context ctx,
@@ -407,72 +446,16 @@ Task<void> consumer_actor(
         if (ctx.m_enable_batch_dequeue) {
           /* Batch dequeue mode - loop until mailbox is drained using lambda API */
           while (proc->m_mailbox.dequeue_batch(ctx.m_batch_size, [&](auto& batch_msg) {
-            if (std::holds_alternative<util::Poison_pill>(batch_msg.m_payload)) [[unlikely]] {
-              ++completed_producers;
-
-              if (completed_producers >= ctx.m_num_producers) {
-                loop_exited_normally = false;
-                return false;  // Stop processing
-              }
-            } else {
-              /* Check for Fdatasync */
-              if (std::holds_alternative<wal::Fdatasync>(batch_msg.m_payload)) {
-                /* Flush batch and call fdatasync */
-                if constexpr (requires { ctx.m_processor->write_and_fdatasync(); }) {
-                  ctx.m_processor->write_and_fdatasync();
-                }
-                return true;  // Continue processing
-              }
-              /* Check for Fsync */
-              if (std::holds_alternative<wal::Fsync>(batch_msg.m_payload)) {
-                /* Flush batch and call fsync */
-                if constexpr (requires { ctx.m_processor->write_and_fsync(); }) {
-                  ctx.m_processor->write_and_fsync();
-                }
-                return true;  // Continue processing
-              }
-              /* Regular payload message */
-              if (std::holds_alternative<Payload_type>(batch_msg.m_payload)) {
-                process_payload_message(*ctx.m_processor, std::get<Payload_type>(batch_msg.m_payload), batch_msg);
-              }
-            }
-            return true;  // Continue processing
+            return process_single_message(batch_msg, ctx, completed_producers, loop_exited_normally);
           }) > 0) {
             if (completed_producers >= ctx.m_num_producers) {
               break;
             }
           }
         } else {
-          /* Single dequeue mode (original behavior) */
           while (proc->m_mailbox.dequeue(msg)) {
-            if (std::holds_alternative<util::Poison_pill>(msg.m_payload)) [[unlikely]] {
-              ++completed_producers;
-
-              if (completed_producers >= ctx.m_num_producers) {
-                loop_exited_normally = false;
-                break;
-              }
-            } else {
-              /* Check for Fdatasync */
-              if (std::holds_alternative<wal::Fdatasync>(msg.m_payload)) {
-                /* Flush batch and call fdatasync */
-                if constexpr (requires { ctx.m_processor->write_and_fdatasync(); }) {
-                  ctx.m_processor->write_and_fdatasync();
-                }
-                continue;
-              }
-              /* Check for Fsync */
-              if (std::holds_alternative<wal::Fsync>(msg.m_payload)) {
-                /* Flush batch and call fsync */
-                if constexpr (requires { ctx.m_processor->write_and_fsync(); }) {
-                  ctx.m_processor->write_and_fsync();
-                }
-                continue;
-              }
-              /* Regular payload message */
-              if (std::holds_alternative<Payload_type>(msg.m_payload)) {
-                process_payload_message(*ctx.m_processor, std::get<Payload_type>(msg.m_payload), msg);
-              }
+            if (!process_single_message(msg, ctx, completed_producers, loop_exited_normally)) {
+              break;
             }
           }
         }
@@ -694,7 +677,6 @@ static double test_throughput_actor_model_single_run(const Test_config& config) 
     .m_sched = nullptr,  /* Will be set after processor is created */
     .m_processor = nullptr,  /* Will be set after processor is created */
     .m_num_producers = 0,  /* Will be set after processor is created */
-    .m_batch_timeout = std::chrono::milliseconds(10),
     .m_enable_batch_dequeue = config.m_enable_batch_dequeue,
     .m_batch_size = config.m_batch_size
   };
@@ -730,7 +712,6 @@ static double test_throughput_actor_model_single_run(const Test_config& config) 
   consumer_ctx.m_sched = &service_setup.m_sched;
   consumer_ctx.m_processor = &msg_processor;
   consumer_ctx.m_num_producers = producers;
-  consumer_ctx.m_batch_timeout = std::chrono::milliseconds(10);  /* Flush batch every 10ms */
 
   /* Use simple lambda when writes are disabled, matching test_actor_model exactly */
   /* Pass processor by reference so timer can call write_and_fdatasync/fsync */
