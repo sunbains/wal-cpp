@@ -18,6 +18,7 @@
 
 #include <cassert>
 #include <cstring>
+#include <cerrno>
 #include <vector>
 #include <thread>
 #include <atomic>
@@ -48,6 +49,27 @@
 #include "wal/io.h"
 #include "wal/service.h"
 #include "wal/wal.h"
+
+namespace {
+
+inline int portable_posix_fallocate(int fd, off_t offset, off_t len) {
+#if defined(__APPLE__)
+  const off_t end = offset + len;
+  return (::ftruncate(fd, end) == 0) ? 0 : errno;
+#else
+  return ::posix_fallocate(fd, offset, len);
+#endif
+}
+
+inline int portable_fdatasync(int fd) {
+#if defined(__APPLE__)
+  return ::fsync(fd);
+#else
+  return ::fdatasync(fd);
+#endif
+}
+
+} // namespace
 
 util::Logger<util::MT_logger_writer> g_logger(util::MT_logger_writer{std::cerr}, util::Log_level::Trace);
 
@@ -244,7 +266,7 @@ inline wal::Result<bool> Sync_callable::operator()() const noexcept {
   if (m_processor->m_log_file != nullptr && m_processor->m_log_file->m_fd != -1) {
     int result = -1;
     if (m_sync_type == wal::Sync_type::Fdatasync) [[likely]] {
-      result = ::fdatasync(m_processor->m_log_file->m_fd);
+      result = portable_fdatasync(m_processor->m_log_file->m_fd);
     } else if (m_sync_type == wal::Sync_type::Fsync) {
       result = ::fsync(m_processor->m_log_file->m_fd);
     }
@@ -568,7 +590,7 @@ static Test_run_result test_throughput_actor_model_single_run(const Test_config&
   WAL_ASSERT(log_file->m_fd != -1);
 
   if (!config.m_disable_writes) {
-    auto ret = ::posix_fallocate(log_file->m_fd, 0, log_file->m_max_file_size);
+    auto ret = portable_posix_fallocate(log_file->m_fd, 0, log_file->m_max_file_size);
     if (ret != 0) {
       log_fatal("Failed to preallocate log file: {}", std::strerror(errno));
     }

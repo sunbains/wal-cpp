@@ -112,8 +112,8 @@ void Buffer::clear(lsn_t start_lsn, lsn_t end_lsn) noexcept {
 
   /* Clear blocks from first_block_no up to (but not including) last_block_no */
   /* This ensures we don't clear the block at end_lsn */
-  const auto n_blocks_to_clear = last_block_no - first_block_no;
-  [[maybe_unused]] auto n_bytes_to_clear = n_blocks_to_clear * sizeof(Block_header);
+  const auto n_blocks_to_clear = static_cast<std::size_t>(last_block_no - first_block_no);
+  auto n_bytes_to_clear = n_blocks_to_clear * sizeof(Block_header);
 
   WAL_ASSERT(n_bytes_to_clear <= sizeof(Block_header) * m_config.m_n_blocks);
 
@@ -124,7 +124,7 @@ void Buffer::clear(lsn_t start_lsn, lsn_t end_lsn) noexcept {
     using uptrdiff_t = std::make_unsigned_t<std::ptrdiff_t>;
 
     WAL_ASSERT(sizeof(Block_header) * n_blocks_to_clear >= n_bytes_to_clear);
-    const auto len = std::min(n_bytes_to_clear, uptrdiff_t(end_ptr - ptr) * sizeof(Block_header));
+    const auto len = std::min<std::size_t>(n_bytes_to_clear, uptrdiff_t(end_ptr - ptr) * sizeof(Block_header));
     std::memset(ptr, 0, len);
     n_bytes_to_clear -= len;
   }
@@ -157,7 +157,8 @@ std::size_t prepare_batch(Buffer& buffer, block_no_t start, block_no_t end, std:
     auto [header, span, crc32] = buffer.get_block(block_index);
 
     header->set_block_no(block_no);
-    header->set_data_len(std::uint16_t(std::min(remaining_data_len, data_size)));
+    const auto chunk_len = static_cast<std::size_t>(std::min<lsn_t>(remaining_data_len, static_cast<lsn_t>(data_size)));
+    header->set_data_len(static_cast<std::uint16_t>(chunk_len));
 
     const auto is_last_block = header->get_block_no() == end;
 
@@ -216,8 +217,8 @@ Result<lsn_t> Buffer::write_to_store(Write_callback callback, lsn_t max_write_ls
   const auto write_limit_lsn = (max_write_lsn > 0) ? std::min(m_hwm, max_write_lsn) : m_hwm;
   const auto n_bytes_to_flush = write_limit_lsn - m_lwm;
 
-  auto n_blocks_to_flush = (n_bytes_to_flush + data_size - 1) / data_size;
-  const auto last_block_no = static_cast<block_no_t>(block_start_no + n_blocks_to_flush - 1);
+  auto n_blocks_to_flush = static_cast<std::size_t>((n_bytes_to_flush + data_size - 1) / data_size);
+  const auto last_block_no = static_cast<block_no_t>(block_start_no + static_cast<block_no_t>(n_blocks_to_flush - 1));
 
   /* Limit batch size to what iovecs array can hold */
   const auto iovecs_size = m_iovecs.size();

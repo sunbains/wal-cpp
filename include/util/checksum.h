@@ -36,6 +36,11 @@ inline size_t get_cpuid(uint32_t level, uint32_t& eax, uint32_t& ebx, uint32_t& 
 #if defined(__x86_64__) || defined(_M_X64)
     return static_cast<size_t>(__get_cpuid(level, &eax, &ebx, &ecx, &edx));
 #else
+    (void)level;
+    (void)eax;
+    (void)ebx;
+    (void)ecx;
+    (void)edx;
     return 0;
 #endif
 }
@@ -128,6 +133,8 @@ inline crc32_t crc32c_hw(crc32_t crc, const void* data, size_t length) noexcept 
 
     return ~crc;
 #else
+    (void)data;
+    (void)length;
     return crc;
 #endif /* defined(__x86_64__) || defined(_M_X64) */
 }

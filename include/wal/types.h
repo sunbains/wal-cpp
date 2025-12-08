@@ -26,7 +26,9 @@
 #include <format>
 #include <cstdlib>
 #include <limits>
-#include <numa.h>
+#if defined(WAL_HAVE_LIBNUMA)
+#  include <numa.h>
+#endif
 
 #include "util/byte_order.h"
 #include "util/util.h"
@@ -251,6 +253,7 @@ struct Aligned_allocator {
 
     void* ptr = nullptr;
 
+#if defined(WAL_HAVE_LIBNUMA)
     /* Use NUMA-aware allocation if available, otherwise fall back to posix_memalign */
     if (numa_available() >= 0) {
       /* Allocate on local NUMA node for better performance.
@@ -259,7 +262,7 @@ struct Aligned_allocator {
        * This ensures memory is allocated on the local NUMA node for
        * better performance on NUMA systems. */
       ptr = numa_alloc_local(size);
-      
+
       if (ptr == nullptr) {
         /* Fallback to posix_memalign if NUMA allocation fails */
         if (::posix_memalign(&ptr, alignment, size) != 0) {
@@ -278,7 +281,9 @@ struct Aligned_allocator {
           }
         }
       }
-    } else {
+    } else
+#endif
+    {
       /* NUMA not available, use posix_memalign */
       if (::posix_memalign(&ptr, alignment, size) != 0) {
         throw std::bad_alloc();
@@ -293,7 +298,9 @@ struct Aligned_allocator {
       return;
     }
 
-    const size_type size = n * sizeof(T);
+#if !defined(WAL_HAVE_LIBNUMA)
+    (void)n;
+#endif
 
     /* Use NUMA deallocation if NUMA is available.
      * Note: numa_free must only be used for memory allocated by numa_alloc functions.
@@ -303,13 +310,17 @@ struct Aligned_allocator {
      * but we can't easily distinguish. However, on most systems, numa_free on
      * non-NUMA memory either works or is handled gracefully. For production use,
      * consider tracking allocation method if this becomes an issue. */
+#if defined(WAL_HAVE_LIBNUMA)
+    const size_type size = n * sizeof(T);
     if (numa_available() >= 0) {
       /* Use numa_free for NUMA-allocated memory.
        * This is safe for memory allocated by numa_alloc_local. */
       numa_free(p, size);
-    } else {
-      std::free(p);
+      return;
     }
+#endif
+
+    std::free(p);
   }
 
   template<typename U>

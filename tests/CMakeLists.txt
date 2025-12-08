@@ -39,7 +39,7 @@ else()
   set(TEST_COMPILE_OPTIONS
     -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion
     -Werror
-    -msse4.2
+    ${WAL_SIMD_FLAGS}
     -ggdb3
     -fno-omit-frame-pointer
     $<$<CONFIG:Debug>:-O0>
@@ -109,7 +109,7 @@ endif()
 
 # Linker options (non-MSVC): build-id and mold if present
 if(NOT MSVC)
-  set(TEST_LINK_OPTIONS -Wl,--build-id ${SANITIZER_LINK_FLAGS})
+  set(TEST_LINK_OPTIONS ${WAL_BUILD_ID_FLAG} ${SANITIZER_LINK_FLAGS})
 
   # Performance test gets LTO for non-Debug builds
   set(TEST_PERF_LINK_OPTIONS

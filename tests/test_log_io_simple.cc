@@ -19,6 +19,7 @@
 #include <cassert>
 #include <cstdio>
 #include <cstring>
+#include <cerrno>
 #include <vector>
 #include <thread>
 #include <atomic>
@@ -42,6 +43,19 @@
 
 /* Local logger instance for this test file */
 util::Logger<util::MT_logger_writer> g_logger(util::MT_logger_writer{std::cerr}, util::Log_level::Trace);
+
+namespace {
+
+inline int portable_posix_fallocate(int fd, off_t offset, off_t len) {
+#if defined(__APPLE__)
+  const off_t end = offset + len;
+  return (::ftruncate(fd, end) == 0) ? 0 : errno;
+#else
+  return ::posix_fallocate(fd, offset, len);
+#endif
+}
+
+} // namespace
 
 struct Test_config {
   std::size_t m_num_messages{1000000};
@@ -88,7 +102,7 @@ static void test_log_io_simple(const Test_config& config) {
   WAL_ASSERT(log_file->m_fd != -1);
 
   if (!config.m_disable_writes) {
-    auto ret = ::posix_fallocate(log_file->m_fd, 0, log_file->m_max_file_size);
+    auto ret = portable_posix_fallocate(log_file->m_fd, 0, log_file->m_max_file_size);
     if (ret != 0) {
       log_fatal("Failed to preallocate log file: {}", std::strerror(errno));
     }
@@ -220,4 +234,3 @@ int main(int argc, char* argv[]) {
   test_log_io_simple(config);
   return 0;
 }
-

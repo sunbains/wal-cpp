@@ -25,10 +25,10 @@
 #include <format>
 #include <functional>
 #include <iostream>
+#include <mutex>
 #include <source_location>
 #include <string>
 #include <string_view>
-#include <syncstream>
 #include <utility>
 
 namespace util {
@@ -178,7 +178,10 @@ struct MT_logger_writer {
   explicit MT_logger_writer(std::ostream &stream) noexcept : m_stream{&stream} {}
 
   void operator()(std::string_view msg) noexcept {
-    std::osyncstream{*m_stream} << msg;
+    static std::mutex mutex;
+    const std::lock_guard<std::mutex> lock{mutex};
+    *m_stream << msg;
+    m_stream->flush();
   }
 
  private:

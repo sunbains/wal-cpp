@@ -4,6 +4,7 @@ project(wal VERSION 0.1.0 LANGUAGES CXX)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
+include(CheckCXXCompilerFlag)
 
 # ------------------------------- Options -------------------------------------
 option(WAL_BUILD_TESTS "Build tests" ON)
@@ -102,6 +103,23 @@ if(NOT MSVC)
   endif()
 endif()
 
+# SIMD flags vary by architecture; enable SSE4.2 only where it is supported.
+set(WAL_SIMD_FLAGS "")
+if(NOT MSVC)
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i.86")
+    check_cxx_compiler_flag("-msse4.2" COMPILER_SUPPORTS_SSE42)
+    if(COMPILER_SUPPORTS_SSE42)
+      set(WAL_SIMD_FLAGS -msse4.2)
+    endif()
+  endif()
+endif()
+
+# Platform-specific linker flags
+set(WAL_BUILD_ID_FLAG "")
+if(NOT APPLE)
+  set(WAL_BUILD_ID_FLAG -Wl,--build-id)
+endif()
+
 # Option to enable/disable __atomic builtins (default: OFF, use std::atomic)
 option(WAL_USE_ATOMIC_BUILTINS "Use __atomic builtins instead of std::atomic (experimental)" OFF)
 if(WAL_USE_ATOMIC_BUILTINS AND NOT HAVE_ATOMIC_BUILTINS)
@@ -153,7 +171,7 @@ if(WAL_BUILD_LIB OR WAL_BUILD_TESTS)
     target_compile_options(wal PRIVATE
       -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion
       -Werror
-      -msse4.2
+      ${WAL_SIMD_FLAGS}
       $<$<CONFIG:Debug>:-g3 -O0 -ggdb3>
       $<$<CONFIG:Release>:-g -O3 -flto -march=native -mtune=native -fno-omit-frame-pointer>
       $<$<CONFIG:RelWithDebInfo>:-g -O3 -flto -fno-omit-frame-pointer>
@@ -167,7 +185,7 @@ if(WAL_BUILD_LIB OR WAL_BUILD_TESTS)
       target_link_options(wal PRIVATE -fuse-ld=mold)
     endif()
     target_link_options(wal PRIVATE
-      -Wl,--build-id
+      ${WAL_BUILD_ID_FLAG}
       # Enable LTO in linker for Release builds
       $<$<CONFIG:Release>:-flto>
       $<$<CONFIG:RelWithDebInfo>:-flto>
@@ -179,6 +197,7 @@ if(WAL_BUILD_LIB OR WAL_BUILD_TESTS)
   find_library(NUMA_LIBRARY numa)
   if(NUMA_LIBRARY)
     target_link_libraries(wal PRIVATE ${NUMA_LIBRARY})
+    target_compile_definitions(wal PRIVATE WAL_HAVE_LIBNUMA)
     message(STATUS "Found libnuma: ${NUMA_LIBRARY}")
   else()
     message(WARNING "libnuma not found - NUMA-aware allocation will be disabled")
