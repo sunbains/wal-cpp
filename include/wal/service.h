@@ -58,12 +58,12 @@ struct Producer_context_base {
 /**
  * Common test setup - creates thread pool, mailboxes, and scheduler
  */
- template<typename PayloadType, typename SchedulerType>
- struct Log_service_setup {
-   Log_service_setup(std::size_t num_producers)
-     : m_producer_pool(create_producer_pool_config(num_producers)),
-       m_consumer_pool(create_consumer_pool_config()),
-       m_io_pool(create_io_pool_config()) {
+template<typename PayloadType, typename SchedulerType>
+struct Log_service_setup {
+  Log_service_setup(std::size_t num_producers, std::size_t io_threads = 1)
+    : m_producer_pool(create_producer_pool_config(num_producers)),
+      m_consumer_pool(create_consumer_pool_config()),
+      m_io_pool(create_io_pool_config(io_threads)) {
      std::size_t hw_threads = std::thread::hardware_concurrency();
  
      if (hw_threads == 0) {
@@ -132,8 +132,8 @@ struct Producer_context_base {
      return consumer_pool_config;
    }
  
-   static util::Thread_pool::Config create_io_pool_config() {
-     util::Thread_pool::Config io_pool_config;
+  static util::Thread_pool::Config create_io_pool_config(std::size_t io_threads = 1) {
+    util::Thread_pool::Config io_pool_config;
  
      std::size_t hw_threads = std::thread::hardware_concurrency();
  
@@ -141,7 +141,7 @@ struct Producer_context_base {
        hw_threads = 4;
      }
  
-     io_pool_config.m_num_threads = 1;
+    io_pool_config.m_num_threads = std::max<std::size_t>(std::size_t(1), io_threads);
      io_pool_config.m_queue_capacity = 64;
  
      if (!std::has_single_bit(io_pool_config.m_queue_capacity)) {
