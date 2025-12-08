@@ -81,6 +81,15 @@ struct Pool {
   struct Entry;
   
   /**
+   * Type of the last operation enqueued to the IO queue.
+   */
+  enum class Last_io_op_type : std::uint8_t {
+    None,    /* No operation has been enqueued yet */
+    Write,   /* Last operation was a write */
+    Sync     /* Last operation was a sync (fdatasync/fsync) */
+  };
+  
+  /**
    * IO operation types that can be queued for serialized execution.
    * All operations are serialized through a single queue since we only configure one IO thread.
    */
@@ -248,6 +257,9 @@ struct Pool {
       [[maybe_unused]] auto ret = m_io_operations.enqueue(io_op);
       WAL_ASSERT(ret);
       
+      /* Track last operation type */
+      m_last_io_op_type.store(Last_io_op_type::Write, std::memory_order_release);
+      
       /* Start IO coroutine if not already running */
       bool expected = false;
       if (m_io_task_running.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
@@ -308,6 +320,9 @@ struct Pool {
     };
     [[maybe_unused]] auto ret = m_io_operations.enqueue(io_op);
     WAL_ASSERT(ret);
+    
+    /* Track last operation type */
+    m_last_io_op_type.store(Last_io_op_type::Sync, std::memory_order_release);
     
     /* Start IO coroutine if not already running */
     bool expected = false;
@@ -444,34 +459,46 @@ struct Pool {
   [[nodiscard]] std::size_t get_sync_write_count() const noexcept {
     return m_sync_write_count.load(std::memory_order_acquire);
   }
-
-  /* Background I/O coroutine that continuously processes buffers on the thread pool */
-  /* Currently active buffer - align to cache line to avoid false sharing with I/O threads */
+  
+  /**
+   * Get the type of the last operation enqueued to the IO queue.
+   * @return The type of the last IO operation (None, Write, or Sync).
+   */
+  [[nodiscard]] Last_io_op_type get_last_io_op_type() const noexcept {
+    return m_last_io_op_type.load(std::memory_order_acquire);
+  }
+  
+  /** Background I/O coroutine that continuously processes buffers on the thread pool.
+   * 
+   * Currently active buffer - align to cache line to avoid false sharing with I/O threads */
   alignas(kCLS) Entry* m_active{nullptr};
 
-  /* Storage for all buffer entries - manages lifetime */
+  /** Storage for all buffer entries - manages lifetime */
   std::vector<std::unique_ptr<Entry>> m_buffers;
 
-  /* Pool of available buffers */
+  /** Pool of available buffers */
   util::Bounded_queue<Entry*> m_free_buffers;
   
-  /* Queue of buffers waiting for I/O */
+  /** Queue of buffers waiting for I/O */
   util::Bounded_queue<Entry*> m_ready_for_io_buffers;
 
-  /* I/O process state - align to cache line to avoid false sharing */
+  /** I/O process state - align to cache line to avoid false sharing */
   alignas(kCLS) std::atomic<bool> m_io_thread_running{false};
 
-  /* Synchronous write callback for inline I/O when buffers exhausted */
+  /** Synchronous write callback for inline I/O when buffers exhausted */
   Buffer::Write_callback m_sync_write_callback;
 
-  /* Unified queue for all IO operations (writes, syncs, reads) - serialized execution */
+  /** Unified queue for all IO operations (writes, syncs, reads) - serialized execution */
   util::Bounded_queue<Io_operation> m_io_operations;
 
-  /* Flag to track if IO coroutine is running */
+  /** Flag to track if IO coroutine is running */
   alignas(kCLS) std::atomic<bool> m_io_task_running{false};
   
-  /* Counter for synchronous writes (when no free buffer available) */
+  /** Counter for synchronous writes (when no free buffer available) */
   alignas(kCLS) std::atomic<std::size_t> m_sync_write_count{0};
+  
+  /** Type of the last operation enqueued to the IO queue */
+  alignas(kCLS) std::atomic<Last_io_op_type> m_last_io_op_type{Last_io_op_type::None};
 };
 // NOLINTEND(clang-analyzer-optin.performance.Padding)
 

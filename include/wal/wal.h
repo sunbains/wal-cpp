@@ -74,6 +74,14 @@ struct [[nodiscard]] Log {
   [[nodiscard]] std::size_t get_sync_write_count() const noexcept {
     return m_pool->get_sync_write_count();
   }
+  
+  /**
+   * Get the type of the last operation enqueued to the IO queue.
+   * @return The type of the last IO operation (None, Write, or Sync).
+   */
+  [[nodiscard]] Pool::Last_io_op_type get_last_io_op_type() const noexcept {
+    return m_pool->get_last_io_op_type();
+  }
 
   /** Start the background I/O coroutine that continuously processes buffers.
    * 
