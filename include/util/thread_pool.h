@@ -46,9 +46,6 @@
 
 namespace util {
 
-// Thread-local worker ID for current thread (0 for non-worker threads)
-inline thread_local std::size_t g_thread_pool_worker_id = 0;
-
 #ifdef __linux__
 /**
  * Linux_parker - multi-waiter futex-based parking lot.
@@ -563,9 +560,6 @@ public:
 
 private:
   void worker_loop(std::size_t worker_id, std::stop_token stop_token) noexcept {
-    // Set thread-local worker ID for this thread
-    g_thread_pool_worker_id = worker_id;
-
     auto& wq = *m_worker_queues[worker_id];
     
     /* Return task to free list */
