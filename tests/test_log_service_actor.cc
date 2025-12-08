@@ -729,8 +729,6 @@ static Test_run_result test_throughput_actor_model_single_run(const Test_config&
     log_file  /* Pass log_file for direct sync operations */
   );
 
-  assert(config.m_num_consumers == 1);
-
   Log_message_processor msg_processor(
     service_ctx.m_log,
     service_ctx.m_io_pool,
@@ -983,7 +981,6 @@ static void print_usage(const char* program_name) noexcept {
                "  -m, --messages NUM       Number of messages per iteration (default: 1000000)\n"
                "  -i, --iterations NUM     Number of iterations to average (default: 1)\n"
                "  -p, --producers NUM      Number of producer actors (default: 1)\n"
-               "  -c, --consumers NUM       Number of consumer actors (default: 1)\n"
                "  -d, --disable-writes     Disable actual disk writes (default: off)\n"
                "  -w, --disable-log-writes Disable log->append() calls entirely (default: off)\n"
                "  -S, --skip-memcpy        Skip memcpy in write operation (default: off)\n"
@@ -1012,7 +1009,6 @@ int main(int argc, char** argv) {
     {"messages", required_argument, nullptr, 'm'},
     {"iterations", required_argument, nullptr, 'i'},
     {"producers", required_argument, nullptr, 'p'},
-    {"consumers", required_argument, nullptr, 'c'},
     {"disable-writes", no_argument, nullptr, 'd'},
     {"disable-log-writes", no_argument, nullptr, 'w'},
     {"skip-memcpy", no_argument, nullptr, 'S'},
@@ -1031,7 +1027,7 @@ int main(int argc, char** argv) {
 
   int opt;
   int option_index = 0;
-  while ((opt = getopt_long(argc, argv, "M:m:i:p:c:hwdSXL:R:T:f:bB:v", long_options, &option_index)) != -1) {
+  while ((opt = getopt_long(argc, argv, "M:m:i:p:hwdSXL:R:T:f:bB:v", long_options, &option_index)) != -1) {
     switch (opt) {
       case 'M':
         config.m_mailbox_size = std::stoull(optarg);
@@ -1044,9 +1040,6 @@ int main(int argc, char** argv) {
         break;
       case 'p':
         config.m_num_producers = std::stoull(optarg);
-        break;
-      case 'c':
-        config.m_num_consumers = std::stoull(optarg);
         break;
       case 'd':
         config.m_disable_writes = true;
