@@ -151,6 +151,7 @@ std::size_t prepare_batch(Buffer& buffer, block_no_t start, block_no_t end, std:
 
   auto remaining_data_len = total_data_len;
   auto block_index = block_no % buffer.m_config.m_n_blocks;
+  std::size_t bytes_prepared{};
 
   for (std::size_t i{}; i < n_slots; i += 3,  ++block_no) {
     auto [header, span, crc32] = buffer.get_block(block_index);
@@ -185,13 +186,14 @@ std::size_t prepare_batch(Buffer& buffer, block_no_t start, block_no_t end, std:
     buffer.m_iovecs[i + 2].iov_base = static_cast<void*>(crc32);
     buffer.m_iovecs[i + 2].iov_len = sizeof(crc32_t);
 
+    bytes_prepared += header->get_data_len();
     block_index = (block_index + 1) % buffer.m_config.m_n_blocks;
 
     WAL_ASSERT(remaining_data_len >= header->get_data_len());
     remaining_data_len -= header->get_data_len();
   }
 
-  return total_data_len;
+  return bytes_prepared;
 }
 
 } // anonymous namespace

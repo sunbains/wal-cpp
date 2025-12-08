@@ -38,6 +38,7 @@
 #include <vector>
 
 #include "coro/task.h"
+#include "util/util.h"
 #include "util/bounded_channel.h"
 #include "util/logger.h"
 #include "util/thread_pool.h"
@@ -250,6 +251,8 @@ struct Pool {
 
     Entry* free_entry_ptr{};
 
+    m_last_io_op_type.store(Last_io_op_type::Write, std::memory_order_release);
+
     if (m_free_buffers.dequeue(free_entry_ptr)) {
       /* Enqueue write operation to IO queue */
       Io_operation io_op;
@@ -258,7 +261,6 @@ struct Pool {
       WAL_ASSERT(ret);
       
       /* Track last operation type */
-      m_last_io_op_type.store(Last_io_op_type::Write, std::memory_order_release);
       
       /* Start IO coroutine if not already running */
       bool expected = false;
@@ -280,9 +282,6 @@ struct Pool {
       if (!result.has_value()) {
         log_fatal("IO task failed");
       }
-      
-      /* Reset last operation type since we did a synchronous write */
-      m_last_io_op_type.store(Last_io_op_type::None, std::memory_order_release);
     }
 
     m_active->m_state = Entry::State::In_use;
@@ -320,6 +319,8 @@ struct Pool {
       return;
     }
     
+    m_last_io_op_type.store(Last_io_op_type::Sync, std::memory_order_release);
+
     Io_operation io_op;
     io_op.m_op = Io_operation::Sync_op{
       .m_sync_type = sync_type,
@@ -329,8 +330,8 @@ struct Pool {
     [[maybe_unused]] auto ret = m_io_operations.enqueue(io_op);
     WAL_ASSERT(ret);
     
-    /* Track last operation type */
-    m_last_io_op_type.store(Last_io_op_type::Sync, std::memory_order_release);
+    /* Increment pending sync counter */
+    m_pending_sync_count.fetch_add(1, std::memory_order_release);
     
     /* Start IO coroutine if not already running */
     bool expected = false;
@@ -382,8 +383,8 @@ struct Pool {
           }
         }
         
-        /* Reset last operation type when a sync completes */
-        pool->m_last_io_op_type.store(Last_io_op_type::None, std::memory_order_release);
+        /* Decrement pending sync counter after callback is called */
+        pool->m_pending_sync_count.fetch_sub(1, std::memory_order_release);
         
       } else if (std::holds_alternative<Io_operation::Read_op>(io_op.m_op)) {
         /* Handle read operation - placeholder for future use */
@@ -436,6 +437,22 @@ struct Pool {
     return Result<bool>{true};
   }
 
+  /**
+   * Wait until the IO coroutine has processed all pending operations.
+   * Safe to call during shutdown after producers have stopped.
+   */
+  void wait_for_io_idle() noexcept {
+    for (;;) {
+      const bool io_running = m_io_task_running.load(std::memory_order_acquire);
+      const bool has_ops = !m_io_operations.empty();
+      const bool has_ready = !m_ready_for_io_buffers.empty();
+      if (!io_running && !has_ops && !has_ready) {
+        break;
+      }
+      util::cpu_pause();
+    }
+  }
+
   void shutdown() noexcept {
     WAL_ASSERT(m_active->m_state == Entry::State::In_use);
 
@@ -473,11 +490,11 @@ struct Pool {
   }
   
   /**
-   * Get the type of the last operation enqueued to the IO queue.
-   * @return The type of the last IO operation (None, Write, or Sync).
+   * Get the number of pending sync operations in the IO queue.
+   * @return The count of pending sync operations.
    */
-  [[nodiscard]] Last_io_op_type get_last_io_op_type() const noexcept {
-    return m_last_io_op_type.load(std::memory_order_acquire);
+  [[nodiscard]] std::size_t get_pending_sync_count() const noexcept {
+    return m_pending_sync_count.load(std::memory_order_acquire);
   }
   
   /** Background I/O coroutine that continuously processes buffers on the thread pool.
@@ -511,8 +528,10 @@ struct Pool {
   
   /** Type of the last operation enqueued to the IO queue */
   alignas(kCLS) std::atomic<Last_io_op_type> m_last_io_op_type{Last_io_op_type::None};
+  
+  /** Counter for pending sync operations in the IO queue */
+  alignas(kCLS) std::atomic<std::size_t> m_pending_sync_count{0};
 };
 // NOLINTEND(clang-analyzer-optin.performance.Padding)
 
 } // namespace wal
-

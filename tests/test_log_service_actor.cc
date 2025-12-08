@@ -130,6 +130,7 @@ using Scheduler_type = util::Scheduler_base<Payload_type>;
 struct Producer_context : public wal::Producer_context_base<Payload_type, Scheduler_type> {
   Sync_message_type m_sync_type{Sync_message_type::Fdatasync};
   bool m_track_latency{false};
+  bool m_disable_log_writes{false};
 };
 
 /* Forward declaration */
@@ -286,48 +287,57 @@ Task<void> producer_actor(Producer_context ctx, std::size_t num_items, std::atom
 
   ctx.m_proc->schedule_self(ctx.m_sched->m_mailboxes, n_mailboxes);
 
-  /* Use cheaper RNG seed - std::random_device is expensive */
-  std::mt19937 rng(static_cast<uint32_t>(reinterpret_cast<uintptr_t>(ctx.m_proc) ^ static_cast<uintptr_t>(std::chrono::steady_clock::now().time_since_epoch().count())));
-  std::uniform_int_distribution<std::size_t> dist(1, ctx.m_fdatasync_interval > 0 ? ctx.m_fdatasync_interval : 1);
+  auto enqueue_with_retry = [&](auto&& env_factory) {
+    while (true) {
+      auto env = env_factory();
+      if (ctx.m_proc->m_mailbox.enqueue(std::move(env))) [[likely]] {
+        /* Notify consumer only if not already scheduled. */
+        if (!ctx.m_proc->m_in_process_mailbox.load(std::memory_order_acquire)) {
+          ctx.m_proc->schedule_self(ctx.m_sched->m_mailboxes, n_mailboxes);
+        }
+        break;
+      }
+      /* Failed to enqueue (mailbox full) - notify consumer and retry. */
+      ctx.m_proc->schedule_self(ctx.m_sched->m_mailboxes, n_mailboxes);
+      util::cpu_pause();
+    }
+  };
 
   /* Send messages, randomly sending sync messages if interval is set */
   for (std::size_t i = 0; i < num_items; ++i) {
+    /* Always send the payload message */
+    const auto send_time = ctx.m_track_latency ? Clock::now() : Clock::time_point{};
+    enqueue_with_retry([&]() {
+      util::Message_envelope<Payload_type> env;
+      env.m_sender = ctx.m_self;
+      env.m_send_time = send_time;
+      env.m_payload = wal::Test_message{};
+      return env;
+    });
+
+    /* Optionally send an additional sync message */
+    if (ctx.m_fdatasync_interval > 0 &&
+        !ctx.m_disable_log_writes &&
+        ((i + 1) % ctx.m_fdatasync_interval == 0)) {
+      enqueue_with_retry([&]() {
+        util::Message_envelope<Payload_type> env;
+        env.m_sender = ctx.m_self;
+        if (ctx.m_sync_type == Sync_message_type::Fdatasync) {
+          env.m_payload = wal::Fdatasync{};
+        } else {
+          env.m_payload = wal::Fsync{};
+        }
+        return env;
+      });
+    }
+  }
+
+  enqueue_with_retry([&]() {
     util::Message_envelope<Payload_type> env;
     env.m_sender = ctx.m_self;
-    /* Only record send time if latency tracking is enabled - avoids expensive clock call */
-    if (ctx.m_track_latency) [[unlikely]] {
-      env.m_send_time = Clock::now();
-    }
-
-    /* Send sync message randomly with 1/fdatasync_interval probability if interval is set */
-    if (ctx.m_fdatasync_interval > 0 && dist(rng) == 1) {
-      if (ctx.m_sync_type == Sync_message_type::Fdatasync) {
-        env.m_payload = wal::Fdatasync{};
-      } else {
-        env.m_payload = wal::Fsync{};
-      }
-    } else {
-      /* Direct construct in variant to avoid extra copy */
-      env.m_payload = wal::Test_message{};
-    }
-
-    if (ctx.m_proc->m_mailbox.enqueue(std::move(env))) [[likely]] {
-      continue;
-    }
-
-    /* Slow path: queue full - recreate env since it was moved */
-    do {
-      ctx.m_proc->schedule_self(ctx.m_sched->m_mailboxes, n_mailboxes);
-      util::cpu_pause();
-    } while (!ctx.m_proc->m_mailbox.enqueue(std::move(env)));
-  }
-
-  util::Message_envelope<Payload_type> term_env{.m_payload = util::Poison_pill{}, .m_sender = ctx.m_self};
-
-  while (!ctx.m_proc->m_mailbox.enqueue(std::move(term_env))) {
-    ctx.m_proc->schedule_self(ctx.m_sched->m_mailboxes, n_mailboxes);
-    util::cpu_pause();
-  }
+    env.m_payload = util::Poison_pill{};
+    return env;
+  });
 
   /* Schedule self after enqueueing poison pill so consumer can detect it */
   ctx.m_proc->schedule_self(ctx.m_sched->m_mailboxes, n_mailboxes);
@@ -552,7 +562,7 @@ static Test_run_result test_throughput_actor_model_single_run(const Test_config&
   const std::size_t base_per_producer = producers == 0 ? 0 : total_messages / producers;
   const std::size_t producer_remainder = producers == 0 ? 0 : total_messages % producers;
 
-  std::string path = config.m_disable_writes ? "/dev/null" : ("/local/tmp/test_actor.log");
+  std::string path = config.m_disable_writes ? "/dev/null" : ("/tmp/test_actor.log");
   auto log_file = std::make_shared<wal::Log_file>(path, 512 * 1024 * 1024, config.m_log_block_size, config.m_disable_writes);
 
   WAL_ASSERT(log_file->m_fd != -1);
@@ -699,6 +709,7 @@ static Test_run_result test_throughput_actor_model_single_run(const Test_config&
     producer_ctx.m_sched = &service_setup.m_sched;
     producer_ctx.m_fdatasync_interval = config.m_fdatasync_interval;
     producer_ctx.m_sync_type = config.m_sync_type;
+    producer_ctx.m_disable_log_writes = config.m_disable_log_writes;
     /* Enable latency tracking if metrics are enabled, producer latency is enabled, and log writes are not disabled */
     producer_ctx.m_track_latency = (!config.m_disable_metrics && 
                                     config.m_metrics_config.m_enable_producer_latency &&
@@ -749,6 +760,9 @@ static Test_run_result test_throughput_actor_model_single_run(const Test_config&
         !log->m_pool->m_active->m_buffer.is_empty()) {
       log->m_pool->prepare_buffer_for_io(log->m_pool->m_active, service_setup.m_io_pool, log->m_write_callback);
     }
+
+    /* Ensure all pending background I/O is complete before shutdown to avoid races. */
+    log->wait_for_io_idle();
 
     /* Use fdatasync callable for shutdown sync */
     WAL_ASSERT(log->shutdown(log_writer, &msg_processor.m_fdatasync_callable).has_value());

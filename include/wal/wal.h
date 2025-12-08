@@ -76,11 +76,18 @@ struct [[nodiscard]] Log {
   }
   
   /**
-   * Get the type of the last operation enqueued to the IO queue.
-   * @return The type of the last IO operation (None, Write, or Sync).
+   * Get the number of pending sync operations in the IO queue.
+   * @return The count of pending sync operations.
    */
-  [[nodiscard]] Pool::Last_io_op_type get_last_io_op_type() const noexcept {
-    return m_pool->get_last_io_op_type();
+  [[nodiscard]] std::size_t get_pending_sync_count() const noexcept {
+    return m_pool->get_pending_sync_count();
+  }
+
+  /** Wait until background IO has drained (writes + syncs). */
+  void wait_for_io_idle() noexcept {
+    if (m_pool != nullptr) {
+      m_pool->wait_for_io_idle();
+    }
   }
 
   /** Start the background I/O coroutine that continuously processes buffers.
@@ -160,7 +167,7 @@ struct [[nodiscard]] Log {
       auto sync_result = (*sync_callable)();
       if (!sync_result.has_value()) {
         /* Sync failed, return error */
-        return Result<bool>(sync_result.error());
+        return std::unexpected(sync_result.error());
       }
     }
     
@@ -230,12 +237,6 @@ struct [[nodiscard]] Log {
 };
 
 using Log_writer = Log::Write_callback;
-} // namespace wal
-
-// Include Pool definition for inline Log::append
-#include "wal/buffer_pool.h"
-
-namespace wal {
 
 inline Result<Log::Slot> Log::append(std::span<const std::byte> span, [[maybe_unused]] util::Thread_pool* thread_pool) noexcept {
   WAL_ASSERT(span.size() > 0);
