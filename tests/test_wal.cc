@@ -283,9 +283,14 @@ static void test_log_basic() {
   std::println("[test_log_basic] start");
   
   constexpr lsn_t initial_lsn = 0;
-  constexpr size_t pool_size = 4;
-  Log::Config config(4, 512);
-  Log log(initial_lsn, pool_size, config);
+  wal::Pool::Config pool_config;
+  pool_config.m_pool_size = 4;
+  wal::Buffer::Config buffer_config(4, 512);
+  wal::Log::Config config{
+    .m_pool_config = pool_config,
+    .m_buffer_config = buffer_config
+  };
+  Log log(initial_lsn, config);
   
   log.start_io(null_writer, nullptr);
 
@@ -305,9 +310,14 @@ static void test_log_write() {
   std::println("[test_log_write] start");
   
   constexpr lsn_t initial_lsn = 0;
-  constexpr size_t pool_size = 4;
-  Log::Config config(4, 512);
-  Log log(initial_lsn, pool_size, config);
+  wal::Pool::Config pool_config;
+  pool_config.m_pool_size = 4;
+  wal::Buffer::Config buffer_config(4, 512);
+  wal::Log::Config config{
+    .m_pool_config = pool_config,
+    .m_buffer_config = buffer_config
+  };
+  Log log(initial_lsn, config);
   
   log.start_io(null_writer, nullptr);
 
@@ -334,10 +344,15 @@ static void test_log_multiple_writes() {
   std::println("[test_log_multiple_writes] start");
   
   constexpr lsn_t initial_lsn = 0;
-  constexpr size_t pool_size = 4;
   constexpr size_t record_size = 26;
-  Log::Config config(4, 512);
-  Log log(initial_lsn, pool_size, config);
+  wal::Pool::Config pool_config;
+  pool_config.m_pool_size = 4;
+  wal::Buffer::Config buffer_config(4, 512);
+  wal::Log::Config config{
+    .m_pool_config = pool_config,
+    .m_buffer_config = buffer_config
+  };
+  Log log(initial_lsn, config);
   
   log.start_io(null_writer, nullptr);
 
@@ -451,9 +466,15 @@ static void test_log_write_performance() {
 
   using Clock = std::chrono::steady_clock;
 
-  wal::Config config(buffer_blocks, block_size, util::ChecksumAlgorithm::NONE);
+  wal::Pool::Config pool_config;
+  pool_config.m_pool_size = 1;
+  wal::Buffer::Config buffer_config(buffer_blocks, block_size, util::ChecksumAlgorithm::NONE);
+  wal::Log::Config config{
+    .m_pool_config = pool_config,
+    .m_buffer_config = buffer_config
+  };
 
-  Log log(0, 1, config);
+  Log log(0, config);
 
   log.start_io(null_writer, nullptr);
 

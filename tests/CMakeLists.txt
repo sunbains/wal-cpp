@@ -9,7 +9,6 @@ set(TEST_TARGETS
   wal_tests_actor_model
   wal_tests_log_service_actor
   wal_tests_log_io_simple
-  wal_tests_batch_dequeue
 )
 
 # Create all test executables
@@ -71,7 +70,6 @@ add_test(NAME wal.tests COMMAND wal_tests)
 add_test(NAME wal.tests.tp COMMAND wal_tests_tp)
 add_test(NAME wal.tests.spsc_per_producer COMMAND wal_tests_spsc_per_producer)
 add_test(NAME wal.tests.actor_model COMMAND wal_tests_actor_model)
-add_test(NAME wal.tests.batch_dequeue COMMAND wal_tests_batch_dequeue)
 
 # Link libraries
 find_package(Threads REQUIRED)

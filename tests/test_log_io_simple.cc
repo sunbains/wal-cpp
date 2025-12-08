@@ -95,9 +95,14 @@ static void test_log_io_simple(const Test_config& config) {
   }
 
   /* Create log with buffer pool */
-  const std::size_t buffer_pool_size = 4;
-  auto wal_config = wal::Config(config.m_log_buffer_size_blocks, config.m_log_block_size, util::ChecksumAlgorithm::CRC32C);
-  auto log = std::make_shared<wal::Log>(0, buffer_pool_size, wal_config);
+  wal::Pool::Config pool_config;
+  pool_config.m_pool_size = 4;
+  wal::Buffer::Config buffer_config(config.m_log_buffer_size_blocks, config.m_log_block_size, util::ChecksumAlgorithm::CRC32C);
+  wal::Log::Config log_config{
+    .m_pool_config = pool_config,
+    .m_buffer_config = buffer_config
+  };
+  auto log = std::make_shared<wal::Log>(0, log_config);
 
   Log_writer log_writer = [&](std::span<struct iovec> span) -> wal::Result<std::size_t> {
     auto result = log_file->write(span);
@@ -111,16 +116,16 @@ static void test_log_io_simple(const Test_config& config) {
 
   std::size_t pool_threads = std::max<std::size_t>(1, hw_threads / 2);
 
-  util::Thread_pool::Config pool_config;
+  util::Thread_pool::Config thread_pool_config;
 
-  pool_config.m_num_threads = pool_threads;
-  pool_config.m_queue_capacity = 32768;
+  thread_pool_config.m_num_threads = pool_threads;
+  thread_pool_config.m_queue_capacity = 32768;
 
-  if (!std::has_single_bit(pool_config.m_queue_capacity)) {
-    pool_config.m_queue_capacity = std::bit_ceil(pool_config.m_queue_capacity);
+  if (!std::has_single_bit(thread_pool_config.m_queue_capacity)) {
+    thread_pool_config.m_queue_capacity = std::bit_ceil(thread_pool_config.m_queue_capacity);
   }
 
-  util::Thread_pool pool(pool_config);
+  util::Thread_pool pool(thread_pool_config);
 
   /* Start the background I/O coroutine on thread pool */
   if (!config.m_disable_writes) {

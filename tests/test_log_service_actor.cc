@@ -79,6 +79,8 @@ struct Test_config {
   bool m_skip_memcpy{false};
   std::size_t m_log_block_size{4096};
   std::size_t m_log_buffer_size_blocks{16384};
+  std::size_t m_pool_size{32};
+  std::size_t m_io_queue_size{0};  // 0 means use pool_size * 2
   std::size_t m_timeout_ms{5000};
 
   /** Send fdatasync/fsync with probability 1/N (0 = disabled, calculated from probability) */
@@ -151,6 +153,17 @@ struct Consumer_context {
   std::size_t m_batch_size{32};
 };
 
+/* Forward declaration */
+struct Log_message_processor;
+
+/* Callable for sync operations (fdatasync/fsync) - defined before Log_message_processor
+ * but operator() implementation accesses Log_message_processor members */
+struct Sync_callable {
+  [[nodiscard]] wal::Result<bool> operator()() const noexcept;
+  Log_message_processor* m_processor;
+  wal::Sync_type m_sync_type;
+};
+
 /* Function object wrapper that stores values as members and calls static function */
 struct Log_message_processor {
   Log_message_processor() = default;
@@ -167,7 +180,9 @@ struct Log_message_processor {
       m_disable_log_writes(disable_log_writes),
       m_metrics(metrics),
       m_metrics_config(metrics_config),
-      m_log_file(log_file) {
+      m_log_file(log_file),
+      m_fdatasync_callable{this, wal::Sync_type::Fdatasync},
+      m_fsync_callable{this, wal::Sync_type::Fsync} {
   }
 
   void operator()(const Payload_type& payload, Clock::time_point send_time = Clock::time_point{}) noexcept{
@@ -189,26 +204,12 @@ struct Log_message_processor {
     }
   }
 
-  void write_and_fdatasync(int fd) {
-    std::function<wal::Result<bool>()> sync_callback = [fd]() -> wal::Result<bool> {
-      if (::fdatasync(fd) == 0) {
-        return wal::Result<bool>(true);
-      }
-      log_err("Failed to fdatasync log file: {}", std::strerror(errno));
-      return wal::Result<bool>(false);
-    };
-    m_log->request_sync(wal::Sync_type::Fdatasync, sync_callback);
+  void write_and_fdatasync(int) {
+    m_log->request_sync(wal::Sync_type::Fdatasync, &m_fdatasync_callable);
   }
 
-  void write_and_fsync(int fd) {
-    std::function<wal::Result<bool>()> sync_callback = [fd]() -> wal::Result<bool> {
-      if (::fsync(fd) == 0) {
-        return wal::Result<bool>(true);
-      }
-      log_err("Failed to fsync log file: {}", std::strerror(errno));
-      return wal::Result<bool>(false);
-    };
-    m_log->request_sync(wal::Sync_type::Fsync, sync_callback);
+  void write_and_fsync(int) {
+    m_log->request_sync(wal::Sync_type::Fsync, &m_fsync_callable);
   }
 
 public:
@@ -224,7 +225,49 @@ public:
   
   /** Log file for direct sync operations */
   std::shared_ptr<wal::Log_file> m_log_file{nullptr};
+  
+  /** Fdatasync callable - member to avoid lifetime issues */
+  Sync_callable m_fdatasync_callable;
+  
+  /** Fsync callable - member to avoid lifetime issues */
+  Sync_callable m_fsync_callable;
 };
+
+/* Implementation of Sync_callable::operator() - defined after Log_message_processor is complete */
+inline wal::Result<bool> Sync_callable::operator()() const noexcept {
+  Clock::time_point sync_start;
+  if (m_processor->m_metrics != nullptr) [[likely]] {
+    sync_start = Clock::now();
+  }
+  
+  if (m_processor->m_log_file != nullptr && m_processor->m_log_file->m_fd != -1) {
+    int result = -1;
+    if (m_sync_type == wal::Sync_type::Fdatasync) [[likely]] {
+      result = ::fdatasync(m_processor->m_log_file->m_fd);
+    } else if (m_sync_type == wal::Sync_type::Fsync) {
+      result = ::fsync(m_processor->m_log_file->m_fd);
+    }
+    
+    if (result == 0) [[likely]] {
+      if (m_processor->m_metrics != nullptr) [[likely]] {
+        auto sync_end = Clock::now();
+        auto sync_duration = std::chrono::duration_cast<std::chrono::nanoseconds>(sync_end - sync_start);
+        if (m_sync_type == wal::Sync_type::Fdatasync) {
+          m_processor->m_metrics->inc(util::MetricType::FdatasyncCount);
+          m_processor->m_metrics->add_timing(util::MetricType::FdatasyncTiming, sync_duration);
+        } else {
+          m_processor->m_metrics->inc(util::MetricType::FsyncCount);
+          m_processor->m_metrics->add_timing(util::MetricType::FsyncTiming, sync_duration);
+        }
+      }
+      return wal::Result<bool>(true);
+    }
+    const char* op_name = (m_sync_type == wal::Sync_type::Fdatasync) ? "fdatasync" : "fsync";
+    log_err("Failed to {} log file: {}", op_name, std::strerror(errno));
+    return wal::Result<bool>(false);
+  }
+  return wal::Result<bool>(true);
+}
 
 /** Producer actor - sends log messages to consumer
  * @param[in] ctx The producer context (contains fdatasync_interval, sync_type, and track_latency)
@@ -498,7 +541,12 @@ Task<void> consumer_actor(
   co_return;
 }
 
-static double test_throughput_actor_model_single_run(const Test_config& config) {
+struct Test_run_result {
+  double m_ops_per_sec;
+  std::size_t m_sync_write_count;
+};
+
+static Test_run_result test_throughput_actor_model_single_run(const Test_config& config) {
   const std::size_t total_messages = config.m_num_messages;
   const std::size_t producers = config.m_num_producers;
   const std::size_t base_per_producer = producers == 0 ? 0 : total_messages / producers;
@@ -520,12 +568,29 @@ static double test_throughput_actor_model_single_run(const Test_config& config) 
    * If buffer size is large (e.g., 16384 blocks), use more smaller buffers.
    * Aim for ~4-8MB per buffer instead of 64MB */
   const std::size_t target_buffer_size_blocks = std::min(config.m_log_buffer_size_blocks, std::size_t(2048));
-  const std::size_t buffer_pool_size = std::max(std::size_t(8), (config.m_log_buffer_size_blocks + target_buffer_size_blocks - 1) / target_buffer_size_blocks);
+  auto wal_buffer_config = wal::Buffer::Config(target_buffer_size_blocks, config.m_log_block_size, kChecksumAlgorithm);
+  
   /* Ensure pool size is a power of 2 */
-  const std::size_t log2_pool_size = static_cast<std::size_t>(std::ceil(std::log2(static_cast<double>(buffer_pool_size))));
-  const std::size_t buffer_pool_size_pow2 = std::size_t(1) << log2_pool_size;
-  auto wal_config = wal::Config(target_buffer_size_blocks, config.m_log_block_size, kChecksumAlgorithm);
-  auto log = std::make_shared<wal::Log>(0, buffer_pool_size_pow2, wal_config);
+  const std::size_t log2_pool_size = static_cast<std::size_t>(std::ceil(std::log2(static_cast<double>(config.m_pool_size))));
+  const std::size_t pool_size_pow2 = std::size_t(1) << log2_pool_size;
+  
+  /* Ensure IO queue size is a power of 2 */
+  std::size_t io_queue_size_pow2 = 0;
+  if (config.m_io_queue_size > 0) {
+    const std::size_t log2_io_queue_size = static_cast<std::size_t>(std::ceil(std::log2(static_cast<double>(config.m_io_queue_size))));
+    io_queue_size_pow2 = std::size_t(1) << log2_io_queue_size;
+  }
+  
+  wal::Pool::Config pool_config;
+  pool_config.m_pool_size = pool_size_pow2;
+  pool_config.m_io_queue_size = io_queue_size_pow2;
+  
+  wal::Log::Config log_config{
+    .m_pool_config = pool_config,
+    .m_buffer_config = wal_buffer_config
+  };
+  
+  auto log = std::make_shared<wal::Log>(0, log_config);
 
   /* Create metrics collector for write_to_store operations - always enabled unless explicitly disabled.
    * Write-to-store metrics are always collected; producer latency is controlled by Metrics_config */
@@ -685,7 +750,8 @@ static double test_throughput_actor_model_single_run(const Test_config& config) 
       log->m_pool->prepare_buffer_for_io(log->m_pool->m_active, service_setup.m_io_pool, log->m_write_callback);
     }
 
-    WAL_ASSERT(log->shutdown(log_writer).has_value());
+    /* Use fdatasync callable for shutdown sync */
+    WAL_ASSERT(log->shutdown(log_writer, &msg_processor.m_fdatasync_callable).has_value());
     
     /* Clear the I/O callback to break circular reference before log goes out of scope */
     /* The callback lambda captures metrics_ptr, but Log also stores it, creating a cycle */
@@ -693,6 +759,9 @@ static double test_throughput_actor_model_single_run(const Test_config& config) 
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
   }
   
+  /* Get sync write count before log goes out of scope */
+  const std::size_t sync_write_count = log->get_sync_write_count();
+
   /* Explicitly clear the log_writer lambda to break any remaining references */
   /* This ensures the lambda (which may capture log_file and metrics_ptr) is destroyed */
   log_writer = {};
@@ -712,11 +781,9 @@ static double test_throughput_actor_model_single_run(const Test_config& config) 
     /* Explicitly print sync metrics even if count is 0 for visibility */
     auto fdatasync_count = log->get_metrics()->get_counter(util::MetricType::FdatasyncCount);
     auto fsync_count = log->get_metrics()->get_counter(util::MetricType::FsyncCount);
-    auto consumer_sync_count = log->get_metrics()->get_counter(util::MetricType::ConsumerSyncCount);
     std::println("\nSync Operations:");
     std::println("  fdatasync.count: {}", fdatasync_count);
     std::println("  fsync.count: {}", fsync_count);
-    std::println("  consumer_sync.count: {}", consumer_sync_count);
     
     if (fdatasync_count > 0) {
       auto fdatasync_stats = log->get_metrics()->get_timing_stats(util::MetricType::FdatasyncTiming);
@@ -780,7 +847,7 @@ static double test_throughput_actor_model_single_run(const Test_config& config) 
     }
   }
 
-  return ops_per_sec;
+  return Test_run_result{.m_ops_per_sec = ops_per_sec, .m_sync_write_count = sync_write_count};
 }
 
 static void test_throughput_actor_model(const Test_config& config) {
@@ -790,12 +857,14 @@ static void test_throughput_actor_model(const Test_config& config) {
   double total_ops_per_sec = 0.0;
   double min_ops_per_sec = std::numeric_limits<double>::max();
   double max_ops_per_sec = 0.0;
+  std::size_t total_sync_write_count = 0;
 
   for (std::size_t run = 0; run < config.m_num_iterations; ++run) {
-    double ops_per_sec = test_throughput_actor_model_single_run(config);
-    total_ops_per_sec += ops_per_sec;
-    min_ops_per_sec = std::min(min_ops_per_sec, ops_per_sec);
-    max_ops_per_sec = std::max(max_ops_per_sec, ops_per_sec);
+    auto result = test_throughput_actor_model_single_run(config);
+    total_ops_per_sec += result.m_ops_per_sec;
+    min_ops_per_sec = std::min(min_ops_per_sec, result.m_ops_per_sec);
+    max_ops_per_sec = std::max(max_ops_per_sec, result.m_ops_per_sec);
+    total_sync_write_count += result.m_sync_write_count;
   }
 
   const double avg_ops_per_sec = total_ops_per_sec / static_cast<double>(config.m_num_iterations);
@@ -834,6 +903,11 @@ static void test_throughput_actor_model(const Test_config& config) {
   std::println("[test_throughput_actor_model] total_messages={}, iterations={}, elapsed={:.3f}s, throughput={:.2f} {}, ops={:.2f} {} (min={:.2f}, max={:.2f})",
                total_messages, config.m_num_iterations, avg_elapsed_s, throughput_value, throughput_unit,
                ops_value, ops_unit, min_ops_per_sec / 1'000'000.0, max_ops_per_sec / 1'000'000.0);
+  
+  /* Print sync write count */
+  if (total_sync_write_count > 0) {
+    std::println("[test_throughput_actor_model] sync_writes={} (no free buffer available)", total_sync_write_count);
+  }
 }
 
 static void print_usage(const char* program_name) noexcept {
@@ -853,6 +927,8 @@ static void print_usage(const char* program_name) noexcept {
                "      --no-producer-latency Disable producer latency tracking (most expensive metric)\n"
                "      --log-block-size NUM Size of each log block in bytes (default: 4096)\n"
                "      --log-buffer-blocks NUM Number of blocks in log buffer (default: 16384)\n"
+               "      --pool-size NUM        Number of buffers in pool (default: 32, must be power of 2)\n"
+               "      --io-queue-size NUM     Size of IO operations queue (default: pool_size * 2, must be power of 2)\n"
                "      --timeout-ms NUM     Timeout in milliseconds (0 disables, default: 3000)\n"
                "  -f, --fdatasync-interval NUM Send sync messages with probability NUM (0.0-1.0, e.g., 0.3 = 30%%, default: 0)\n"
                "      --use-fsync          Use fsync messages instead of fdatasync (default: fdatasync)\n"
@@ -927,6 +1003,12 @@ int main(int argc, char** argv) {
         break;
       case 'R':
         config.m_log_buffer_size_blocks = std::stoull(optarg);
+        break;
+      case 1007:
+        config.m_pool_size = std::stoull(optarg);
+        break;
+      case 1008:
+        config.m_io_queue_size = std::stoull(optarg);
         break;
       case 'T':
         config.m_timeout_ms = std::stoull(optarg);

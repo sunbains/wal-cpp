@@ -26,19 +26,28 @@ namespace wal {
 struct [[nodiscard]] Log {
   using Sync_type = wal::Sync_type;  /* Alias to namespace-level Sync_type */
 
-  using Config = Buffer::Config;
   using Slot = Buffer::Slot;
   using IO_vecs = Buffer::IO_vecs;
   using Write_callback = Buffer::Write_callback;
 
   /**
+   * Configuration for the Log.
+   */
+  struct Config {
+    /** Configuration for the buffer pool */
+    Pool::Config m_pool_config;
+    
+    /** Configuration for each buffer */
+    Buffer::Config m_buffer_config;
+  };
+
+  /**
    * Constructor.
    *
    * @param[in]  lsn The LSN to start the log from.
-   * @param[in]  pool_size The size of the pool to use for the Buffers.
-   * @param[in]  config The configuration for the circular buffer.
+   * @param[in]  config The configuration for the log (pool and buffer).
    */
-  Log(lsn_t lsn, size_t pool_size, const Buffer::Config &config);
+  Log(lsn_t lsn, const Config &config);
 
   ~Log() noexcept;
 
@@ -57,6 +66,14 @@ struct [[nodiscard]] Log {
   [[nodiscard]] bool is_full() const noexcept;
   [[nodiscard]] bool is_empty() const noexcept;
   [[nodiscard]] std::size_t margin() const noexcept;
+  
+  /**
+   * Get the number of synchronous writes that occurred due to no free buffer being available.
+   * @return The count of synchronous writes.
+   */
+  [[nodiscard]] std::size_t get_sync_write_count() const noexcept {
+    return m_pool->get_sync_write_count();
+  }
 
   /** Start the background I/O coroutine that continuously processes buffers.
    * 
@@ -76,11 +93,77 @@ struct [[nodiscard]] Log {
   /** Flush all pending and active buffers to the store and wait for them to complete.
 
    * @param[in] callback The callback function to write the data.
-   * @param[in] pool Thread pool for executing I/O operations. If nullptr, executes synchronously.
-
    * @return A Task that yields true if the write was successful, false otherwise.
    */
-  [[nodiscard]] Result<bool> shutdown(Write_callback callback) noexcept;
+  [[nodiscard]] inline Result<bool> shutdown(Write_callback callback) noexcept {
+    WAL_ASSERT(m_pool->m_active != nullptr);
+
+    /* Disable writes after this. */
+    m_pool->shutdown();
+
+    WAL_ASSERT(m_pool->m_active == nullptr);
+
+    /* Stop the I/O coroutine and wait for any remaining buffers to be processed */
+    m_pool->stop_io_coroutine();
+
+    /* Process any remaining buffers synchronously */
+    auto adapter = [callback](Buffer& buffer) -> Result<bool> {
+     return  buffer.write_to_store(callback);
+    };
+
+    auto result = m_pool->write_to_store(adapter);
+    
+    /* Clear callbacks to break circular references before Log destruction.
+     * The adapter lambda in m_io_callback captures 'this' and m_write_callback,
+     * which can create cycles if the callbacks are not cleared */
+    m_io_callback = {};
+    m_write_callback = {};
+    
+    return result;
+  }
+
+  /** Flush all pending and active buffers to the store and wait for them to complete.
+
+   * @param[in] callback The callback function to write the data.
+   * @param[in] sync_callable Sync callback to execute after the last write.
+   * @return A Task that yields true if the write was successful, false otherwise.
+   */
+  template<typename CallableType>
+  [[nodiscard]] Result<bool> shutdown(Write_callback callback, CallableType* sync_callable) noexcept {
+    WAL_ASSERT(m_pool->m_active != nullptr);
+
+    /* Disable writes after this. */
+    m_pool->shutdown();
+
+    WAL_ASSERT(m_pool->m_active == nullptr);
+
+    /* Stop the I/O coroutine and wait for any remaining buffers to be processed */
+    m_pool->stop_io_coroutine();
+
+    /* Process any remaining buffers synchronously */
+    auto adapter = [callback](Buffer& buffer) -> Result<bool> {
+     return  buffer.write_to_store(callback);
+    };
+
+    auto result = m_pool->write_to_store(adapter);
+    
+    /* If write was successful and sync callback is provided, execute sync */
+    if (result.has_value() && sync_callable != nullptr) {
+      auto sync_result = (*sync_callable)();
+      if (!sync_result.has_value()) {
+        /* Sync failed, return error */
+        return Result<bool>(sync_result.error());
+      }
+    }
+    
+    /* Clear callbacks to break circular references before Log destruction.
+     * The adapter lambda in m_io_callback captures 'this' and m_write_callback,
+     * which can create cycles if the callbacks are not cleared */
+    m_io_callback = {};
+    m_write_callback = {};
+    
+    return result;
+  }
 
   /**
    * Request a sync operation (fsync/fdatasync) to be executed after all pending writes.
@@ -89,7 +172,14 @@ struct [[nodiscard]] Log {
    * @param sync_type Type of sync operation (Fdatasync or Fsync).
    * @param sync_callback Callback that performs the sync operation (returns Result<bool>).
    */
-  void request_sync(Sync_type sync_type, std::function<Result<bool>()>& sync_callback) noexcept;
+  template<typename CallableType>
+  void request_sync(Sync_type sync_type, CallableType* sync_callable) noexcept {
+    if (sync_type == Sync_type::None || m_thread_pool == nullptr) {
+      return;
+    }
+    
+    m_pool->enqueue_sync_operation(sync_type, sync_callable, *m_thread_pool);
+  }
 
   /**
    * Convert the log state to a string.
@@ -131,7 +221,6 @@ struct [[nodiscard]] Log {
   std::atomic<lsn_t> m_flushed_lsn{0};
 };
 
-using Config = Log::Config;
 using Log_writer = Log::Write_callback;
 } // namespace wal
 

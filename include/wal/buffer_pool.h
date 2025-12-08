@@ -60,6 +60,24 @@ using Config = Buffer::Config;
  */
 // NOLINTBEGIN(clang-analyzer-optin.performance.Padding)
 struct Pool {
+  /**
+   * Configuration for the buffer pool.
+   */
+  struct Config {
+    /** Number of buffers in the pool (must be a power of 2, default: 32) */
+    std::size_t m_pool_size{32};
+    
+    /** Size of the IO operations queue (must be a power of 2, default: pool_size * 2) */
+    std::size_t m_io_queue_size{0};  // 0 means use pool_size * 2
+    
+    /**
+     * Get the actual IO queue size to use.
+     */
+    [[nodiscard]] std::size_t get_io_queue_size() const noexcept {
+      return m_io_queue_size == 0 ? m_pool_size * 2 : m_io_queue_size;
+    }
+  };
+  
   struct Entry;
   
   /**
@@ -76,7 +94,10 @@ struct Pool {
     /* Sync operation - fsync or fdatasync */
     struct Sync_op {
       Sync_type m_sync_type;
-      std::function<Result<bool>()>* m_sync_callback;
+      /* Pointer to callable that performs the sync operation */
+      void* m_sync_callable_ptr;
+      /* Function pointer to invoke the callable */
+      Result<bool>(*m_sync_invoke)(void*);
     };
     
     /* Read operation - placeholder for future use */
@@ -136,24 +157,29 @@ struct Pool {
   /**
   * Constructor.
   * 
-  * @param[in] pool_size Number of buffers in the pool (must be a power of 2)
-  * @param[in] config Configuration for each buffer
+  * @param[in] pool_config Configuration for the buffer pool
+  * @param[in] buffer_config Configuration for each buffer
   * @param[in] hwm Starting LSN for the first buffer
   */
-  Pool(std::size_t pool_size, const Config& config, lsn_t hwm)
-    : m_free_buffers(pool_size),
-      m_ready_for_io_buffers(pool_size),
+  Pool(const Config& pool_config, const Buffer::Config& buffer_config, lsn_t hwm)
+    : m_free_buffers(pool_config.m_pool_size),
+      m_ready_for_io_buffers(pool_config.m_pool_size),
       m_io_thread_running(false),
-      m_io_operations(pool_size * 2) {
+      m_io_operations(pool_config.get_io_queue_size()) {
 
-    if (!std::has_single_bit(pool_size)) {
+    if (!std::has_single_bit(pool_config.m_pool_size)) {
       throw std::invalid_argument("Pool size must be a power of 2");
     }
 
-    m_buffers.reserve(pool_size);
+    const auto io_queue_size = pool_config.get_io_queue_size();
+    if (!std::has_single_bit(io_queue_size)) {
+      throw std::invalid_argument("IO queue size must be a power of 2");
+    }
 
-    for (std::size_t i = 0; i < pool_size; ++i) {
-      m_buffers.emplace_back(std::make_unique<Entry>(Buffer(config), Entry::State::Free));
+    m_buffers.reserve(pool_config.m_pool_size);
+
+    for (std::size_t i = 0; i < pool_config.m_pool_size; ++i) {
+      m_buffers.emplace_back(std::make_unique<Entry>(Buffer(buffer_config), Entry::State::Free));
       if (!m_free_buffers.enqueue(m_buffers.back().get())) {
         std::terminate();
       }
@@ -231,7 +257,8 @@ struct Pool {
       m_active = free_entry_ptr;
       WAL_ASSERT(m_active->m_state == Entry::State::Free);
     } else {
-      log_warn("No free buffer available, doing synchronous write");
+      /* Increment counter for synchronous writes */
+      m_sync_write_count.fetch_add(1, std::memory_order_relaxed);
 
       WAL_ASSERT(write_callback && "I/O callback must be set via start_io");
 
@@ -250,20 +277,35 @@ struct Pool {
   }
 
   /**
+   * Helper function template to invoke a callable through a void pointer.
+   * This allows type-erased storage while maintaining type safety at call site.
+   */
+  template<typename CallableType>
+  static Result<bool> invoke_sync_callable(void* ptr) noexcept {
+    return (*static_cast<CallableType*>(ptr))();
+  }
+
+  /**
    * Enqueue a sync operation (fsync/fdatasync) to be executed after all pending writes.
    * The sync operation will be serialized with other IO operations through the IO queue.
    * 
+   * @tparam CallableType Type of callable that performs the sync operation (must have operator()() -> Result<bool>).
    * @param[in] sync_type Type of sync operation (Fdatasync or Fsync).
-   * @param[in] sync_callback Callback that performs the sync operation.
+   * @param[in] sync_callable Pointer to callable that performs the sync operation.
    * @param[in] thread_pool Thread pool for executing I/O operations.
    */
-  void enqueue_sync_operation(Sync_type sync_type, std::function<Result<bool>()>& sync_callback, util::Thread_pool& thread_pool) noexcept {
+  template<typename CallableType>
+  void enqueue_sync_operation(Sync_type sync_type, CallableType* sync_callable, util::Thread_pool& thread_pool) noexcept {
     if (sync_type == Sync_type::None) {
       return;
     }
     
     Io_operation io_op;
-    io_op.m_op = Io_operation::Sync_op{.m_sync_type = sync_type, .m_sync_callback = &sync_callback};
+    io_op.m_op = Io_operation::Sync_op{
+      .m_sync_type = sync_type,
+      .m_sync_callable_ptr = sync_callable,
+      .m_sync_invoke = &invoke_sync_callable<CallableType>
+    };
     [[maybe_unused]] auto ret = m_io_operations.enqueue(io_op);
     WAL_ASSERT(ret);
     
@@ -309,8 +351,8 @@ struct Pool {
         /* Handle sync operation */
         auto& sync_op = std::get<Io_operation::Sync_op>(io_op.m_op);
         
-        if ((sync_op.m_sync_callback != nullptr) && sync_op.m_sync_type != Sync_type::None) {
-          auto sync_result = (*sync_op.m_sync_callback)();
+        if (sync_op.m_sync_type != Sync_type::None && sync_op.m_sync_callable_ptr != nullptr && sync_op.m_sync_invoke != nullptr) {
+          auto sync_result = sync_op.m_sync_invoke(sync_op.m_sync_callable_ptr);
           if (!sync_result.has_value()) {
             log_fatal("Sync operation failed");
           }
@@ -363,7 +405,7 @@ struct Pool {
       [[maybe_unused]] auto ret = m_free_buffers.enqueue(entry_ptr);
       WAL_ASSERT(ret);
     }
-
+    
     return Result<bool>{true};
   }
 
@@ -394,6 +436,14 @@ struct Pool {
     }
     return stream.str();
   }
+  
+  /**
+   * Get the number of synchronous writes that occurred due to no free buffer being available.
+   * @return The count of synchronous writes.
+   */
+  [[nodiscard]] std::size_t get_sync_write_count() const noexcept {
+    return m_sync_write_count.load(std::memory_order_acquire);
+  }
 
   /* Background I/O coroutine that continuously processes buffers on the thread pool */
   /* Currently active buffer - align to cache line to avoid false sharing with I/O threads */
@@ -419,6 +469,9 @@ struct Pool {
 
   /* Flag to track if IO coroutine is running */
   alignas(kCLS) std::atomic<bool> m_io_task_running{false};
+  
+  /* Counter for synchronous writes (when no free buffer available) */
+  alignas(kCLS) std::atomic<std::size_t> m_sync_write_count{0};
 };
 // NOLINTEND(clang-analyzer-optin.performance.Padding)
 

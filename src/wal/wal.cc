@@ -353,39 +353,13 @@ Result<lsn_t> Buffer::read_from_store(lsn_t, Read_callback) noexcept {
   return Result<lsn_t>(0);
  }
 
- Log::Log(lsn_t lsn, size_t pool_size, const Buffer::Config &config)
-  : m_pool(std::make_unique<Pool>(pool_size, config, lsn)) {}
+ Log::Log(lsn_t lsn, const Config &config)
+  : m_pool(std::make_unique<Pool>(config.m_pool_config, config.m_buffer_config, lsn)) {}
 
  Log::~Log() noexcept {
   WAL_ASSERT(m_pool->m_active == nullptr);
  }
 
-Result<bool> Log::shutdown(Write_callback callback) noexcept {
-  WAL_ASSERT(m_pool->m_active != nullptr);
-
-  /* Disable writes after this. */
-  m_pool->shutdown();
-
-  WAL_ASSERT(m_pool->m_active == nullptr);
-
-  /* Stop the I/O coroutine and wait for any remaining buffers to be processed */
-  m_pool->stop_io_coroutine();
-
-  /* Process any remaining buffers synchronously */
-  auto adapter = [callback](Buffer& buffer) -> Result<bool> {
-   return  buffer.write_to_store(callback);
-  };
-
-  auto result = m_pool->write_to_store(adapter);
-  
-  /* Clear callbacks to break circular references before Log destruction.
-   * The adapter lambda in m_io_callback captures 'this' and m_write_callback,
-   * which can create cycles if the callbacks are not cleared */
-  m_io_callback = {};
-  m_write_callback = {};
-  
-  return result;
-}
 
 bool Log::is_full() const noexcept {
   WAL_ASSERT(m_pool->m_active != nullptr);
@@ -451,12 +425,5 @@ void Log::set_metrics(util::Metrics* metrics) noexcept {
   }
 }
 
-void Log::request_sync(Sync_type sync_type, std::function<Result<bool>()>& sync_callback) noexcept {
-  if (sync_type == Sync_type::None || m_thread_pool == nullptr) {
-    return;
-  }
-  
-  m_pool->enqueue_sync_operation(sync_type, sync_callback, *m_thread_pool);
-}
 
 } // namespace wal

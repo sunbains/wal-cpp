@@ -51,7 +51,6 @@ enum class MetricType : std::size_t {
   WriteToStoreBytesWritten,
   FdatasyncCount,   /* Number of fdatasync() calls */
   FsyncCount,       /* Number of fsync() calls */
-  ConsumerSyncCount, /* Number of sync operations performed synchronously from consumer thread */
   
   // Total count - must be last
   Count
@@ -420,7 +419,6 @@ public:
       case MetricType::WriteToStoreBytesWritten: return "write_to_store.bytes_written";
       case MetricType::FdatasyncCount: return "fdatasync.count";
       case MetricType::FsyncCount: return "fsync.count";
-      case MetricType::ConsumerSyncCount: return "consumer_sync.count";
       default: return "unknown";
     }
   }
