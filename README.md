@@ -76,6 +76,7 @@ Common flags:
 - `-b/--batch-dequeue`         batch dequeue mode
 - `-B/--batch-size NUM`        batch size when batch dequeue is enabled
 - `-v/--verbose`               increase metrics verbosity (repeatable)
+- `--producer-latency`         enable per-message latency metrics (disabled by default for speed)
 
 For full usage, run:
 ```bash

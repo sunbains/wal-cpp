@@ -92,7 +92,7 @@ using Log_writer = wal::Log_writer;
 using Clock = std::chrono::steady_clock;
 
 struct Metrics_config {
-  bool m_enable_producer_latency{true};  /* Most expensive - track per-message latency */
+  bool m_enable_producer_latency{false};  /* Opt-in: per-message latency tracking is expensive */
   
   /* Returns true if any metrics are enabled */
   [[nodiscard]] bool any_enabled() const noexcept {
@@ -994,7 +994,7 @@ static void print_usage(const char* program_name) noexcept {
                "  -w, --disable-log-writes Disable log->append() calls entirely (default: off)\n"
                "  -S, --skip-memcpy        Skip memcpy in write operation (default: off)\n"
                "  -X, --disable-metrics    Disable metrics collection entirely (default: off)\n"
-               "      --no-producer-latency Disable producer latency tracking (most expensive metric)\n"
+               "      --producer-latency    Enable per-message producer latency tracking (opt-in, expensive)\n"
                "      --log-block-size NUM Size of each log block in bytes (default: 4096)\n"
                "      --log-buffer-blocks NUM Number of blocks in log buffer (default: 16384)\n"
                "      --pool-size NUM        Number of buffers in pool (default: 32, must be power of 2)\n"
@@ -1022,7 +1022,7 @@ int main(int argc, char** argv) {
     {"disable-log-writes", no_argument, nullptr, 'w'},
     {"skip-memcpy", no_argument, nullptr, 'S'},
     {"disable-metrics", no_argument, nullptr, 'X'},
-    {"no-producer-latency", no_argument, nullptr, 1000},
+    {"producer-latency", no_argument, nullptr, 1000},
     {"log-block-size", required_argument, nullptr, 'L'},
     {"log-buffer-blocks", required_argument, nullptr, 'R'},
     {"timeout-ms", required_argument, nullptr, 'T'},
@@ -1063,7 +1063,7 @@ int main(int argc, char** argv) {
         config.m_disable_metrics = true;
         break;
       case 1000:
-        config.m_metrics_config.m_enable_producer_latency = false;
+        config.m_metrics_config.m_enable_producer_latency = true;
         break;
       case 'L':
         config.m_log_block_size = std::stoull(optarg);
