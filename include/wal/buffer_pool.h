@@ -178,6 +178,12 @@ struct Pool {
     }
   }
 
+  /* Delete copy and move operations - Pool is not copyable or movable */
+  Pool(Pool&&) = delete;
+  Pool(const Pool&) = delete;
+  Pool& operator=(Pool&&) = delete;
+  Pool& operator=(const Pool&) = delete;
+
   /**
   * Acquire a buffer from the pool for writing.
   * Blocks if no buffer is available.
@@ -268,14 +274,12 @@ struct Pool {
     }
   }
 
-  /* Delete copy and move operations - Pool is not copyable or movable */
-  Pool(Pool&&) = delete;
-  Pool(const Pool&) = delete;
-  Pool& operator=(Pool&&) = delete;
-  Pool& operator=(const Pool&) = delete;
-
   /* I/O coroutine function - processes all IO operations (writes, syncs, reads) from the queue.
    * All operations are serialized through the single queue since we only configure one IO thread.
+   * 
+   * @param[in] pool The pool instance to process the IO operations.
+   * @param[in] thread_pool The thread pool to execute the IO operations.
+   * @return A Task that yields true if the IO operations were successful, false otherwise.
    */
   static Task<void> io_coroutine_function(Pool* pool, [[maybe_unused]] util::Thread_pool* thread_pool) {
     Io_operation io_op;
@@ -323,21 +327,6 @@ struct Pool {
     pool->m_io_task_running.store(false, std::memory_order_release);
     
     co_return;
-  }
-
-  /**
-   * Start the background I/O coroutine that continuously processes buffers.
-   * The coroutine runs on the thread pool and processes buffers from m_ready_for_io_buffers.
-   * 
-   * NOTE: This method is deprecated. I/O orchestration is now controlled by Log.
-   * The Log sets m_io_thread_running directly.
-   */
-  template<typename CallbackType>
-  void start_io_coroutine(CallbackType callback) noexcept {
-    WAL_ASSERT(!m_io_thread_running.load(std::memory_order_acquire));
-    /* I/O callback is now stored in Log, not Pool */
-    m_io_thread_running = true;
-    (void)callback; /* Ignored - callback is stored in Log */
   }
 
   /**
