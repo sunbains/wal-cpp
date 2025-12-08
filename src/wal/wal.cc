@@ -113,7 +113,7 @@ void Buffer::clear(lsn_t start_lsn, lsn_t end_lsn) noexcept {
   /* Clear blocks from first_block_no up to (but not including) last_block_no */
   /* This ensures we don't clear the block at end_lsn */
   const auto n_blocks_to_clear = last_block_no - first_block_no;
-  auto n_bytes_to_clear = n_blocks_to_clear * sizeof(Block_header);
+  [[maybe_unused]] auto n_bytes_to_clear = n_blocks_to_clear * sizeof(Block_header);
 
   WAL_ASSERT(n_bytes_to_clear <= sizeof(Block_header) * m_config.m_n_blocks);
 
@@ -136,7 +136,6 @@ void Buffer::clear(lsn_t start_lsn, lsn_t end_lsn) noexcept {
   }
 
   WAL_ASSERT(n_bytes_to_clear == 0);
-  (void)n_bytes_to_clear;  // Silence clang-tidy warning in release builds where assert is disabled
 }
 
 namespace {
@@ -388,8 +387,6 @@ Result<bool> Log::shutdown(Write_callback callback) noexcept {
   return result;
 }
 
-
-
 bool Log::is_full() const noexcept {
   WAL_ASSERT(m_pool->m_active != nullptr);
   return m_pool->m_active->m_buffer.is_full();
@@ -412,11 +409,10 @@ void Log::start_io(Write_callback callback, util::Thread_pool* thread_pool) noex
   /* Store sync callback for inline I/O when buffers exhausted */
   m_pool->m_sync_write_callback = callback;
 
-  /* Create an adapter that converts Write_callback to a function that takes Buffer& and returns Result<lsn_t>.
-   * Tasks are posted directly by consumer, no background coroutine needed. */
+  /* Create an adapter that converts Write_callback to a function
+   * that takes Buffer& and returns Result<lsn_t>. Tasks are posted
+   * directly by consumer, no background coroutine needed. */
   auto adapter = [this](Buffer& buffer) -> Result<lsn_t> {
-    /* Write the full buffer - sync_target_lsn is just a marker for when to sync, not a write limit.
-     * We always write the full buffer to maintain buffer state consistency */
     return buffer.write_to_store(m_write_callback);
   };
 
@@ -426,7 +422,8 @@ void Log::start_io(Write_callback callback, util::Thread_pool* thread_pool) noex
 }
 
 Result<bool> Log::write_to_store(Write_callback callback) noexcept {
-  /* Create an adapter that converts Write_callback to a function that takes Buffer& and returns Result<bool> */
+  /* Create an adapter that converts Write_callback to a function
+   * that takes Buffer& and returns Result<bool>. */
   auto adapter = [callback](Buffer& buffer) -> Result<bool> {
     return buffer.write_to_store(callback, 0);
   };
@@ -454,7 +451,7 @@ void Log::set_metrics(util::Metrics* metrics) noexcept {
   }
 }
 
-void Log::request_sync(Sync_type sync_type, std::function<Result<bool>(Sync_type)>& sync_callback) noexcept {
+void Log::request_sync(Sync_type sync_type, std::function<Result<bool>()>& sync_callback) noexcept {
   if (sync_type == Sync_type::None || m_thread_pool == nullptr) {
     return;
   }

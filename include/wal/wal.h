@@ -87,9 +87,9 @@ struct [[nodiscard]] Log {
    * The sync operation will be serialized with other IO operations.
    * 
    * @param sync_type Type of sync operation (Fdatasync or Fsync).
-   * @param sync_callback Callback that performs the sync operation (takes Sync_type, returns Result<bool>).
+   * @param sync_callback Callback that performs the sync operation (returns Result<bool>).
    */
-  void request_sync(Sync_type sync_type, std::function<Result<bool>(Sync_type)>& sync_callback) noexcept;
+  void request_sync(Sync_type sync_type, std::function<Result<bool>()>& sync_callback) noexcept;
 
   /**
    * Convert the log state to a string.

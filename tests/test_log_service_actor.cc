@@ -189,56 +189,26 @@ struct Log_message_processor {
     }
   }
 
-  void write_and_fdatasync() {
-    if (m_log && m_io_pool && m_log->m_write_callback) {
-      if (m_log->m_pool && m_log->m_pool->m_active && !m_log->m_pool->m_active->m_buffer.is_empty()) {
-        m_log->m_pool->prepare_buffer_for_io(m_log->m_pool->m_active, *m_io_pool, m_log->m_write_callback);
+  void write_and_fdatasync(int fd) {
+    std::function<wal::Result<bool>()> sync_callback = [fd]() -> wal::Result<bool> {
+      if (::fdatasync(fd) == 0) {
+        return wal::Result<bool>(true);
       }
-      
-      [[maybe_unused]] auto result = m_log->write_to_store(m_log->m_write_callback);
-      WAL_ASSERT(result.has_value());
-      
-      if (m_log->m_pool && m_log->m_pool->m_active && !m_log->m_pool->m_active->m_buffer.is_empty() && m_log->m_pool->m_active->m_buffer.is_write_pending()) {
-        [[maybe_unused]] auto active_result = m_log->m_pool->m_active->m_buffer.write_to_store(m_log->m_write_callback, 0);
-        WAL_ASSERT(active_result.has_value());
-      }
-      
-      if (m_log_file && m_log_file->m_fd != -1 && m_metrics) {
-        auto sync_start = Clock::now();
-        if (::fdatasync(m_log_file->m_fd) == 0) {
-          auto sync_end = Clock::now();
-          auto sync_duration = std::chrono::duration_cast<std::chrono::nanoseconds>(sync_end - sync_start);
-          m_metrics->inc(util::MetricType::FdatasyncCount);
-          m_metrics->add_timing(util::MetricType::FdatasyncTiming, sync_duration);
-        }
-      }
-    }
+      log_err("Failed to fdatasync log file: {}", std::strerror(errno));
+      return wal::Result<bool>(false);
+    };
+    m_log->request_sync(wal::Sync_type::Fdatasync, sync_callback);
   }
 
-  void write_and_fsync() {
-    if (m_log && m_io_pool && m_log->m_write_callback) {
-      if (m_log->m_pool && m_log->m_pool->m_active && !m_log->m_pool->m_active->m_buffer.is_empty()) {
-        m_log->m_pool->prepare_buffer_for_io(m_log->m_pool->m_active, *m_io_pool, m_log->m_write_callback);
+  void write_and_fsync(int fd) {
+    std::function<wal::Result<bool>()> sync_callback = [fd]() -> wal::Result<bool> {
+      if (::fsync(fd) == 0) {
+        return wal::Result<bool>(true);
       }
-      
-      [[maybe_unused]] auto result = m_log->write_to_store(m_log->m_write_callback);
-      WAL_ASSERT(result.has_value());
-      
-      if (m_log->m_pool && m_log->m_pool->m_active && !m_log->m_pool->m_active->m_buffer.is_empty() && m_log->m_pool->m_active->m_buffer.is_write_pending()) {
-        [[maybe_unused]] auto active_result = m_log->m_pool->m_active->m_buffer.write_to_store(m_log->m_write_callback, 0);
-        WAL_ASSERT(active_result.has_value());
-      }
-      
-      if (m_log_file && m_log_file->m_fd != -1 && m_metrics) {
-        auto sync_start = Clock::now();
-        if (::fsync(m_log_file->m_fd) == 0) {
-          auto sync_end = Clock::now();
-          auto sync_duration = std::chrono::duration_cast<std::chrono::nanoseconds>(sync_end - sync_start);
-          m_metrics->inc(util::MetricType::FsyncCount);
-          m_metrics->add_timing(util::MetricType::FsyncTiming, sync_duration);
-        }
-      }
-    }
+      log_err("Failed to fsync log file: {}", std::strerror(errno));
+      return wal::Result<bool>(false);
+    };
+    m_log->request_sync(wal::Sync_type::Fsync, sync_callback);
   }
 
 public:
@@ -339,15 +309,19 @@ Task<void> producer_actor(Producer_context ctx, std::size_t num_items, std::atom
   }
   
   if (std::holds_alternative<wal::Fdatasync>(msg.m_payload)) {
-    if constexpr (requires { ctx.m_processor->write_and_fdatasync(); }) {
-      ctx.m_processor->write_and_fdatasync();
+    if constexpr (requires { ctx.m_processor->write_and_fdatasync(0); }) {
+      if (ctx.m_processor->m_log_file != nullptr) {
+        ctx.m_processor->write_and_fdatasync(ctx.m_processor->m_log_file->m_fd);
+      }
     }
     return true;
   }
   
   if (std::holds_alternative<wal::Fsync>(msg.m_payload)) {
-    if constexpr (requires { ctx.m_processor->write_and_fsync(); }) {
-      ctx.m_processor->write_and_fsync();
+    if constexpr (requires { ctx.m_processor->write_and_fsync(0); }) {
+      if (ctx.m_processor->m_log_file != nullptr) {
+        ctx.m_processor->write_and_fsync(ctx.m_processor->m_log_file->m_fd);
+      }
     }
     return true;
   }
@@ -357,6 +331,41 @@ Task<void> producer_actor(Producer_context ctx, std::size_t num_items, std::atom
   }
   
   return true;
+}
+
+/* Process messages from a process mailbox until it's empty or all producers are done.
+ * Returns true if processing should continue, false if all producers are done.
+ *  
+ * @param[in] process The process to process
+ * @param[in] ctx The consumer context
+ * @param[in] completed_producers The number of completed producers
+ * @param[in] msg The message envelope
+ * 
+ * @return True if processing should continue, false if all producers are done
+ */
+[[nodiscard]] inline bool process_mailbox(
+  util::Process<Payload_type>* process,
+  Consumer_context& ctx,
+  std::size_t& completed_producers,
+  util::Message_envelope<Payload_type>& msg
+) noexcept {
+  if (process == nullptr) [[unlikely]] {
+    return true;
+  }
+  
+  /* Skip consumer process mailbox - producers don't send poison pills there */
+  if (ctx.m_consumer_process && process == ctx.m_consumer_process) {
+    return true;
+  }
+  
+  bool loop_exited_normally{true};
+  while (process->m_mailbox.dequeue(msg)) [[likely]] {
+    if (!process_single_message(msg, ctx, completed_producers, loop_exited_normally)) [[unlikely]] {
+      break;
+    }
+  }
+  
+  return completed_producers < ctx.m_num_producers;
 }
 
 /* Consumer coroutine - runs on thread pool and writes to log */
@@ -371,9 +380,8 @@ Task<void> consumer_actor(
   }
  
   std::size_t completed_producers = 0;
-  util::Message_envelope<Payload_type> msg;
   std::size_t no_work_iterations = 0;
-
+  util::Message_envelope<Payload_type> msg;
   constexpr std::size_t bulk_read_size = 64;
   std::array<std::size_t, bulk_read_size> notification_buffer;
  
@@ -398,14 +406,14 @@ Task<void> consumer_actor(
     bool found_work{false};
     util::Process<Payload_type>* proc{nullptr};
  
-    std::size_t num_notifications{0};
+    std::size_t n_notifications{0};
     std::size_t notified_mailbox_idx{0};
     
-    while (num_notifications < bulk_read_size && ctx.m_sched->m_mailboxes->m_notify_queue->dequeue(notified_mailbox_idx)) {
-      notification_buffer[num_notifications++] = notified_mailbox_idx;
+    while (n_notifications < bulk_read_size && ctx.m_sched->m_mailboxes->m_notify_queue->dequeue(notified_mailbox_idx)) {
+      notification_buffer[n_notifications++] = notified_mailbox_idx;
     }
  
-    for (std::size_t i = 0; i < num_notifications; ++i) {
+    for (std::size_t i = 0; i < n_notifications; ++i) {
       std::size_t mailbox_idx = notification_buffer[i];
  
       auto process_mbox = ctx.m_sched->m_mailboxes->get_for_process(mailbox_idx);
@@ -420,7 +428,7 @@ Task<void> consumer_actor(
 
       bool loop_exited_normally{true};
 
-      while (process_mbox->m_queue.dequeue(proc)) {
+      while (process_mbox->m_queue.dequeue(proc)) [[likely]] {
         found_work = true;
 
         util::prefetch_for_read<3>(proc);
@@ -430,20 +438,20 @@ Task<void> consumer_actor(
         if (ctx.m_enable_batch_dequeue) [[likely]] {
           while (proc->m_mailbox.dequeue_batch(ctx.m_batch_size, [&](auto& batch_msg) {
             return process_single_message(batch_msg, ctx, completed_producers, loop_exited_normally);
-          }) > 0) {
-            if (completed_producers >= ctx.m_num_producers) {
+          }) > 0) [[likely]] {
+            if (completed_producers >= ctx.m_num_producers) [[unlikely]] {
               break;
             }
           }
         } else {
-          while (proc->m_mailbox.dequeue(msg)) {
-            if (!process_single_message(msg, ctx, completed_producers, loop_exited_normally)) {
+          while (proc->m_mailbox.dequeue(msg)) [[likely]] {
+            if (!process_single_message(msg, ctx, completed_producers, loop_exited_normally)) [[unlikely]] {
               break;
             }
           }
         }
         
-        if (completed_producers >= ctx.m_num_producers) {
+        if (completed_producers >= ctx.m_num_producers) [[unlikely]] {
           loop_exited_normally = false;
           break;
         }
@@ -473,36 +481,7 @@ Task<void> consumer_actor(
        */
       for (std::size_t pid = 0; pid < ctx.m_sched->m_processes.size() && completed_producers < ctx.m_num_producers; ++pid) {
         auto* p = ctx.m_sched->get_process(pid);
-
-        if (p == nullptr) [[unlikely]] {
-          continue;
-        }
-        
-        /* Skip consumer process mailbox - producers don't send poison pills there */
-        if (ctx.m_consumer_process && p == ctx.m_consumer_process) {
-          continue;
-        }
- 
-        while (p->m_mailbox.dequeue(msg)) {
-          if (std::holds_alternative<util::Poison_pill>(msg.m_payload)) [[unlikely]] {
-            ++completed_producers;
-            if (completed_producers >= ctx.m_num_producers) {
-              break;
-            }
-          } else {
-            if (std::holds_alternative<wal::Fdatasync>(msg.m_payload)) {
-              if constexpr (requires { ctx.m_processor->write_and_fdatasync(); }) {
-                ctx.m_processor->write_and_fdatasync();
-              }
-              continue;
-            }
-            if (std::holds_alternative<Payload_type>(msg.m_payload)) {
-              process_payload_message(*ctx.m_processor, std::get<Payload_type>(msg.m_payload), msg);
-            }
-          }
-        }
-        
-        if (completed_producers >= ctx.m_num_producers) {
+        if (!process_mailbox(p, ctx, completed_producers, msg)) {
           break;
         }
       }
@@ -578,7 +557,6 @@ static double test_throughput_actor_model_single_run(const Test_config& config) 
     (std::span<struct iovec> span) -> wal::Result<std::size_t> {
     
     auto result = log_file_wrapper->m_log_file->write(span);
-    /* Note: Sync operations are now handled separately via request_sync() */
     return result;
   };
 

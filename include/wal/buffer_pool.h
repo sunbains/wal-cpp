@@ -76,7 +76,7 @@ struct Pool {
     /* Sync operation - fsync or fdatasync */
     struct Sync_op {
       Sync_type m_sync_type;
-      std::function<Result<bool>(Sync_type)>* m_sync_callback;
+      std::function<Result<bool>()>* m_sync_callback;
     };
     
     /* Read operation - placeholder for future use */
@@ -257,7 +257,7 @@ struct Pool {
    * @param[in] sync_callback Callback that performs the sync operation.
    * @param[in] thread_pool Thread pool for executing I/O operations.
    */
-  void enqueue_sync_operation(Sync_type sync_type, std::function<Result<bool>(Sync_type)>& sync_callback, util::Thread_pool& thread_pool) noexcept {
+  void enqueue_sync_operation(Sync_type sync_type, std::function<Result<bool>()>& sync_callback, util::Thread_pool& thread_pool) noexcept {
     if (sync_type == Sync_type::None) {
       return;
     }
@@ -310,7 +310,7 @@ struct Pool {
         auto& sync_op = std::get<Io_operation::Sync_op>(io_op.m_op);
         
         if ((sync_op.m_sync_callback != nullptr) && sync_op.m_sync_type != Sync_type::None) {
-          auto sync_result = (*sync_op.m_sync_callback)(sync_op.m_sync_type);
+          auto sync_result = (*sync_op.m_sync_callback)();
           if (!sync_result.has_value()) {
             log_fatal("Sync operation failed");
           }
