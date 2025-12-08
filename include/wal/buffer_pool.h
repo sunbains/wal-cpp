@@ -176,10 +176,6 @@ struct Pool {
       WAL_ASSERT(entry->m_buffer.is_empty());
       WAL_ASSERT(entry->m_state == Entry::State::Free);
     }
-    WAL_ASSERT(m_sync_submit_count == m_sync_count);
-    WAL_ASSERT(m_read_submit_count == m_read_count);
-    WAL_ASSERT(m_write_submit_count == m_write_count);
-    log_trace("Pool shutdown completed: write_count: {}, write_submit_count: {}, sync_count: {}, sync_submit_count: {}, read_count: {}, read_submit_count: {}", m_write_count, m_write_submit_count, m_sync_count, m_sync_submit_count, m_read_count, m_read_submit_count);
   }
 
   /**
@@ -212,8 +208,6 @@ struct Pool {
     entry_ptr->m_state = Entry::State::Ready_for_io;
 
     Entry* free_entry_ptr{};
-
-    ++m_write_submit_count;
 
     if (m_free_buffers.dequeue(free_entry_ptr)) {
       /* Enqueue write operation to IO queue */
@@ -297,8 +291,6 @@ struct Pool {
         
         auto result = entry_ptr->m_buffer.write_to_store(*write_callback);
 
-        ++pool->m_write_count;
-        
         if (!result.has_value()) {
           log_fatal("IO task failed");
         }
@@ -438,14 +430,6 @@ struct Pool {
 
   /* Flag to track if IO coroutine is running */
   alignas(kCLS) std::atomic<bool> m_io_task_running{false};
-
-  /** FIXME: Remove them, debug counters. */
-  std::size_t m_write_count{0};
-  std::size_t m_write_submit_count{0};
-  std::size_t m_sync_count{0};
-  std::size_t m_sync_submit_count{0};
-  std::size_t m_read_count{0};
-  std::size_t m_read_submit_count{0};
 };
 // NOLINTEND(clang-analyzer-optin.performance.Padding)
 
