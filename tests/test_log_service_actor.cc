@@ -564,7 +564,9 @@ Task<void> log_service_actor(
     std::size_t notified_mailbox_idx{0};
     
     constexpr std::size_t fast_scan_limit = 8;
-    const bool use_fast_scan = (ctx.m_sched->m_mailboxes->size() <= fast_scan_limit &&
+    const bool use_fast_scan = ctx.m_sched->m_mailboxes->m_direct_fast_path ||
+                               ((ctx.m_sched->m_mailboxes->size() <= fast_scan_limit) &&
+                                ctx.m_sched->m_mailboxes->m_track_active_count &&
                                 ctx.m_sched->m_mailboxes->m_active_count.load(std::memory_order_acquire) <= fast_scan_limit);
 
     if (!ctx.m_sched->m_round_robin_drain && !use_fast_scan) {

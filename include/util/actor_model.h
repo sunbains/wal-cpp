@@ -144,6 +144,8 @@ struct Process_mailboxes {
     m_active_queues.clear();
     m_worker_index.clear();
     m_active_count.store(0, std::memory_order_relaxed);
+    m_track_active_count = (n_processes <= 1024);
+    m_direct_fast_path = (n_processes <= 8);
 
     for (std::size_t i = 0; i < n_processes; ++i) {
       m_mailboxes.push_back(std::make_unique<Mailbox_type>(capacity));
@@ -195,6 +197,10 @@ struct Process_mailboxes {
     if (process_id >= m_mailboxes.size() || m_active_queues.empty()) {
       return false;
     }
+    if (m_direct_fast_path) {
+      m_mailboxes[process_id]->m_has_messages.store(true, std::memory_order_release);
+      return true;
+    }
     
     auto mbox = m_mailboxes[process_id].get();
 
@@ -237,6 +243,8 @@ struct Process_mailboxes {
   std::size_t m_pending_flags_size{0};
   std::vector<std::size_t> m_worker_index;
   std::atomic<std::size_t> m_active_count{0};
+  bool m_track_active_count{false};
+  bool m_direct_fast_path{false};
 };
 
 /**

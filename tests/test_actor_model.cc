@@ -179,7 +179,9 @@ Task<void> consumer_actor(
     std::size_t notified_mailbox_idx = 0;
     
     constexpr std::size_t fast_scan_limit = 8;
-    const bool use_fast_scan = (sched->m_mailboxes->size() <= fast_scan_limit &&
+    const bool use_fast_scan = sched->m_mailboxes->m_direct_fast_path ||
+                               ((sched->m_mailboxes->size() <= fast_scan_limit) &&
+                                sched->m_mailboxes->m_track_active_count &&
                                 sched->m_mailboxes->m_active_count.load(std::memory_order_acquire) <= fast_scan_limit);
 
     if (!use_fast_scan) {
