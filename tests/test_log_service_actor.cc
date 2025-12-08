@@ -1029,12 +1029,14 @@ int main(int argc, char** argv) {
     {"producer-latency", no_argument, nullptr, 1000},
     {"log-block-size", required_argument, nullptr, 'L'},
     {"log-buffer-blocks", required_argument, nullptr, 'R'},
+    {"pool-size", required_argument, nullptr, 1007},
+    {"io-queue-size", required_argument, nullptr, 1008},
     {"io-threads", required_argument, nullptr, 1009},
     {"timeout-ms", required_argument, nullptr, 'T'},
     {"fdatasync-interval", required_argument, nullptr, 'f'},
     {"use-fsync", no_argument, nullptr, 1005},
     {"batch-dequeue", no_argument, nullptr, 'b'},
-    {"no-batch-dequeue", no_argument, nullptr, 1009},
+    {"no-batch-dequeue", no_argument, nullptr, 1010},
     {"batch-size", required_argument, nullptr, 'B'},
     {"help", no_argument, nullptr, 'h'},
     {nullptr, 0, nullptr, 0}
@@ -1115,7 +1117,7 @@ int main(int argc, char** argv) {
       case 'b':
         config.m_enable_batch_dequeue = true;
         break;
-      case 1009:
+      case 1010:
         config.m_enable_batch_dequeue = false;
         break;
       case 'B':
