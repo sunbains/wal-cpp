@@ -26,6 +26,10 @@
 #include <utility>
 #include <optional>
 
+//
+// THIS CODE IS BROKEN, DO NOT USE. REMOVE NEEDS TO BE FIXED.
+//
+
 namespace util {
 
 struct Iterator_invalidated : public std::runtime_error {
