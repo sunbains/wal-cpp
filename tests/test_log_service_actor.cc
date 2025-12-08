@@ -142,6 +142,9 @@ struct Test_config {
   /** Max messages to process per consumer loop iteration (reductions); 0 = unlimited */
   std::size_t m_reduction_budget{0};
 
+  /** Max messages to drain per mailbox before moving on (0 = unlimited) */
+  std::size_t m_drain_quanta{0};
+
   /** Force deterministic round-robin drain of all mailboxes each loop (reduces jitter) */
   bool m_round_robin_drain{false};
 
@@ -200,7 +203,9 @@ struct Log_service_context {
   /** Batch size for batch dequeue, only used if m_enable_batch_dequeue is true */
   std::size_t m_batch_size{32};
   /** Max messages to process per loop before yielding (reductions) */
-  std::size_t m_reduction_budget{4096};
+  std::size_t m_reduction_budget{0};
+  /** Max messages to drain from a single mailbox before moving on (0 = unlimited) */
+  std::size_t m_drain_quanta{0};
 };
 
 /* Forward declaration */
@@ -520,6 +525,21 @@ Task<void> log_service_actor(
  
   while (completed_producers < ctx.m_num_producers) {
     std::size_t reductions_left = reduction_budget;
+    /* Dynamically tune drain quanta: many producers -> smaller slices for fairness */
+    std::size_t dynamic_drain_limit = 0;
+    if (ctx.m_drain_quanta > 0) {
+      dynamic_drain_limit = ctx.m_drain_quanta;
+    } else {
+      if (ctx.m_num_producers > 8192) {
+        dynamic_drain_limit = 16;
+      } else if (ctx.m_num_producers > 2048) {
+        dynamic_drain_limit = 64;
+      } else if (ctx.m_num_producers > 512) {
+        dynamic_drain_limit = 256;
+      } else {
+        dynamic_drain_limit = std::numeric_limits<std::size_t>::max();
+      }
+    }
 
     /* Check for poison pills in service mailbox (if provided) */
     if (ctx.m_service_process != nullptr) {
@@ -572,7 +592,10 @@ Task<void> log_service_actor(
 
       bool loop_exited_normally{true};
 
-      while (process_mbox->m_queue.dequeue(proc) && reductions_left > 0) {
+      std::size_t drained_from_mailbox = 0;
+      const std::size_t drain_limit = dynamic_drain_limit;
+
+      while (process_mbox->m_queue.dequeue(proc) && reductions_left > 0 && drained_from_mailbox < drain_limit) {
         found_work = true;
 
         util::prefetch_for_read<3>(proc);
@@ -612,6 +635,7 @@ Task<void> log_service_actor(
         if (reductions_left == 0) {
           break;
         }
+        ++drained_from_mailbox;
       }
 
       if (loop_exited_normally) {
@@ -816,6 +840,7 @@ static Test_run_result test_throughput_actor_model_single_run(const Test_config&
   service_ctx.m_sched = &service_setup.m_sched;
   service_ctx.m_processor = &msg_processor;
   service_ctx.m_num_producers = producers;
+  service_ctx.m_drain_quanta = config.m_drain_quanta;
   service_ctx.m_reduction_budget = 0;
   service_setup.m_sched.m_round_robin_drain = config.m_round_robin_drain;
 
@@ -1068,6 +1093,7 @@ static void print_usage(const char* program_name) noexcept {
                "      --io-queue-size NUM     Size of IO operations queue (default: pool_size * 2, must be power of 2)\n"
                "      --io-threads NUM        Number of I/O threads for background writes/syncs (default: 1)\n"
                "      --pin-threads           Pin worker threads to CPUs (Linux only, default: off)\n"
+               "      --drain-quanta NUM      Max messages to drain per mailbox before moving on (default: 0=unlimited)\n"
                "      --round-robin-drain     Force consumer to scan all mailboxes each loop (reduces jitter)\n"
                "      --timeout-ms NUM     Timeout in milliseconds (0 disables, default: 3000)\n"
                "  -f, --fdatasync-interval NUM Send sync messages with probability NUM (0.0-1.0, e.g., 0.3 = 30%%, default: 0)\n"
@@ -1100,7 +1126,8 @@ int main(int argc, char** argv) {
     {"io-queue-size", required_argument, nullptr, 1008},
     {"io-threads", required_argument, nullptr, 1009},
     {"pin-threads", no_argument, nullptr, 1011},
-    {"round-robin-drain", no_argument, nullptr, 1012},
+    {"drain-quanta", required_argument, nullptr, 1012},
+    {"round-robin-drain", no_argument, nullptr, 1013},
     {"timeout-ms", required_argument, nullptr, 'T'},
     {"fdatasync-interval", required_argument, nullptr, 'f'},
     {"use-fsync", no_argument, nullptr, 1005},
@@ -1164,6 +1191,9 @@ int main(int argc, char** argv) {
         config.m_pin_threads = true;
         break;
       case 1012:
+        config.m_drain_quanta = std::stoull(optarg);
+        break;
+      case 1013:
         config.m_round_robin_drain = true;
         break;
       case 'T':
