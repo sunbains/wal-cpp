@@ -123,7 +123,11 @@ struct [[nodiscard]] Log {
 
     /* Process any remaining buffers synchronously */
     auto adapter = [callback](Buffer& buffer) -> Result<bool> {
-     return  buffer.write_to_store(callback);
+      auto result = buffer.write_to_store(callback);
+      if (result.has_value()) {
+        return result.value() > 0;
+      }
+      return std::unexpected(result.error());
     };
 
     auto result = m_pool->write_to_store(adapter);
@@ -157,7 +161,11 @@ struct [[nodiscard]] Log {
 
     /* Process any remaining buffers synchronously */
     auto adapter = [callback](Buffer& buffer) -> Result<bool> {
-     return  buffer.write_to_store(callback);
+      auto result = buffer.write_to_store(callback);
+      if (result.has_value()) {
+        return true;
+      }
+      return std::unexpected(result.error());
     };
 
     auto result = m_pool->write_to_store(adapter);
