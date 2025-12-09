@@ -60,7 +60,7 @@ struct Producer_context_base {
  */
 template<typename PayloadType, typename SchedulerType>
 struct Log_service_setup {
-  Log_service_setup(std::size_t num_producers, std::size_t io_threads = 1, bool pin_workers = false)
+  Log_service_setup(std::size_t num_producers, std::size_t io_threads = 1, [[maybe_unused]] bool pin_workers = false)
     : m_producer_pool(create_producer_pool_config(num_producers, pin_workers)),
       m_consumer_pool(create_consumer_pool_config(pin_workers)),
       m_io_pool(create_io_pool_config(io_threads, pin_workers)) {
@@ -96,7 +96,7 @@ struct Log_service_setup {
    }
  
  private:
-   static util::Thread_pool::Config create_producer_pool_config(std::size_t num_producers, bool pin_workers) {
+   static util::Thread_pool::Config create_producer_pool_config(std::size_t num_producers, [[maybe_unused]] bool pin_workers) {
      util::Thread_pool::Config producer_pool_config;
  
      std::size_t hw_threads = std::thread::hardware_concurrency();
@@ -105,10 +105,10 @@ struct Log_service_setup {
        hw_threads = 4;
      }
  
+     /* Allow enough slots for one task per producer (and then some) */
+     const std::size_t desired_capacity = std::max<std::size_t>(4096, num_producers + (num_producers / 10));
+     producer_pool_config.m_queue_capacity = std::bit_ceil(desired_capacity);
      producer_pool_config.m_num_threads = std::max<std::size_t>(1, hw_threads / 2);
-     producer_pool_config.m_queue_capacity = std::min<std::size_t>(1024, std::max<std::size_t>(4096, num_producers * 4));
-     producer_pool_config.m_pin_workers = pin_workers;
- 
      if (!std::has_single_bit(producer_pool_config.m_queue_capacity)) {
        producer_pool_config.m_queue_capacity = std::bit_ceil(producer_pool_config.m_queue_capacity);
      }
