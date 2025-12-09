@@ -446,7 +446,8 @@ Task<void> producer_actor(Producer_context ctx, std::size_t num_items, std::atom
   
   if (std::holds_alternative<wal::Fdatasync>(msg.m_payload)) {
     if constexpr (requires { ctx.m_processor->write_and_fdatasync(0); }) {
-      if (ctx.m_processor->m_log_file != nullptr) {
+      if (ctx.m_processor->m_log_file != nullptr &&
+          !ctx.m_processor->m_log_file->m_disable_writes) {
         ctx.m_processor->write_and_fdatasync(ctx.m_processor->m_log_file->m_fd);
       }
     }
@@ -455,7 +456,8 @@ Task<void> producer_actor(Producer_context ctx, std::size_t num_items, std::atom
   
   if (std::holds_alternative<wal::Fsync>(msg.m_payload)) {
     if constexpr (requires { ctx.m_processor->write_and_fsync(0); }) {
-      if (ctx.m_processor->m_log_file != nullptr) {
+      if (ctx.m_processor->m_log_file != nullptr &&
+          !ctx.m_processor->m_log_file->m_disable_writes) {
         ctx.m_processor->write_and_fsync(ctx.m_processor->m_log_file->m_fd);
       }
     }
@@ -927,7 +929,12 @@ static Test_run_result test_throughput_actor_model_single_run(const Test_config&
     log->wait_for_io_idle();
 
     /* Use fdatasync callable for shutdown sync */
-    WAL_ASSERT(log->shutdown(log_writer, &msg_processor.m_fdatasync_callable).has_value());
+    Sync_callable* shutdown_sync = config.m_disable_writes ? nullptr : &msg_processor.m_fdatasync_callable;
+    auto shutdown_result = log->shutdown(log_writer, shutdown_sync);
+    if (!shutdown_result.has_value()) {
+      std::println(stderr, "ERROR: Shutdown failed with status {}", static_cast<int>(shutdown_result.error()));
+    }
+    WAL_ASSERT(shutdown_result.has_value());
     
     /* Clear the I/O callback to break circular reference before log goes out of scope */
     /* The callback lambda captures metrics_ptr, but Log also stores it, creating a cycle */
