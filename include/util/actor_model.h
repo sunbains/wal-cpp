@@ -152,8 +152,8 @@ struct Process_mailboxes {
     if (n_producers > 0) {
       /* Scale with producers: allow for bursts where many producers schedule simultaneously
        * For 8K producers, we need significant capacity to handle all notifications
-       * Cap at reasonable limit to avoid excessive memory usage */
-      notify_capacity = std::min<std::size_t>(131072, std::max<std::size_t>(n_processes * 16, n_producers / 2));
+       * Keep capacity high enough to avoid dropping notifications under load (no hard cap) */
+      notify_capacity = std::max<std::size_t>(n_processes * 16, n_producers / 2);
     } else {
       /* Fallback: scale with processes only */
       notify_capacity = std::max<std::size_t>(n_processes * 8, 1024);

@@ -62,6 +62,7 @@ struct Test_config {
   std::size_t m_log_block_size{4096};
   std::size_t m_log_buffer_size_blocks{1024};
   bool m_disable_writes{false};
+  bool m_disable_crc32{false};
 };
 
 using Log_writer = wal::Log::Write_callback;
@@ -111,7 +112,8 @@ static void test_log_io_simple(const Test_config& config) {
   /* Create log with buffer pool */
   wal::Pool::Config pool_config;
   pool_config.m_pool_size = 4;
-  wal::Buffer::Config buffer_config(config.m_log_buffer_size_blocks, config.m_log_block_size, util::ChecksumAlgorithm::CRC32C);
+  auto checksum_algo = config.m_disable_crc32 ? util::ChecksumAlgorithm::NONE : util::ChecksumAlgorithm::CRC32C;
+  wal::Buffer::Config buffer_config(config.m_log_buffer_size_blocks, config.m_log_block_size, checksum_algo);
   wal::Log::Config log_config{
     .m_pool_config = pool_config,
     .m_buffer_config = buffer_config
@@ -207,6 +209,7 @@ int main(int argc, char* argv[]) {
     {"disable-writes", no_argument, nullptr, 'd'},
     {"log-block-size", required_argument, nullptr, 'L'},
     {"log-buffer-blocks", required_argument, nullptr, 'R'},
+    {"disable-crc32", no_argument, nullptr, 1001},
     {nullptr, 0, nullptr, 0}
   };
 
@@ -225,8 +228,11 @@ int main(int argc, char* argv[]) {
       case 'R':
         config.m_log_buffer_size_blocks = std::strtoull(optarg, nullptr, 10);
         break;
+      case 1001:
+        config.m_disable_crc32 = true;
+        break;
       default:
-        std::println(stderr, "Usage: {} [-m messages] [-d] [-L block-size] [-R buffer-blocks]", argv[0]);
+        std::println(stderr, "Usage: {} [-m messages] [-d] [-L block-size] [-R buffer-blocks] [--disable-crc32 (default: on)]", argv[0]);
         return 1;
     }
   }
