@@ -116,7 +116,7 @@ struct Test_config {
   bool m_skip_memcpy{false};
   bool m_pin_threads{false};
   std::size_t m_log_block_size{4096};
-  std::size_t m_log_buffer_size_blocks{16384};
+  std::size_t m_log_buffer_size_blocks{341};
   bool m_disable_crc32{false};
   std::size_t m_pool_size{32};
   std::size_t m_io_queue_size{0};  // 0 means use pool_size * 2
@@ -701,10 +701,6 @@ Task<void> log_service_actor(
         }
       }
     }
-
-    if (!found_work) {
-      util::cpu_pause();
-    }
   }
 
   if (ctx.m_service_done) {
@@ -1111,7 +1107,7 @@ static void print_usage(const char* program_name) noexcept {
                "  -X, --disable-metrics    Disable metrics collection entirely (default: off)\n"
                "      --producer-latency    Enable per-message producer latency tracking (opt-in, expensive)\n"
                "      --log-block-size NUM Size of each log block in bytes (default: 4096)\n"
-               "      --log-buffer-blocks NUM Number of blocks in log buffer (default: 16384)\n"
+               "      --log-buffer-blocks NUM Number of blocks in log buffer (default: 341)\n"
                "      --pool-size NUM        Number of buffers in pool (default: 32, must be power of 2)\n"
                "      --io-queue-size NUM     Size of IO operations queue (default: pool_size * 2, must be power of 2)\n"
                "      --io-threads NUM        Number of I/O threads for background writes/syncs (default: 1)\n"

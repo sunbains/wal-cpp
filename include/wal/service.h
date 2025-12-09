@@ -60,7 +60,7 @@ struct Producer_context_base {
  */
 template<typename PayloadType, typename SchedulerType>
 struct Log_service_setup {
-  Log_service_setup(std::size_t num_producers, std::size_t io_threads = 1, bool pin_workers = false)
+  Log_service_setup(std::size_t num_producers, std::size_t io_threads = 1, [[maybe_unused]] bool pin_workers = false)
     : m_producer_pool(create_producer_pool_config(num_producers, pin_workers)),
       m_consumer_pool(create_consumer_pool_config(pin_workers)),
       m_io_pool(create_io_pool_config(io_threads, pin_workers)) {
