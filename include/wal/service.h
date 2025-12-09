@@ -96,24 +96,25 @@ struct Log_service_setup {
    }
  
  private:
-   static util::Thread_pool::Config create_producer_pool_config(std::size_t num_producers, bool pin_workers) {
-     util::Thread_pool::Config producer_pool_config;
- 
-     std::size_t hw_threads = std::thread::hardware_concurrency();
- 
+  static util::Thread_pool::Config create_producer_pool_config(std::size_t num_producers, bool pin_workers) {
+    util::Thread_pool::Config producer_pool_config;
+
+    std::size_t hw_threads = std::thread::hardware_concurrency();
+
      if (hw_threads == 0) {
        hw_threads = 4;
      }
  
-     /* Allow enough slots for one task per producer (and then some) */
-     const std::size_t desired_capacity = std::max<std::size_t>(4096, num_producers + (num_producers / 10));
-     producer_pool_config.m_queue_capacity = std::bit_ceil(desired_capacity);
-     producer_pool_config.m_num_threads = std::max<std::size_t>(1, hw_threads / 2);
+    /* Allow enough slots for one task per producer (and then some) */
+    const std::size_t desired_capacity = std::max<std::size_t>(4096, num_producers + (num_producers / 10));
+    producer_pool_config.m_queue_capacity = std::bit_ceil(desired_capacity);
+    producer_pool_config.m_num_threads = std::max<std::size_t>(1, hw_threads / 2);
+    producer_pool_config.m_pin_workers = pin_workers;
 
-     if (!std::has_single_bit(producer_pool_config.m_queue_capacity)) {
-       producer_pool_config.m_queue_capacity = std::bit_ceil(producer_pool_config.m_queue_capacity);
-     }
-     return producer_pool_config;
+    if (!std::has_single_bit(producer_pool_config.m_queue_capacity)) {
+      producer_pool_config.m_queue_capacity = std::bit_ceil(producer_pool_config.m_queue_capacity);
+    }
+    return producer_pool_config;
    }
  
    static util::Thread_pool::Config create_consumer_pool_config(bool pin_workers) {
