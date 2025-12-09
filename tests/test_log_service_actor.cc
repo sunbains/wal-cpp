@@ -117,6 +117,7 @@ struct Test_config {
   bool m_pin_threads{false};
   std::size_t m_log_block_size{4096};
   std::size_t m_log_buffer_size_blocks{16384};
+  bool m_disable_crc32{false};
   std::size_t m_pool_size{32};
   std::size_t m_io_queue_size{0};  // 0 means use pool_size * 2
   std::size_t m_timeout_ms{5000};
@@ -739,7 +740,8 @@ static Test_run_result test_throughput_actor_model_single_run(const Test_config&
    * If buffer size is large (e.g., 16384 blocks), use more smaller buffers.
    * Aim for ~4-8MB per buffer instead of 64MB */
   const std::size_t target_buffer_size_blocks = std::min(config.m_log_buffer_size_blocks, std::size_t(2048));
-  auto wal_buffer_config = wal::Buffer::Config(target_buffer_size_blocks, config.m_log_block_size, kChecksumAlgorithm);
+  const auto checksum_algo = config.m_disable_crc32 ? util::ChecksumAlgorithm::NONE : kChecksumAlgorithm;
+  auto wal_buffer_config = wal::Buffer::Config(target_buffer_size_blocks, config.m_log_block_size, checksum_algo);
   
   /* Ensure pool size is a power of 2 */
   const std::size_t log2_pool_size = static_cast<std::size_t>(std::ceil(std::log2(static_cast<double>(config.m_pool_size))));
@@ -1116,6 +1118,7 @@ static void print_usage(const char* program_name) noexcept {
                "      --pin-threads           Pin worker threads to CPUs (Linux only, default: off)\n"
                "      --drain-quanta NUM      Max messages to drain per mailbox before moving on (default: 0=unlimited)\n"
                "      --round-robin-drain     Force consumer to scan all mailboxes each loop (reduces jitter)\n"
+               "      --disable-crc32        Disable CRC32C checksumming (default: enabled)\n"
                "      --timeout-ms NUM     Timeout in milliseconds (0 disables, default: 3000)\n"
                "  -f, --fdatasync-interval NUM Send sync messages with probability NUM (0.0-1.0, e.g., 0.3 = 30%%, default: 0)\n"
                "      --use-fsync          Use fsync messages instead of fdatasync (default: fdatasync)\n"
@@ -1149,6 +1152,7 @@ int main(int argc, char** argv) {
     {"pin-threads", no_argument, nullptr, 1011},
     {"drain-quanta", required_argument, nullptr, 1012},
     {"round-robin-drain", no_argument, nullptr, 1013},
+    {"disable-crc32", no_argument, nullptr, 1014},
     {"timeout-ms", required_argument, nullptr, 'T'},
     {"fdatasync-interval", required_argument, nullptr, 'f'},
     {"use-fsync", no_argument, nullptr, 1005},
@@ -1202,25 +1206,28 @@ int main(int argc, char** argv) {
       case 1008:
         config.m_io_queue_size = std::stoull(optarg);
         break;
-      case 1009:
-        config.m_io_threads = std::stoull(optarg);
-        if (config.m_io_threads == 0) {
-          config.m_io_threads = 1;
-        }
-        break;
-      case 1011:
-        config.m_pin_threads = true;
-        break;
-      case 1012:
-        config.m_drain_quanta = std::stoull(optarg);
-        break;
-      case 1013:
-        config.m_round_robin_drain = true;
-        break;
-      case 'T':
-        config.m_timeout_ms = std::stoull(optarg);
-        break;
-      case 'f': {
+    case 1009:
+      config.m_io_threads = std::stoull(optarg);
+      if (config.m_io_threads == 0) {
+        config.m_io_threads = 1;
+      }
+      break;
+    case 1011:
+      config.m_pin_threads = true;
+      break;
+    case 1012:
+      config.m_drain_quanta = std::stoull(optarg);
+      break;
+    case 1013:
+      config.m_round_robin_drain = true;
+      break;
+    case 1014:
+      config.m_disable_crc32 = true;
+      break;
+    case 'T':
+      config.m_timeout_ms = std::stoull(optarg);
+      break;
+    case 'f': {
         /* Parse as double to support fractional values like 0.3 (30% probability) */
         double prob = std::stod(optarg);
         if (prob < 0.0 || prob > 1.0) {

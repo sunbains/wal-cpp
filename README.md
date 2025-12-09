@@ -76,6 +76,7 @@ Common flags:
 - `-f/--fdatasync-interval N`  sync probability (0 disables; e.g. 0.1 ≈ 10%)
 - `-w/--disable-log-writes`    skip log->append entirely
 - `-d/--disable-writes`        write to /dev/null
+- `--disable-crc32`            disable CRC32C checksums (default: enabled)
 - `-b/--batch-dequeue`         batch dequeue mode
 - `-B/--batch-size NUM`        batch size when batch dequeue is enabled
 - `-v/--verbose`               increase metrics verbosity (repeatable)

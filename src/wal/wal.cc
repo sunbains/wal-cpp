@@ -402,7 +402,11 @@ Result<bool> Log::write_to_store(Write_callback callback) noexcept {
   /* Create an adapter that converts Write_callback to a function
    * that takes Buffer& and returns Result<bool>. */
   auto adapter = [callback](Buffer& buffer) -> Result<bool> {
-    return buffer.write_to_store(callback, 0);
+    auto result = buffer.write_to_store(callback, 0);
+    if (result.has_value()) {
+      return result.value() > 0;
+    }
+    return std::unexpected(result.error());
   };
 
   return m_pool->write_to_store(adapter);
