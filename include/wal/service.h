@@ -105,10 +105,11 @@ struct Log_service_setup {
        hw_threads = 4;
      }
  
+     /* Allow enough slots for one task per producer (and then some) */
+     const std::size_t desired_capacity = std::max<std::size_t>(4096, num_producers + (num_producers / 10));
+     producer_pool_config.m_queue_capacity = std::bit_ceil(desired_capacity);
      producer_pool_config.m_num_threads = std::max<std::size_t>(1, hw_threads / 2);
-     producer_pool_config.m_queue_capacity = std::min<std::size_t>(1024, std::max<std::size_t>(4096, num_producers * 4));
-     producer_pool_config.m_pin_workers = pin_workers;
- 
+
      if (!std::has_single_bit(producer_pool_config.m_queue_capacity)) {
        producer_pool_config.m_queue_capacity = std::bit_ceil(producer_pool_config.m_queue_capacity);
      }
